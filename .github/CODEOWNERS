@@ -1,0 +1,36 @@
+# CODEOWNERS — who must approve a change before it can be merged into `main`.
+#
+# The effective rule is:
+#   * anyone (including people with no access to this repository) may open a
+#     pull request — they just fork the repository;
+#   * a pull request can only be merged once it has been approved by the
+#     required number of reviewers WITH WRITE ACCESS;
+#   * with "Require review from Code Owners" enabled on the branch protection
+#     rule for `main`, the required approval must come from someone listed in
+#     THIS FILE. An approval from any other collaborator does not count.
+#
+# READ THIS BEFORE EDITING
+# ------------------------
+# 1. Every owner listed below MUST have "Write" access to this repository.
+#    GitHub silently drops owners without it: "If you specify a user or team
+#    that doesn't exist or has insufficient access, a code owner will not be
+#    assigned."
+# 2. This file is read from the BASE branch of a pull request, so it only takes
+#    effect after it is merged into `main`.
+# 3. Turning on branch protection alone is not enough — the option
+#    "Require review from Code Owners" must also be enabled on the `main`
+#    branch protection rule.
+# 4. An approval from ANY ONE of the owners listed for a path is enough; "all
+#    of them" is not required.
+
+# Everything in the repository needs an approval from the maintainers.
+# @ls199303 is the second collaborator (invited 2026-10-09). Delete it here if
+# you ever want *only* the repository owner to be able to approve.
+*                           @hoymiles-ha   @ls199303
+
+# Hardening: the file that defines who may approve must be protected too,
+# otherwise a new collaborator could widen their own approval rights.
+# The last matching pattern wins, so this narrows just this one file down to
+# the repository owner. Changes to `.github/workflows/` still follow the `*`
+# rule above.
+/.github/CODEOWNERS         @hoymiles-ha
