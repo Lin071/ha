@@ -126,10 +126,20 @@ Two things follow, both easy to get wrong:
 
 ## 1. `custom:hoymiles-power-flow`
 
-Draws the home as an illustration and overlays live PV / storage / grid / load
-power, matching the vendor app's home screen. Pearls flow along each connector
-proportional to that branch's power.
+Draws the system as a **wiring diagram**, the way the vendor app's system
+screen does: one icon per branch, the unit in the middle, the grid tie point as
+a junction dot, and thick rounded connectors carrying moving pearls. The icons
+are the app's own artwork, embedded in the card.
 
+```
+⬜ PV1 ──┐                    ┌── ⬜ PV2
+         ├── ▣ unit ───── ● ── ── ⬜ grid
+⬜ storage ┘                  └── ⬜ load
+                               └── ⬜ smart plug
+```
+
+- **The unit in the middle works as soon as anything flows through it**, so its
+  artwork is the coloured one then and the dim one when the whole system is idle.
 ```yaml
 type: custom:hoymiles-power-flow
 dev_id: MSA-280520260806
@@ -145,38 +155,51 @@ language: zh
 | `language` | `zh` \| `en` | *auto* | Pin the card's language. Omit it to follow the Home Assistant user's language. |
 | `temperature_entity` | entity id | — | Outdoor temperature shown next to the title. |
 | `show_rssi` | bool | `true` | Wi-Fi signal fan in the top-right corner. |
-| `show_extras` | bool | `true` | The *PV2* / *smart plug* chips in the top-left corner. |
-| `gradient` | bool | `true` | Draw the light gradient backdrop. |
+| `gradient` | bool | `true` | Draw the plain **white** backdrop the schematic sits on. `false` leaves the card background instead — pair it with a light theme, since the diagram's text colours are fixed. |
 | `max_width` | number (px) | `620` | Maximum width of the illustration; it stays centred. |
 | `flow_speed` | number | `1` | Speed multiplier for the moving pearls. `0.5` is calmer, `2` is faster. |
-| `has_meter` | `auto` \| `true` \| `false` | `auto` | Whether a grid meter is installed. `auto` treats a non-zero `sys_grid_p` as proof a meter exists; see `meter_zero_samples`. |
-| `meter_zero_samples` | number | `10` | In `auto` mode, how many consecutive zero grid readings are needed before concluding there is no meter. Readings arrive once per second, so the default is ~10 s. |
 | `entities` | map | — | Entity overrides, keyed by suffix (see below). |
 
 ### Data sources
 
-All values come from plain entity states — **the recorder is not required**.
+All values come from plain entity states — **the recorder is not required** — and
+every branch reads the 1 s *quick state* system entity, the same numbers the
+vendor app's system page shows:
 
 | Node | Entity suffix (`sensor.<dev>_…`) |
 |---|---|
-| PV | `system_pv_power` (falls back to `pv_power`) |
-| Storage | `system_battery_power` (negative = charging) + `system_soc` |
-| Grid | `system_grid_power` (positive = importing) |
-| Load | `system_load_power` |
-| PV2 chip | `system_pv2_power` |
-| Smart plug chip | `system_smart_plug_power` |
-| Status chip | `battery_status` (`standby` / `charge` / `discharge` / `lock`) |
+| PV1 (top-left) | `sys_pv_p` |
+| PV2 (top-right) | `sys_pv2_p` |
+| Grid (right) | `sys_grid_p` (positive = importing) |
+| Load (bottom-right) | `sys_load_p` |
+| Smart plug (bottom-right, below load) | `sys_sp_p` |
+| Storage (bottom-left) | `sys_bat_p` (negative = charging), falls back to `bat_p`; SOC from `sys_soc` |
+| Status | `battery_status` (`standby` / `charge` / `discharge` / `lock`) |
 | Signal fan | `rssi` (dBm) |
 
 ### Behaviour notes
 
-- A connector only shows moving pearls when that branch carries **≥ 5 W**. Pearl
-  colour follows the branch, and speed rises with power.
+- **A branch that carries power (`|P| >= 5 W`) is drawn in colour; an idle one
+  uses the grey variant of the same icon**, which is how the app says "nothing
+  happening here" without you having to read the number.
+- A branch whose entity is **missing** (a slave unit reports no system level
+  values) is left out entirely, together with its connector.
+- The grid caption follows the flow: *Grid in* while importing, *Grid out*
+  while exporting, plain *Grid* at ~0 W — it does not claim a direction it
+  cannot see.
+- The two diagonal branches (PV2 and load) are plain connectors - there is no
+  direction arrow anywhere in the picture.  Which way the power goes is shown
+  by the pearls, and only by them.
+- A connector only shows moving pearls when that branch carries **≥ 5 W**,
+  and the pearls always travel **with** the energy: out of PV1 / PV2, out of a
+  discharging battery, in from a charging grid, back into a charging battery,
+  out of the inverter when it feeds the house and back into it when the grid
+  or the PV2 branch charges the battery, and into the load / smart plug.
+  Pearl colour follows the branch, and speed rises with power.
 - Travel time is computed from the **path length**, so a short stub and a long
-  line look like the same speed. At 1059 W the PV connector (about 325 px) takes
-  roughly 3.8 s. Tune the whole card with `flow_speed`.
-- The storage chip shows the real battery state; the grid chip shows
-  **importing / exporting**.
+  line look like the same speed - the fastest branch crosses in about 1.5 s,
+  short stubs are held to a 1.0 s floor and a long line at low power takes at
+  most 6 s. Tune the whole card with `flow_speed`.
 - **The RSSI fan** uses four ascending bars; the number of lit bars indicates
   quality, with the `-21 dBm` reading next to it. Hovering shows a
   description:
@@ -190,18 +213,6 @@ All values come from plain entity states — **the recorder is not required**.
 
   Hidden automatically when the device does not report `rssi`; disable with
   `show_rssi: false`.
-- **The two small chips (PV2 / smart plug)** cover the two branches the
-  illustration has no node for. The device computes load as:
-
-  ```
-  load = grid + plug + PV2 − smart_plug
-  ```
-
-  so those two branches are part of `load` but have no node of their own — which
-  is why the four big numbers alone do not add up. A chip appears only when its
-  reading is **non-zero** (an idle branch has no business taking up space), and
-  the other chip moves up rather than leaving a gap. Set `show_extras: false` to
-  remove the pair.
 - Override individual entities with the suffix-keyed `entities:` map:
 
   ```yaml
@@ -209,32 +220,18 @@ All values come from plain entity states — **the recorder is not required**.
     system_pv_power: sensor.my_pv_power
     system_battery_power: sensor.my_battery_power
     system_grid_power: sensor.my_grid_power
-    grid_on_power: sensor.my_grid_on_power
     system_load_power: sensor.my_load_power
+    system_smart_plug_power: sensor.my_system_smart_plug_power
     soc: sensor.my_soc
     battery_status: sensor.my_battery_status
     rssi: sensor.my_rssi
-    system_pv2_power: sensor.my_system_pv2_power
-    system_smart_plug_power: sensor.my_system_smart_plug_power
   ```
 
-### Meter vs. no meter
+### Sign conventions
 
-The device-side data cannot distinguish the grid from the house when no meter is
-installed, so the card renders two layouts:
-
-- **Meter installed** (`sys_grid_p` non-zero) — four nodes; the grid node shows
-  the meter reading with an *importing / exporting* pill, and the house load
-  gets its own callout in the top-right corner.
-- **No meter** — the load callout and its connector are dropped, and the
-  bottom-right node becomes *Grid & load*, showing the device-level on-grid port
-  power (`grid_on_p`).
-
-The two readings use **opposite sign conventions** (`sys_grid_p` is positive while
-importing, `grid_on_p` is negative because the firmware treats power flowing
-*into* the unit as negative). The card normalises both to "am I importing?"
-before drawing. A node carrying no power gets no pill at all — not a *standby*
-chip.
+`sys_grid_p` is **positive while importing** and the storage power is
+**negative while charging**; the card normalises both before drawing. A node
+carrying no power gets a grey ring — never a *standby* chip.
 
 ---
 
@@ -242,7 +239,23 @@ chip.
 
 Draws the physical battery stack module by module, so the picture always matches
 how many packs are actually installed (1–4), each with its own SOC and
-temperature callout alternating left / right.
+temperature callout alternating left / right. The illustration follows the
+product photos: one body with a single light-to-dark gradient, thin seams
+between the modules, the brand badge on the first module, and a dark head
+drawing the hardware's **display bar** — the power symbol, the PV reading with
+its SOLAR caption, the SOC between two chevrons, and the battery reading with
+its BATTERY caption. The drawn unit is a clean rectangle: no side panel, no
+feet.
+
+  - SOLAR and BATTERY show **this unit's own** `pv_power` / `bat_power` (the
+    panel depicts the device itself); the corner callouts keep the system level
+    readings. The values are shown as they are — no zero padding — and clamp at
+    four digits (9999 W).
+  - **The chevrons are the charge / discharge indicator**: charging draws the
+    left one, discharging the right one, both in white, and an idle battery
+    draws neither. Charging is negative battery power, matching the firmware.
+
+The head module is also where the **host temperature** is called out.
 
 ```yaml
 type: custom:hoymiles-battery
@@ -258,6 +271,7 @@ language: zh
 | `show_title` | bool | `true` | `false` hides the heading. |
 | `language` | `zh` \| `en` | *auto* | Pin the card's language. Omit it to follow the Home Assistant user's language. |
 | `show_history` | bool | `true` | Optional history section (needs the recorder). |
+| `show_host_temp` | bool | `true` | `false` hides the head unit temperature. |
 | `max_width` | number (px) | `560` | Maximum width of the illustration. |
 | `alarm_entity` | entity id | — | Shows a bell next to the title while this entity is `on`. |
 | `entities` | map | — | Entity overrides (see below). |
@@ -273,6 +287,7 @@ language: zh
 | `soc` | System SOC |
 | `pack<N>_soc` | Per-pack SOC |
 | `pack<N>_temperature` | Per-pack temperature |
+| `battery_temperature` | Firmware's own battery temperature (head temperature fallback) |
 
 ### Behaviour notes
 
@@ -285,6 +300,12 @@ language: zh
   truncation.
 - Per-pack values use `pack<i>_soc` / `pack<i>_temperature`; the surrounding
   powers use `pv_power`, `grid_on_power`, `grid_off_power`, `battery_power`.
+- **The head unit temperature is the average of the installed packs**, drawn as
+  one more callout in the same style as the per-pack ones — the head has no
+  sensor of its own, so the vendor app shows the same measure. Packs that report
+  no temperature are skipped, and if none of them do the firmware's
+  `battery_temperature` (`bat_temp`) is used instead. `show_host_temp: false`
+  removes the callout.
 - The signal bars next to the title are derived from `rssi` (dBm).
 - The history section (optional) reads long-term statistics via
   `recorder/statistics_during_period`, plotting pack SOC and summarising charge /
@@ -353,6 +374,7 @@ series:
 | `unit` | string | — | Y-axis unit label. Auto-promotes to kW above 1.5 kW. |
 | `zero_line` | bool | `true` | Draw the zero line. |
 | `symmetric` | bool | `true` | `false` draws a bottom-up axis from min to max — use it for SOC. |
+| `stack` | bool | = `symmetric` | `false` overlays the curves instead of stacking them. Leave it off for a *level* (SOC, temperature); stack only series that add up (power, energy). |
 | `min` / `max` | number | — | Fixed axis limits. |
 | `span` | number | — | Fixed half-range when `symmetric` is on. |
 | `sync_group` | string | — | Cards sharing a group share their time window (range + date). |
@@ -369,6 +391,12 @@ series:
   shows `1.25` instead of rounding to `1`.
 - Fixing `span` / `min` / `max` keeps the same scale across different days, which
   makes side-by-side comparison possible.
+- **Stacking follows the axis unless you say otherwise.** Power and energy
+  series stack, because `charge + discharge` is a sum worth reading as a total.
+  A *level* must never stack: three packs at 81 % would be drawn at 0..81 %,
+  81..162 % and 162..243 %, so on a 0..100 axis only the first pack stays
+  visible. `symmetric: false` (the SOC / temperature axis) therefore overlays
+  by default; `stack: true` / `false` overrides it either way.
 - **Click a legend entry to highlight that curve** — the selected curve thickens
   and brightens while the others fade back. Click it again (or click the chart)
   to clear. The tooltip dims faded curves to match.

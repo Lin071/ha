@@ -124,16 +124,17 @@ function _hmPowerFlowRegister() {
      length, so a short stub and a long line no longer look like different
      animals.
 
-     Tuned twice: the first values (40..230 px/s) crossed the 325 px PV
-     connector in 1.4 s and looked frantic, so they were halved; the user then
-     found that a little too calm and asked for a small step back up, which is
-     where these sit - the same connector now takes about 2.8 s. Use the card's
-     `flow_speed` option to nudge the whole thing (1 = default). */
-  const DOT_SPEED_MIN = 22; // px per second at ~0 W
-  const DOT_SPEED_MAX = 115; // px per second at full power
-  const DOT_SPEED_PER_W = 0.13; // px/s gained per watt, saturates near 715 W
-  const DOT_DUR_MIN = 1.2; // s, keeps the very short stubs readable
-  const DOT_DUR_MAX = 7.0; // s
+     Tuned three times: the first values (40..230 px/s) crossed the 233 unit PV
+     connector in 1.0 s and looked frantic, so they were more than halved; the
+     user then found that a little too calm and asked for a step up, and then
+     for one more, which is where these sit - the same connector now crosses in
+     about 1.6 s. Use the card's `flow_speed` option to nudge the whole thing
+     (1 = default). */
+  const DOT_SPEED_MIN = 28; // px per second at ~0 W
+  const DOT_SPEED_MAX = 150; // px per second at full power
+  const DOT_SPEED_PER_W = 0.17; // px/s gained per watt, saturates near 720 W
+  const DOT_DUR_MIN = 1.0; // s, keeps the very short stubs readable
+  const DOT_DUR_MAX = 6.0; // s
   /* The readings arrive once a second and their last digit jumps about, so the
      pearls low pass the power over this long; without it the dots stutter in
      step with the pushes instead of gliding. */
@@ -170,7 +171,7 @@ function _hmPowerFlowRegister() {
    * it and the page keeps the stale copy - exactly the problem it exists to
    * solve.
    * ------------------------------------------------------------------ */
-  const BUILD = "2026-10-14d seated-diagonals+ring-clipped-artwork+faster-pearls+build-probe+no-auto-reload";
+  const BUILD = "2026-10-14e no-direction-marks+faster-pearls+build-probe+no-auto-reload";
   const BUILD_URL = "/hoymiles_static/hoymiles-power-flow.js";
   const BUILD_POLL_MS = 60000;
   const BUILD_RELOAD_LIMIT = 2; // reloads per browser session
@@ -267,9 +268,10 @@ function _hmPowerFlowRegister() {
      than a node so it reads as the centre of the diagram. */
   const INV_ICON = 96;
   const JUNCTION = { x: NODE_COL_R, y: 232 };   // where the right branches meet
-  /* The two diagonal branches, as explicit endpoints: the arrow heads are
-     placed by interpolating between them, so the mark and the edge can never
-     drift apart.
+  /* The two diagonal branches, as explicit endpoints: the arrow heads used to
+     be placed by interpolating between them, so the two had to be kept in
+     step - the arrows are gone now and the endpoints are simply the ends of
+     the connector.
 
      Both start *on* the ring (34 units from the node centre, like the straight
      branches start on the edge of their artwork), so the line reaches the
@@ -878,10 +880,6 @@ function _hmPowerFlowRegister() {
            nothing is stroked on top of it.  The .pf-unit class is the one in
            the middle, which the app draws a little larger. */
         .pf-ic { display: block; }
-        .pf-mark { fill: none; stroke-width: 2.4;
-                   stroke-linecap: round; stroke-linejoin: round; }
-        .pf-mark.on { stroke: #22c55e; }
-        .pf-mark.off { stroke: var(--hm-pf-idle, #b6bcc4); }
 
         /* A pearl's opacity is written every frame (see pearlOpacity), so it
            must NOT be declared here: a stylesheet rule beats the presentation
@@ -1377,10 +1375,9 @@ function _hmPowerFlowRegister() {
 
       const dots = routes.map((r) => flowPearls(r, this._phaseOf(r.id))).join("");
 
-      /* One icon per node, the unit in the middle and the two direction marks
-         on the diagonals.  A branch whose entity is absent is dropped (and its
-         connector with it); a branch that exists but reads zero is still drawn,
-         in its dim variant - exactly like the app. */
+      /* One icon per node and the unit in the middle.  A branch whose entity is
+         absent is dropped (and its connector with it); a branch that exists but
+         reads zero is still drawn, in its dim variant - exactly like the app. */
       const nodes = this._nodes(d, {
         pv2: present(d.pv2),
         plug: present(d.smartPlug),
@@ -1437,6 +1434,11 @@ function _hmPowerFlowRegister() {
      * Every node is one group translated to its centre, and its artwork is
      * clipped to the ring (see NODE_CLIP_R) so the opaque white corner of the
      * square can never cover a connector that runs past it.
+     *
+     * There used to be a small arrow head on each diagonal branch showing which
+     * way the power went.  It is gone: the pearls already say that, and the
+     * arrow only added a second, coarser copy of the same information - the user
+     * asked for it to be removed.
      */
     _nodes(d, opts) {
       const t = (en, zh) => this._t(en, zh);
@@ -1454,20 +1456,6 @@ function _hmPowerFlowRegister() {
             <text class="pf-c" x="0" y="${NODE_R + 46}"
                   text-anchor="middle">${esc(caption)}</text>
           </g>`);
-      };
-
-      /* Arrow head on a diagonal branch: it sits along the line and points
-         away from the junction when the power leaves the node there, and
-         towards it when the power arrives.  Green while the branch works, grey
-         while it is idle - same two-tone rule as the node artwork. */
-      const mark = (a, b, reverse, on) => {
-        const at = (t) => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
-        const p0 = at(reverse ? 0.42 : 0.58);
-        const p1 = at(reverse ? 0.32 : 0.68);
-        const deg = Math.atan2(p1.y - p0.y, p1.x - p0.x) * 180 / Math.PI;
-        return `<g transform="translate(${p1.x.toFixed(1)}, ${p1.y.toFixed(1)}) rotate(${deg.toFixed(1)})">
-            <path class="pf-mark ${on ? "on" : "off"}" d="M-6 -4.6 L0 0 L-6 4.6"/>
-          </g>`;
       };
 
       node(NODE_COL_L, NODE_ROW_TOP, "pv", working(d.pv),
@@ -1497,16 +1485,6 @@ function _hmPowerFlowRegister() {
       if (opts.plug) {
         node(NODE_COL_R, NODE_ROW_BOT, "plug", working(d.smartPlug),
           fmtW(d.smartPlug), t("Smart plug", "智能插座"));
-      }
-
-      // Direction marks on the two diagonal branches, drawn above the edges.
-      // `reverse` must agree with the connector's own direction (see _svg), or
-      // the arrow head points the other way than the pearls travel.
-      if (opts.pv2) {
-        parts.push(mark(PV2_A, PV2_B, num(d.pv2) < 0, working(d.pv2)));
-      }
-      if (opts.lamp) {
-        parts.push(mark(LAMP_A, LAMP_B, num(d.load) >= 0, working(d.load)));
       }
 
       return parts.join("");

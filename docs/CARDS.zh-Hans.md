@@ -113,8 +113,18 @@ computeViewTitle = (view, index) => view.title ?? (view.path ? titleCase(view.pa
 
 ## 1. `custom:hoymiles-power-flow`
 
-把「家」画出来，并把实时的光伏 / 微储 / 电网 / 负载功率叠加在插图上，和手机 App
-首页一致。珠子沿连线流动，速度与该支路功率相关。
+把系统画成一张**接线示意图**（和手机 App 的系统页一致）：每条支路一个图标、
+中间是主机（App 那套「方框里插头」的图）、并网点用一个小圆点，连线是粗圆头线
+并带流动小球。节点图标直接用 App 的那套图（内嵌在卡片里）。
+
+- **中间的主机只要系统里有任何一路在动就用彩色图**，全系统都 0 W 时才用暗色图。
+
+```
+⬜ 光伏1 ──┐                       ┌── ⬜ 光伏2
+           ├── ▣ 逆变器 ─── ● ── ── ⬜ 电网
+⬜ 微储   ──┘                       └── ⬜ 灯泡
+                                     └── ⬜ 智能插座
+```
 
 ```yaml
 type: custom:hoymiles-power-flow
@@ -131,35 +141,43 @@ language: zh
 | `language` | `zh` \| `en` | *自动* | 钉死卡片语言；不填则跟随当前 Home Assistant 用户的语言。 |
 | `temperature_entity` | entity id | — | 标题右侧显示的温度实体 |
 | `show_rssi` | bool | `true` | 右上角 Wi-Fi 信号扇形 |
-| `show_extras` | bool | `true` | 左上角「光伏2 / 智能插座」小气泡 |
-| `gradient` | bool | `true` | 是否画浅色渐变底 |
+| `gradient` | bool | `true` | 是否画接线图下的**纯白底**。`false` 则不画，露出卡片自身底色――此时请配浅色主题，因为示意图的文字颜色是固定的 |
 | `max_width` | number (px) | `620` | 插图最大宽度，超宽时保持居中 |
 | `flow_speed` | number | `1` | 流动珠子速度倍数，`0.5` 更慢、`2` 更快 |
-| `has_meter` | `auto` \| `true` \| `false` | `auto` | 是否装了电网电表。`auto` 把非零的 `sys_grid_p` 视为有电表；判定逻辑见 `meter_zero_samples` |
-| `meter_zero_samples` | number | `10` | `auto` 模式下，需要连续多少个 0 读数才判定为「没有电表」。读数每秒一次，故默认约 10 秒 |
 | `entities` | map | — | 实体覆盖，键为后缀（见下） |
 
 ### 数据来源
 
-全部来自普通实体状态，**不依赖 recorder**。
+全部来自普通实体状态，**不依赖 recorder**；每条支路都直接取秒级 `quick/state`
+的系统实体，与 App 系统页同源：
 
 | 节点 | 实体后缀（`sensor.<dev>_…`） |
 |---|---|
-| 光伏 | `system_pv_power`（缺失时回退 `pv_power`） |
-| 微储 | `system_battery_power`（负 = 充电）+ `system_soc` |
-| 电网 | `system_grid_power`（正 = 受电） |
-| 负载 | `system_load_power` |
-| 光伏2 气泡 | `system_pv2_power` |
-| 智能插座气泡 | `system_smart_plug_power` |
-| 状态气泡 | `battery_status`（`standby` / `charge` / `discharge` / `lock`） |
+| 光伏1（左上） | `sys_pv_p` |
+| 光伏2（右上） | `sys_pv2_p` |
+| 电网（右） | `sys_grid_p`（正 = 受电） |
+| 灯泡（右下） | `sys_load_p` |
+| 智能插座（右下，灯泡下方） | `sys_sp_p` |
+| 微储（左下） | `sys_bat_p`（负 = 充电），缺失时回退 `bat_p`；SOC 取 `sys_soc` |
+| 状态 | `battery_status`（`standby` / `charge` / `discharge` / `lock`） |
 | 信号扇形 | `rssi`（dBm） |
 
 ### 行为说明
 
-- 连线只有该支路功率 **≥ 5 W** 时才显示流动小球，球的颜色随支路变化，速度随功率加快。
-- 珠子走完时间**按路径长度算**，所以短线与长线速度一致；1059 W 时 325px 的光伏连线
-  约 3.8 秒跑完。觉得还快/还慢就用 `flow_speed` 整体调。
-- 「微储」气泡显示电池真实状态；「电网」气泡显示 `电网输入` / `电网输出`。
+- **有功率（`|P| ≥ 5 W`）的支路用彩色图标，没功率的用同款暗色图标**，
+  这就是 App 表达「这里没数据」的方式，不用去读数字。
+- 实体**不存在**的支路（从机没有系统级读数）连节点和连线一起省略。
+- 电网标题随流向变化：取电显示 `电网输入`、馈网显示 `电网输出`、约 0 W 时
+  只写 `电网`——不假装知道方向。
+- 连线只有该支路功率 **≥ 5 W** 时才显示流动小球，而且小球**永远顺着能量流动的方向**：
+  从光伏1 / 光伏2 流出、从放电的微储流出、从取电的电网流入、流入充电的微储、
+  逆变器送电时从逆变器流向汇流点、电网或光伏2 给电池充电时倒流回逆变器，
+  以及流入灯泡 / 智能插座。球的颜色随支路变化，速度随功率加快。
+- **画面上不画方向箭头**：哪边进哪边出一律由流动小球表示（箭头只是同一件事的第二份
+  更粗糙的说明，已按要求去掉）。
+- 珠子走完时间**按路径长度算**，所以短线与长线速度一致（最快的支路约 1.5 s 走完，
+  最短的短线有 1.0 s 下限，低功率的长线最长 6 s）。觉得还快/还慢就用
+  `flow_speed` 整体调。
 - **右上角是 RSSI 信号图标**（与「电池卡片」及 App 的 Wi-Fi 图标同款）：
   四根高度递增的信号条，点亮的条数（0~4）表示信号质量，旁边直接跟 `-21 dBm`
   读数，悬停可看说明：
@@ -172,18 +190,6 @@ language: zh
   | < −75 dBm | 1（较弱） |
 
   设备不上报 `rssi` 时自动隐藏，不需要可以把 `show_rssi` 设为 `false`。
-- **左上角两个小气泡（光伏2 / 智能插座）** 用来补齐插图上没有节点的两条支路。
-  设备侧的负载是这么算出来的：
-
-  ```
-  负载 = 电网 + 插座 + 光伏2 − 智能插座
-  ```
-
-  也就是说「光伏2」和「智能插座」参与了 `负载` 的计算，但插图上只有「光伏」一个
-  节点，只看四个大数字是对不上账的，所以把这两路单独做成小气泡显示。
-  从机不上报这两个字段时（读到 `null`）气泡自动隐藏；**读数正好为 0 时也不显示**
-  （该支路没有功率流动，不必占地方），两件事同时发生时插图上就不会出现气泡。
-  只上报一个时，剩下的那个会顶到最上面，不会留空位。整组关掉用 `show_extras: false`。
 - 单独覆盖某个实体用 `entities:` 段：
 
   ```yaml
@@ -191,27 +197,17 @@ language: zh
     system_pv_power: sensor.my_pv_power
     system_battery_power: sensor.my_battery_power
     system_grid_power: sensor.my_grid_power
-    grid_on_power: sensor.my_grid_on_power
     system_load_power: sensor.my_load_power
+    system_smart_plug_power: sensor.my_system_smart_plug_power
     soc: sensor.my_soc
     battery_status: sensor.my_battery_status
     rssi: sensor.my_rssi
-    system_pv2_power: sensor.my_system_pv2_power
-    system_smart_plug_power: sensor.my_system_smart_plug_power
   ```
 
-### 有电表 / 无电表两种版式
+### 符号约定
 
-没有装电表时，设备侧数据无法区分「电网」和「家里」，所以卡片有两种画法：
-
-- **装了电表**（`sys_grid_p` 非零）—— 四个节点；电网节点显示电表读数并带
-  `电网输入` / `电网输出` 药丸标签，家里负载在右上角有独立标注。
-- **没有电表** —— 去掉负载标注及其连线，右下角节点变成「电网&负载」，
-  显示设备侧并网口功率（`grid_on_p`）。
-
-两个读数**符号约定相反**（`sys_grid_p` 受电为正，`grid_on_p` 受电为负，因为固件把
-「功率流入设备」定义为负）。卡片在绘制前统一成「是否在受电」。没有功率流动的节点
-不会挂任何药丸标签，而不是显示「待机」。
+`sys_grid_p` **受电为正**，微储功率**充电为负**；卡片在绘制前统一成能直接
+理解的语义。没有功率流动的节点只是灰环，不会挂「待机」标签。
 
 ---
 
@@ -219,6 +215,18 @@ language: zh
 
 按**实际电池包数量**自适应绘制电池堆：1～4 个电池包各对应一种外形，每个模组
 配一个左右交替的气泡显示自己的 SOC 与温度（和 App 的 HiBattery X 页面一致）。
+插图按**产品图**绘制：整体一块机身加自顶向下由浅到深的单一渐变、模组之间细缝分隔、
+品牌圆标放在第一个模组上；顶部深色头模组画的是**显示条**——电源符号、
+「000 W / SOLAR」、两个尖括号夹住的 SOC、「000 W / BATTERY」
+（真机显示条上那组小状态图标与 Wi-Fi / 循环符号不上看板，已省略）。
+整机画成一个干净矩形：没有侧板，也没有脚。
+
+  - SOLAR / BATTERY 显示的是**本机**的 `pv_power` / `bat_power`（面板画的是设备自身），
+    四个角的气泡仍用系统级读数。数值按实际显示（**不补零**），最大到四位（9999 W）。
+  - **两个尖括号就是充放电指示**：充电时画左箭头、放电时画右箭头，都是白色；电池待机时两个都不画。
+    充电对应电池功率为负，与固件约定一致。
+
+主机温度的气泡也指向这个头模组。
 
 ```yaml
 type: custom:hoymiles-battery
@@ -234,6 +242,7 @@ language: zh
 | `show_title` | bool | `true` | `false` 隐藏标题 |
 | `language` | `zh` \| `en` | *自动* | 钉死卡片语言；不填则跟随当前 Home Assistant 用户的语言。 |
 | `show_history` | bool | `true` | 可选历史数据区（需启用 recorder） |
+| `show_host_temp` | bool | `true` | `false` 隐藏主机温度 |
 | `max_width` | number (px) | `560` | 插图最大宽度 |
 | `alarm_entity` | entity id | — | 该实体为 `on` 时标题左侧显示铃铛 |
 | `entities` | map | — | 实体覆盖（见下表） |
@@ -249,6 +258,7 @@ language: zh
 | `soc` | 系统 SOC |
 | `pack<N>_soc` | 逐包 SOC |
 | `pack<N>_temperature` | 逐包温度 |
+| `battery_temperature` | 固件自己算的电池温度（主机温度的兵底） |
 
 ### 行为说明
 
@@ -258,6 +268,10 @@ language: zh
   SOC 的 `pack1_soc`…`pack4_soc` 推断，上限 4（与固件 `packs` 截断一致）。
 - 逐包数据用 `pack<i>_soc` / `pack<i>_temperature`；四周功率用 `pv_power`、
   `grid_on_power`、`grid_off_power`、`battery_power`。
+- **主机温度取已安装电池包的平均值**，画成一个与逐包气泡同款的独立气泡（标注为
+  「主机」，样式与 Battery 1/2/3 完全一致）——头部本身没有温度传感器，厂商 App 用的
+  也是这个口径。读不到温度的包不参与平均；一个都读不到时回退到固件的
+  `battery_temperature`（`bat_temp`）。`show_host_temp: false` 可去掉该气泡。
 - 标题右侧的信号格数由 `rssi`（dBm）换算。
 - 历史数据区（可选）通过 `recorder/statistics_during_period` 读取长期统计，画 SOC
   曲线并汇总该区间的充电 / 放电电量；recorder 未启用时只提示、不影响其余部分。
@@ -291,8 +305,10 @@ show_temperature: false
 ## 4. `custom:hoymiles-history-chart`
 
 按**日 / 月 / 年**查看曲线，并可用 `‹` `›` 或日期输入框翻到任意时间段，绘制风格与
-厂商 App 的历史页一致。正值向上、负值向下堆叠，因此「充电 / 放电」这类双极性传感器
-会自然地分居 0 线两侧。
+厂商 App 的历史页一致。功率 / 电量这类**会相加**的 series 会堆叠（正值向上、负值向下，
+因此「充电 / 放电」双极性传感器自然分居 0 线两侧）；而 SOC、温度这类**水平量**默认
+**叠加显示**——三个电池包都是 81% 时若堆叠，第二条曲线会被画到 81~162%、第三条到
+162~243%，在 0~100 的轴上就只有第一条看得见。用 `stack` 可显式指定。
 
 ```yaml
 type: custom:hoymiles-history-chart
@@ -322,6 +338,7 @@ series:
 | `unit` | string | — | 纵轴单位（超过 1.5 kW 自动换成 kW） |
 | `zero_line` | bool | `true` | 是否画 0 线 |
 | `symmetric` | bool | `true` | `false` = 从 min 到 max 自底向上（SOC 用） |
+| `stack` | bool | 同 `symmetric` | `false` = 各条曲线叠加显示而不堆叠；**水平量（SOC、温度）不要堆叠**，只有会相加的量（功率、电量）才堆叠 |
 | `min` / `max` | number | — | 固定上下限 |
 | `span` | number | — | 对称模式下固定半量程 |
 | `sync_group` | string | — | 同一组的卡片共享时间窗口（范围 + 日期） |
