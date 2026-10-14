@@ -124,15 +124,16 @@ function _hmPowerFlowRegister() {
      length, so a short stub and a long line no longer look like different
      animals.
 
-     These are deliberately calm: at 1059 W the 325 px PV connector takes about
-     3.8 s to cross, which reads as a gentle drift instead of a race. The old
-     values (40..230 px/s) made it cross in 1.4 s, which looked frantic. Use the
-     card's `flow_speed` option to nudge the whole thing (1 = default). */
-  const DOT_SPEED_MIN = 18; // px per second at ~0 W
-  const DOT_SPEED_MAX = 85; // px per second at full power
-  const DOT_SPEED_PER_W = 0.1; // px/s gained per watt, saturates near 670 W
-  const DOT_DUR_MIN = 1.4; // s, keeps the very short stubs readable
-  const DOT_DUR_MAX = 9.0; // s
+     Tuned twice: the first values (40..230 px/s) crossed the 325 px PV
+     connector in 1.4 s and looked frantic, so they were halved; the user then
+     found that a little too calm and asked for a small step back up, which is
+     where these sit - the same connector now takes about 2.8 s. Use the card's
+     `flow_speed` option to nudge the whole thing (1 = default). */
+  const DOT_SPEED_MIN = 22; // px per second at ~0 W
+  const DOT_SPEED_MAX = 115; // px per second at full power
+  const DOT_SPEED_PER_W = 0.13; // px/s gained per watt, saturates near 715 W
+  const DOT_DUR_MIN = 1.2; // s, keeps the very short stubs readable
+  const DOT_DUR_MAX = 7.0; // s
   /* The readings arrive once a second and their last digit jumps about, so the
      pearls low pass the power over this long; without it the dots stutter in
      step with the pushes instead of gliding. */
@@ -169,7 +170,7 @@ function _hmPowerFlowRegister() {
    * it and the page keeps the stale copy - exactly the problem it exists to
    * solve.
    * ------------------------------------------------------------------ */
-  const BUILD = "2026-10-14 hand-animated-pearls+smooth-speed+build-probe+no-auto-reload";
+  const BUILD = "2026-10-14d seated-diagonals+ring-clipped-artwork+faster-pearls+build-probe+no-auto-reload";
   const BUILD_URL = "/hoymiles_static/hoymiles-power-flow.js";
   const BUILD_POLL_MS = 60000;
   const BUILD_RELOAD_LIMIT = 2; // reloads per browser session
@@ -243,6 +244,19 @@ function _hmPowerFlowRegister() {
    * energy is going; everything else stays grey.
    * ------------------------------------------------------------------ */
   const NODE_R = 34;
+  /* The node artwork is an opaque square: its ring fills the 68x68 box, and
+     everything outside the ring but inside the box is white.  That white
+     corner is invisible on the white backdrop, but it also *paints over* the
+     connectors drawn before it - which is why the two diagonal branches (the
+     only ones whose line starts inside the box, not exactly on its edge) came
+     out cut short and square-ended instead of touching their ring.
+
+     Clipping the artwork to a circle of the ring's own radius keeps the white
+     corners from ever covering a connector, so a line that starts on the ring
+     is visible right up to it, whatever direction it leaves in.  35 is just
+     past the ink (measured 34.8..35.0 at 10x) so nothing of the ring is cut. */
+  const NODE_CLIP_R = 35;
+  const NODE_CLIP_ID = "hm-pf-ring-clip";
   const NODE_ROW_TOP = 108;
   const NODE_ROW_BOT = 356;
   const NODE_COL_L = 104;
@@ -255,10 +269,15 @@ function _hmPowerFlowRegister() {
   const JUNCTION = { x: NODE_COL_R, y: 232 };   // where the right branches meet
   /* The two diagonal branches, as explicit endpoints: the arrow heads are
      placed by interpolating between them, so the mark and the edge can never
-     drift apart. */
+     drift apart.
+
+     Both start *on* the ring (34 units from the node centre, like the straight
+     branches start on the edge of their artwork), so the line reaches the
+     ring instead of stopping in mid air next to it - the lamp end used to sit
+     45.6 units out, which left a visible gap at the node. */
   const PV2_A = { x: 492.8, y: 131.3 };
   const PV2_B = { x: JUNCTION.x, y: JUNCTION.y - 6 };
-  const LAMP_A = { x: 507.2, y: 332.7 };
+  const LAMP_A = { x: 498.7, y: 341.4 };
   const LAMP_B = { x: JUNCTION.x, y: JUNCTION.y + 6 };
   const PV2_ROUTE = `M${PV2_A.x} ${PV2_A.y} L${PV2_B.x} ${PV2_B.y}`;
   const LAMP_ROUTE = `M${LAMP_A.x} ${LAMP_A.y} L${LAMP_B.x} ${LAMP_B.y}`;
@@ -1379,6 +1398,9 @@ function _hmPowerFlowRegister() {
         ${this._config.gradient === false
           ? ""
           : `<rect x="0" y="0" width="${VB_W}" height="${VB_H}" fill="#ffffff"/>`}
+        <clipPath id="${NODE_CLIP_ID}" clipPathUnits="userSpaceOnUse">
+          <circle cx="0" cy="0" r="${NODE_CLIP_R}"/>
+        </clipPath>
         ${edges}
         ${dots}
         ${this._inverter(busy)}
@@ -1411,21 +1433,25 @@ function _hmPowerFlowRegister() {
      * that carries power (|P| >= MIN_FLOW) gets the coloured icon, an idle one
      * the dim grey variant, which is how the app reads "no data here" without
      * you having to read the number.
+     *
+     * Every node is one group translated to its centre, and its artwork is
+     * clipped to the ring (see NODE_CLIP_R) so the opaque white corner of the
+     * square can never cover a connector that runs past it.
      */
     _nodes(d, opts) {
       const t = (en, zh) => this._t(en, zh);
       const working = (v) => Math.abs(num(v)) >= MIN_FLOW;
       const parts = [];
 
-      const node = (x, y, icon, on, value, caption, mark) => {
+      const node = (x, y, icon, on, value, caption) => {
         const art = PF_ICONS[`${icon}.${on ? "on" : "off"}`] || "";
-        parts.push(`<g class="pf-node">
-            <image class="pf-ic" x="${x - NODE_R}" y="${y - NODE_R}"
-                   width="${NODE_R * 2}" height="${NODE_R * 2}" href="${art}"/>
-            ${mark || ""}
-            <text class="pf-v" x="${x}" y="${y + NODE_R + 26}"
+        parts.push(`<g class="pf-node" transform="translate(${x} ${y})">
+            <image class="pf-ic" x="${-NODE_R}" y="${-NODE_R}"
+                   width="${NODE_R * 2}" height="${NODE_R * 2}"
+                   clip-path="url(#${NODE_CLIP_ID})" href="${art}"/>
+            <text class="pf-v" x="0" y="${NODE_R + 26}"
                   text-anchor="middle">${value}</text>
-            <text class="pf-c" x="${x}" y="${y + NODE_R + 46}"
+            <text class="pf-c" x="0" y="${NODE_R + 46}"
                   text-anchor="middle">${esc(caption)}</text>
           </g>`);
       };
