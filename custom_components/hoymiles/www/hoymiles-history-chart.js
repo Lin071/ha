@@ -6,9 +6,13 @@
  * A power / SOC chart with a 日 / 月 / 年 selector and a date navigator, drawn
  * like the vendor app's history pages:
  *
- *   - every series is filled from the zero line, positive values stacking up
- *     and negative values stacking down, so a charge/discharge sensor reads
- *     naturally on both sides of the axis;
+ *   - every series is filled from the zero line; power / energy series stack
+ *     (positive values stacking up, negative values stacking down, so a
+ *     charge/discharge sensor reads naturally on both sides of the axis);
+ *   - a *level* such as SOC is drawn overlaid instead, because stacking two
+ *     packs at 81 % would put the second curve at 81..162 % and the third at
+ *     162..243 %, pushing everything but the first off a 0..100 axis. The
+ *     `stack` option makes the choice explicit;
  *   - the y axis is symmetric around 0 and auto-scales (W is promoted to kW
  *     once the range exceeds 1.5 kW, Wh to kWh ...);
  *   - hovering shows a guide line and the value of every series, and the same
@@ -31,6 +35,11 @@
  *   zero_line: true                 # optional, draw the 0 line (default true)
  *   symmetric: true                 # optional; false draws a bottom-up axis
  *                                   # (use it for SOC: min 0 / max 100)
+ *   stack: true                     # optional; false overlays the curves
+ *                                   # instead of stacking them. Defaults to
+ *                                   # the value of `symmetric`, so a bottom-up
+ *                                   # axis (SOC, temperature) overlays - a
+ *                                   # level must never stack.
  *   min / max: 0 / 100              # optional fixed axis limits
  *   span: 2500                      # optional fixed half-range when symmetric
  *   sync_group: living-room         # optional; cards sharing a group share
@@ -694,6 +703,16 @@ function _hmHistoryRegister() {
       });
 
       const symmetric = this._config.symmetric !== false;
+      /* Stacking depends on what the numbers *mean*, not on the axis. Power
+         and energy series that add up (charge + discharge, per-phase power)
+         stack; a level must never stack - with three packs at 81 % the second
+         curve would be drawn at 81..162 % and the third at 162..243 %, so on a
+         0..100 axis only the first stays visible, which reads as "Battery 2
+         and 3 are wrong". `symmetric: false` is only ever used for such a
+         level, so it defaults to overlay; `stack` overrides either way. */
+      const stacked = this._config.stack != null
+        ? this._config.stack !== false
+        : symmetric;
       const empty = () => times.map(() => 0);
       const add = (acc, other) => acc.map((v, k) => v + other[k]);
 
@@ -702,37 +721,49 @@ function _hmHistoryRegister() {
       let layers = [];
 
       if (symmetric) {
-        // Two independent stacks: positive parts grow upwards, negative parts
-        // grow downwards, which keeps a charge/discharge sensor readable on
-        // both sides of the zero line.
-        const pos = [];
-        const neg = [];
-        let runPos = empty();
-        let runNeg = empty();
-        values.forEach((vals) => {
-          const p = vals.map((v) => (v > 0 ? v : 0));
-          const n = vals.map((v) => (v < 0 ? v : 0));
-          pos.push(p);
-          neg.push(n);
-          runPos = add(runPos, p);
-          runNeg = add(runNeg, n);
-        });
-        runPos.forEach((v) => { if (v > max) max = v; });
-        runNeg.forEach((v) => { if (-v > max) max = -v; });
+        // Positive parts grow upwards, negative parts grow downwards, which
+        // keeps a charge/discharge sensor readable on both sides of the zero
+        // line.
+        const pos = values.map((vals) => vals.map((v) => (v > 0 ? v : 0)));
+        const neg = values.map((vals) => vals.map((v) => (v < 0 ? v : 0)));
 
-        layers = this._config.series.map((s, i) => ({
-          series: s,
-          pos: {
-            base: pos.slice(0, i).reduce(add, empty()),
-            top: pos.slice(0, i + 1).reduce(add, empty()),
-          },
-          neg: {
-            base: neg.slice(0, i).reduce(add, empty()),
-            top: neg.slice(0, i + 1).reduce(add, empty()),
-          },
-        }));
-      } else {
-        // One cumulative stack rising from the baseline (SOC ...).
+        if (stacked) {
+          // Two independent stacks, each series riding on the ones before it.
+          let runPos = empty();
+          let runNeg = empty();
+          const cums = pos.map((p, i) => {
+            const layer = {
+              posBase: runPos,
+              negBase: runNeg,
+              posTop: add(runPos, p),
+              negTop: add(runNeg, neg[i]),
+            };
+            runPos = layer.posTop;
+            runNeg = layer.negTop;
+            return layer;
+          });
+          const last = cums[cums.length - 1];
+          last.posTop.forEach((v) => { if (v > max) max = v; });
+          last.negTop.forEach((v) => { if (-v > max) max = -v; });
+
+          layers = series.map((s, i) => ({
+            series: s,
+            pos: { base: cums[i].posBase, top: cums[i].posTop },
+            neg: { base: cums[i].negBase, top: cums[i].negTop },
+          }));
+        } else {
+          // Overlaid: every curve grows from the zero line on its own.
+          pos.forEach((p) => p.forEach((v) => { if (v > max) max = v; }));
+          neg.forEach((n) => n.forEach((v) => { if (-v > max) max = -v; }));
+
+          layers = series.map((s, i) => ({
+            series: s,
+            pos: { base: empty(), top: pos[i] },
+            neg: { base: empty(), top: neg[i] },
+          }));
+        }
+      } else if (stacked) {
+        // One cumulative stack rising from the baseline (energy series).
         const cums = [];
         let run = empty();
         values.forEach((vals) => {
@@ -744,9 +775,21 @@ function _hmHistoryRegister() {
           if (v > max) max = v;
           if (v < min) min = v;
         });
-        layers = this._config.series.map((s, i) => ({
+        layers = series.map((s, i) => ({
           series: s,
           pos: { base: cums[i * 2], top: cums[i * 2 + 1] },
+          neg: null,
+        }));
+      } else {
+        // A level drawn bottom-up (SOC): every curve is plotted at its own
+        // value so the series can be compared directly.
+        values.forEach((vals) => vals.forEach((v) => {
+          if (v > max) max = v;
+          if (v < min) min = v;
+        }));
+        layers = series.map((s, i) => ({
+          series: s,
+          pos: { base: empty(), top: values[i] },
           neg: null,
         }));
       }
@@ -1181,6 +1224,16 @@ function _hmHistoryRegister() {
             @change=${this._changed("height")}></ha-textfield>
           <ha-textfield label="sync_group" .value=${config.sync_group || ""}
             @change=${this._changed("sync_group")}></ha-textfield>
+          <label class="sw">
+            <ha-switch .checked=${config.symmetric !== false}
+              @change=${this._toggle("symmetric")}></ha-switch>
+            <span>symmetric (off = bottom-up axis, for SOC / temperature)</span>
+          </label>
+          <label class="sw">
+            <ha-switch .checked=${config.stack === true}
+              @change=${this._toggle("stack")}></ha-switch>
+            <span>stack (power and energy series only - never a level like SOC)</span>
+          </label>
           <label class="sw">
             <ha-switch .checked=${config.show_toolbar !== false}
               @change=${this._toggle("show_toolbar")}></ha-switch>
