@@ -28,6 +28,7 @@
  *   title: Device control
  *   show_phase: true            # optional, default true
  *   show_power_ctrl: true       # optional, default true
+ *   show_log: true              # optional, default true; the MQTT log row
  *   show_topics: true           # optional, default false; show the MQTT topic
  *                               # of every row (engineering detail)
  *   subtitle: false             # optional; hide the grey line under the title
@@ -36,6 +37,16 @@
  * rounded group per section, rows of icon + name + right-aligned control, and
  * hairline separators that stop short of the card edge. The MQTT topic paths
  * are hidden by default - they are useful while debugging but noisy in use.
+ *
+ * The last row of "Plan & maintenance" is an **MQTT log**, off by default. While
+ * it is on the card subscribes to the device's topic tree over the Home
+ * Assistant websocket (the `mqtt/subscribe` command) and streams both directions
+ * in one list: what the device publishes (state topics, discovery configs, TOU
+ * acknowledgements) and what Home Assistant sends to it (command topics).
+ * Nothing is subscribed - and nothing is shown - while the switch is off, so the
+ * card costs nothing until it is needed. `mqtt/subscribe` is an admin-only
+ * command in Home Assistant, so a non-admin user sees an explanation instead of
+ * a stream.
  * ========================================================================== */
 
 function _hmControlRegister() {
@@ -109,6 +120,28 @@ function _hmControlRegister() {
 
   const PING_MS = 8000; // how long the "sent" confirmation stays visible
 
+  /* ------------------------------------------------------------------ *
+   * MQTT log
+   *
+   * One wildcard subscription covers the whole topic tree of this device, so a
+   * single stream carries both directions:
+   *
+   *   homeassistant/<component>/<dev_id>/...   firmware + integration topics
+   *   hoymiles/<dev_id>/...                    integration bookkeeping
+   *                                            (availability, EMS mode echo)
+   *
+   * Direction is read off the topic: Home Assistant writes to the command side
+   * (`/set`, `/command`, `/trigger`, `/get`), the device publishes everything
+   * else. The `hoymiles/` family is the integration's own, so it counts as
+   * downlink too. This is a heuristic, but a topic cannot be told apart from
+   * its payload, and the alternative (hard-coding every topic of the protocol)
+   * would silently miss new ones.
+   * ------------------------------------------------------------------ */
+  const LOG_DOWNLINK = /\/(set|command|trigger|get)$/;
+  const LOG_MAX = 200;          // entries kept (quick/state alone is one a second)
+  const LOG_PAYLOAD_MAX = 1200; // characters shown per entry before truncating
+  const LOG_QOS = 0;            // observing only: never add broker load
+
   /* Power on/off is slow: the firmware has to bring the PCS (and the packs)
      down or up again, so the card shows the requested state as pending until
      the device reports it (or gives up after this long). */
@@ -151,6 +184,7 @@ function _hmControlRegister() {
         _toast: { type: String },
         _toastError: { type: Boolean },
         _optimistic: { type: Object },
+        _logOpen: { type: Boolean },
       };
     }
 
@@ -173,6 +207,15 @@ function _hmControlRegister() {
       this._switchPending = null;
       this._switchConfirmedAt = 0;
       this._pendingTimer = null;
+      /* MQTT log. The entries live in `_log` (the source of truth) and are
+         appended to the DOM by hand - see `_syncLogDom` for why. */
+      this._logOpen = false;
+      this._log = [];
+      this._logDropped = 0;
+      this._logErr = "";
+      this._logList = null;
+      this._logUnsubs = [];
+      this._logGen = 0;
     }
 
     static getConfigElement() {
@@ -328,6 +371,45 @@ function _hmControlRegister() {
         .state { font-size: 13px; color: var(--secondary-text-color);
                  white-space: nowrap; }
         .state.live { color: var(--primary-color); font-weight: 500; }
+
+        /* MQTT log. It sits inside the "Plan & maintenance" group, directly
+           under its own row, and grows downwards - the panel itself is the
+           scroll container so the card never jumps. */
+        .log-block { border-top: 1px solid var(--divider-color); }
+        .log-head { display: flex; align-items: center; gap: 8px;
+                    padding: 10px 14px 6px; }
+        .log-head .log-title { font-size: 12.5px; font-weight: 500;
+                               color: var(--primary-text-color); }
+        .log-head .log-count { font-size: 12px; margin-right: auto;
+                               color: var(--secondary-text-color);
+                               font-variant-numeric: tabular-nums; }
+        .log-list { display: flex; flex-direction: column; gap: 6px;
+                    max-height: 280px; overflow: auto; padding: 0 14px 8px; }
+        .log-row { font-size: 12px; border-radius: 10px; padding: 6px 8px;
+                   background: var(--secondary-background-color, rgba(120,120,128,.10)); }
+        .log-row .log-meta { display: flex; align-items: center; gap: 6px;
+                             flex-wrap: wrap; }
+        .log-row .log-time { color: var(--secondary-text-color);
+                             font-variant-numeric: tabular-nums; }
+        .log-row .log-dir { font-size: 11px; line-height: 1.5;
+                            padding: 0 6px; border-radius: 999px;
+                            background: rgba(120,120,128,.20);
+                            color: var(--secondary-text-color); }
+        .log-row.down .log-dir { background: rgba(3,169,244,.16);
+                                 color: var(--primary-color); }
+        .log-row .log-topic { font-family: ui-monospace, SFMono-Regular, Menlo,
+                              Consolas, monospace; word-break: break-all;
+                              color: var(--primary-text-color); }
+        .log-row pre.log-payload { margin: 4px 0 0; white-space: pre-wrap;
+                                   word-break: break-all; max-height: 140px;
+                                   overflow: auto; font-size: 11.5px;
+                                   font-family: ui-monospace, SFMono-Regular, Menlo,
+                                   Consolas, monospace;
+                                   color: var(--secondary-text-color); }
+        .log-hint { padding: 0 14px 10px; font-size: 12px;
+                    color: var(--secondary-text-color); }
+        .log-hint.err { color: var(--error-color); }
+        .btn.small { padding: 5px 10px; font-size: 12.5px; }
         .toast { margin-top: 12px; font-size: 13px; padding: 10px 13px;
                  border-radius: 12px;
                  background: var(--secondary-background-color, rgba(120,120,128,.12)); }
@@ -339,9 +421,14 @@ function _hmControlRegister() {
       if (!config || !config.dev_id) {
         throw new Error("hoymiles-control: 'dev_id' is required");
       }
+      const changed = this._config && this._config.dev_id !== config.dev_id;
       this._config = { ...config };
       this._cache.clear();
       this._initialised = false;
+      /* A different device means different topics, so the open log has to let
+         go of the old ones. Closing it is friendlier than silently subscribing
+         to the new device: the user asked for that view. */
+      if (changed && this._logOpen) this._closeLog();
     }
 
     set hass(hass) {
@@ -355,10 +442,23 @@ function _hmControlRegister() {
       return 13;
     }
 
+    connectedCallback() {
+      super.connectedCallback();
+      /* Dashboards disconnect cards when a view is left; coming back with the
+         log still switched on must resume the stream. The guard also keeps a
+         re-connect from subscribing twice. */
+      if (this._logOpen && !this._logUnsubs.length) this._subscribeLog();
+    }
+
     disconnectedCallback() {
       super.disconnectedCallback();
       if (this._toastTimer) clearTimeout(this._toastTimer);
       if (this._pendingTimer) clearTimeout(this._pendingTimer);
+      this._unsubscribeLog();
+    }
+
+    updated() {
+      this._syncLogDom();
     }
 
     /* ----------------------------- lookups ----------------------------- */
@@ -719,12 +819,301 @@ function _hmControlRegister() {
         this._t("Reboot", "重启"));
     }
 
+    /* ------------------------------- log ------------------------------- */
+
+    /** The two wildcards that cover this device: its tree, and ours. */
+    _logTopics() {
+      return [this._topic("+/<dev_id>/#"), `hoymiles/${this._dev()}/#`];
+    }
+
+    /**
+     * Which way does a message go? Home Assistant writes to the command side of
+     * a topic (`/set`, `/command`, `/trigger`, `/get`); everything else on the
+     * device's tree is published by the device itself. The `hoymiles/` family
+     * belongs to the integration, which is also this end of the link.
+     */
+    _logDown(topic) {
+      if (String(topic).startsWith("hoymiles/")) return true;
+      return LOG_DOWNLINK.test(String(topic));
+    }
+
+    /**
+     * Topic with the boilerplate stripped: `homeassistant/sensor/<dev>/quick/
+     * state` -> `sensor/quick/state`, `hoymiles/<dev>/availability` ->
+     * `integration/availability`. The full topic stays in the tooltip.
+     */
+    _logShort(topic) {
+      const text = String(topic);
+      const cut = `/${this._dev()}/`;
+      const i = text.indexOf(cut);
+      if (i < 0) return text;
+      const head = text.slice(0, i).replace(/^homeassistant\//, "").replace(/^hoymiles$/, "integration");
+      return `${head}/${text.slice(i + cut.length)}`;
+    }
+
+    /** Pretty print the payload when it is JSON, and cap what is shown. */
+    _logPayload(payload) {
+      const text = String(payload == null ? "" : payload);
+      if (text.trim() === "") return this._t("(empty)", "（空）");
+      let out = text;
+      const trimmed = text.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          out = JSON.stringify(JSON.parse(text), null, 2);
+        } catch (err) {
+          out = text; // not valid JSON after all - show it raw
+        }
+      }
+      if (out.length > LOG_PAYLOAD_MAX) {
+        const rest = out.length - LOG_PAYLOAD_MAX;
+        return `${out.slice(0, LOG_PAYLOAD_MAX)}… ${this._t(
+          `(${rest} more characters)`, `（还有 ${rest} 个字符）`,
+        )}`;
+      }
+      return out;
+    }
+
+    /** One entry, ready for the list. */
+    _logEntry(msg) {
+      const topic = String((msg && msg.topic) || "");
+      const payload = (msg && msg.payload) != null ? String(msg.payload) : "";
+      const down = this._logDown(topic);
+      const now = new Date();
+      const pad = (n) => String(n).padStart(2, "0");
+      return {
+        topic,
+        short: this._logShort(topic),
+        down,
+        text: this._logPayload(payload),
+        clock: `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`,
+      };
+    }
+
+    /**
+     * One rendered row. Built with DOM calls and `textContent` rather than
+     * markup: a payload is arbitrary text from the broker, and this way there is
+     * nothing to escape.
+     */
+    _logRow(entry) {
+      const row = document.createElement("div");
+      row.className = `log-row ${entry.down ? "down" : "up"}`;
+
+      const meta = document.createElement("div");
+      meta.className = "log-meta";
+      const time = document.createElement("span");
+      time.className = "log-time";
+      time.textContent = entry.clock;
+      const dir = document.createElement("span");
+      dir.className = "log-dir";
+      dir.textContent = entry.down
+        ? this._t("HA → device", "HA 下发")
+        : this._t("device → HA", "设备上报");
+      const topic = document.createElement("span");
+      topic.className = "log-topic";
+      topic.textContent = entry.short;
+      topic.title = entry.topic;
+      meta.append(time, dir, topic);
+
+      const body = document.createElement("pre");
+      body.className = "log-payload";
+      body.textContent = entry.text;
+
+      row.append(meta, body);
+      return row;
+    }
+
+    _onLogMessage(msg) {
+      if (!this._logOpen || !msg) return;
+      const entry = this._logEntry(msg);
+      this._log.push(entry);
+      while (this._log.length > LOG_MAX) {
+        this._log.shift();
+        this._logDropped += 1;
+      }
+      this._appendLogRow(entry);
+    }
+
+    /**
+     * Append one row, keeping the list bounded and scrolled to the newest
+     * message - unless the user has scrolled up to read, in which case the view
+     * is left where it is.
+     */
+    _appendLogRow(entry) {
+      const list = this._logList;
+      if (!list) return; // the panel is not in the DOM yet; the buffer has it
+      const atBottom = list.scrollTop + list.clientHeight >= list.scrollHeight - 24;
+      list.appendChild(this._logRow(entry));
+      while (list.children.length > LOG_MAX) list.removeChild(list.firstChild);
+      if (atBottom) list.scrollTop = list.scrollHeight;
+      this._syncLogFoot();
+    }
+
+    /**
+     * Pick up the freshly rendered panel (or restore it after a re-render) and
+     * refill it from the buffer.
+     *
+     * The list is filled by hand and deliberately not by Lit: the device pushes
+     * once a second, and re-rendering the card - sliders, segments and all -
+     * for every message would be a lot of churn for a log. Lit leaves the
+     * children of an element it did not create alone, so the rows survive.
+     */
+    _syncLogDom() {
+      const root = this.renderRoot;
+      const list = root && root.querySelector ? root.querySelector(".log-list") : null;
+      if (!list) {
+        this._logList = null;
+        return;
+      }
+      if (list !== this._logList) {
+        this._logList = list;
+        list.textContent = "";
+        for (const entry of this._log) list.appendChild(this._logRow(entry));
+        list.scrollTop = list.scrollHeight;
+      }
+      this._syncLogFoot();
+    }
+
+    /** The counter and the hint line, which also live outside Lit. */
+    _syncLogFoot() {
+      const root = this.renderRoot;
+      if (!root || !root.querySelector) return;
+      const open = this._config && this._config.show_log !== false;
+      const count = root.querySelector(".log-count");
+      if (count) {
+        const dropped = this._logDropped
+          ? this._t(` · ${this._logDropped} dropped`, ` · 已丢弃较早的 ${this._logDropped} 条`)
+          : "";
+        count.textContent = this._logErr
+          ? ""
+          : this._t(`${this._log.length} messages`, `${this._log.length} 条`) + dropped;
+      }
+      const hint = root.querySelector(".log-hint");
+      if (hint) {
+        hint.textContent = this._logErr
+          ? this._logErr
+          : (this._log.length || !open
+            ? ""
+            : this._t("Waiting for MQTT traffic…", "等待 MQTT 数据…"));
+        hint.className = `log-hint ${this._logErr ? "err" : ""}`;
+      }
+    }
+
+    /** Turn a subscribe failure into something a user can act on. */
+    _logSubscribeError(err) {
+      const raw = String((err && err.message) || err || "");
+      if (/unauthor|admin|forbidden|401|403/i.test(raw)) {
+        return this._t(
+          "Subscribing to MQTT needs an administrator account "
+          + "(Home Assistant restricts mqtt/subscribe).",
+          "订阅 MQTT 需要管理员账号（Home Assistant 限制 mqtt/subscribe 命令）。",
+        );
+      }
+      if (/unknown command|unknown_command|not found|not_found/i.test(raw)) {
+        return this._t(
+          "This Home Assistant has no mqtt/subscribe command - is the MQTT integration set up?",
+          "当前 Home Assistant 没有 mqtt/subscribe 命令——MQTT 集成是否已配置？",
+        );
+      }
+      return `${this._t("Subscribe failed", "订阅失败")}: ${raw}`;
+    }
+
+    /**
+     * Subscribe to the device's topics.
+     *
+     * `_logGen` guards the await: a subscription that lands after the switch was
+     * turned off again (or the card moved to another device) must be dropped
+     * instead of being stashed as a live one, or the list would keep growing
+     * with messages nobody asked for.
+     */
+    async _subscribeLog() {
+      this._logErr = "";
+      this._syncLogFoot();
+      const connection = this._hass && this._hass.connection;
+      if (!connection || typeof connection.subscribeMessage !== "function") {
+        this._logErr = this._t(
+          "No Home Assistant websocket connection.",
+          "没有 Home Assistant 的 WebSocket 连接。",
+        );
+        this._syncLogFoot();
+        this.requestUpdate();
+        return;
+      }
+
+      const gen = (this._logGen += 1);
+      for (const topic of this._logTopics()) {
+        try {
+          const unsub = await connection.subscribeMessage(
+            (msg) => this._onLogMessage(msg),
+            { type: "mqtt/subscribe", topic, qos: LOG_QOS },
+          );
+          if (gen !== this._logGen) {
+            if (typeof unsub === "function") unsub();
+            continue;
+          }
+          if (typeof unsub === "function") this._logUnsubs.push(unsub);
+        } catch (err) {
+          if (gen !== this._logGen) break;
+          this._logErr = this._logSubscribeError(err);
+        }
+      }
+      this._syncLogFoot();
+      this.requestUpdate();
+    }
+
+    _unsubscribeLog() {
+      const subs = this._logUnsubs;
+      this._logUnsubs = [];
+      this._logGen += 1; // any in-flight subscribe is now stale
+      for (const unsub of subs) {
+        try {
+          const result = unsub();
+          if (result && typeof result.catch === "function") result.catch(() => {});
+        } catch (err) {
+          /* already gone - nothing to do */
+        }
+      }
+    }
+
+    _toggleLog(on) {
+      if (on) {
+        this._logOpen = true;
+        this._log = [];
+        this._logDropped = 0;
+        this._logList = null;
+        this.requestUpdate();
+        this._subscribeLog();
+      } else {
+        this._closeLog();
+      }
+    }
+
+    _closeLog() {
+      this._logOpen = false;
+      this._unsubscribeLog();
+      /* Start clean next time: the retained configs and the last states arrive
+         again on the next subscribe anyway, so keeping them would only show the
+         same messages twice. */
+      this._log = [];
+      this._logDropped = 0;
+      this._logErr = "";
+      this._logList = null;
+      this.requestUpdate();
+    }
+
+    _clearLog() {
+      this._log = [];
+      this._logDropped = 0;
+      if (this._logList) this._logList.textContent = "";
+      this._syncLogFoot();
+    }
+
     /* ----------------------------- rendering ----------------------------- */
 
     render() {
       if (!this._config) return html``;
       const showPhase = this._config.show_phase !== false;
       const showPowerCtrl = this._config.show_power_ctrl !== false;
+      const showLog = this._config.show_log !== false;
 
       return html`
         <ha-card>
@@ -748,6 +1137,7 @@ function _hmControlRegister() {
           ${this._group(this._t("Plan & maintenance", "计划与维护"), [
             this._touItem(),
             this._rebootItem(),
+            showLog ? html`${this._logItem()}${this._logOpen ? this._logPanel() : ""}` : "",
           ])}
           ${this._toast === "" ? "" : html`
             <div class="toast ${this._toastError ? "err" : ""}">${this._toast}</div>`}
@@ -1021,6 +1411,48 @@ function _hmControlRegister() {
       });
     }
 
+    /**
+     * The MQTT log switch. Off by default: nothing is subscribed - and nothing
+     * is shown - until it is turned on, so the card costs nothing in normal use.
+     */
+    _logItem() {
+      const open = this._logOpen === true;
+      return this._item({
+        icon: "📋",
+        name: this._t("MQTT log", "MQTT 日志"),
+        sub: open
+          ? this._t(
+            "Live traffic: what the device reports and what HA sends",
+            "实时数据：设备上报 + HA 下发",
+          )
+          : this._t(
+            "Off. Turn on to watch what the device reports and what Home Assistant sends",
+            "默认关闭。打开后显示设备上报与 HA 下发的数据",
+          ),
+        ctrl: html`
+          <ha-switch .checked=${open}
+            @change=${(e) => this._toggleLog(e.target.checked)}></ha-switch>`,
+      });
+    }
+
+    /**
+     * The panel: a toolbar (counter + clear) and an empty list. Rows are added
+     * by `_syncLogDom` / `_appendLogRow`, not by Lit - see `_syncLogDom`.
+     */
+    _logPanel() {
+      return html`
+        <div class="log-block">
+          <div class="log-head">
+            <span class="log-title">${this._t("Traffic", "通信记录")}</span>
+            <span class="log-count"></span>
+            <button class="btn small"
+              @click=${() => this._clearLog()}>${this._t("Clear", "清空")}</button>
+          </div>
+          <div class="log-list"></div>
+          <div class="log-hint"></div>
+        </div>`;
+    }
+
     _untrusted(markup) {
       const template = document.createElement("template");
       template.innerHTML = markup;
@@ -1079,6 +1511,11 @@ function _hmControlRegister() {
             <ha-switch .checked=${config.show_topics === true}
               @change=${this._toggle("show_topics")}></ha-switch>
             <span>show_topics (show the MQTT topic of every row, for debugging)</span>
+          </label>
+          <label class="sw">
+            <ha-switch .checked=${config.show_log !== false}
+              @change=${this._toggle("show_log")}></ha-switch>
+            <span>show_log (MQTT log row in Plan &amp; maintenance, off until switched on)</span>
           </label>
         </div>
       `;

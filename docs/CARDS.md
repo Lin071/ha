@@ -503,6 +503,7 @@ title: 设备控制
 | `language` | `zh` \| `en` | *auto* | Pin the card's language. Omit it to follow the Home Assistant user's language. |
 | `show_power_ctrl` | bool | `true` | `false` hides the *Power control* row. |
 | `show_phase` | bool | `true` | `false` hides the *Per-phase output power* row. |
+| `show_log` | bool | `true` | `false` hides the *MQTT log* row (the log itself is off by default). |
 | `show_topics` | bool | `false` | Show the MQTT topic under each row (debugging). |
 | `subtitle` | bool | `true` | `false` hides the grey line next to the title. |
 
@@ -517,6 +518,32 @@ title: 设备控制
 | Per-phase output power | `number/<dev_id>/phase_output_power/set` | Sent as `{"phase_a":..,"phase_b":..,"phase_c":..}` |
 | Fetch TOU plan | `sensor/<dev_id>/tou_plan/get` | The reply is published on `tou_plan/status` |
 | Reboot | `button/<dev_id>/reboot/trigger` | Sends `RESTART` after a confirmation |
+| MQTT log | *(subscribes only, sends nothing)* | Off by default; on, it streams what the device reports and what HA sends |
+
+### MQTT log
+
+The last row of *Plan & maintenance* is an **MQTT log**, **off by default**. Turning it
+on subscribes to two wildcards over the Home Assistant websocket (the
+`mqtt/subscribe` command) and interleaves both directions on one timeline:
+
+| Wildcard | Carries |
+|---|---|
+| `homeassistant/+/<dev_id>/#` | what the device publishes (`quick/state` every second, `device/state`, `system/state`, `tou_plan/status`, the discovery configs) plus what HA sends (`set`, `command`, `trigger`, `get`) |
+| `hoymiles/<dev_id>/#` | the integration's own topics (`availability`, the EMS mode echo) |
+
+- Direction is read off the topic: the command side (`/set`, `/command`,
+  `/trigger`, `/get`) is *HA → device*, everything else on those trees is
+  *device → HA*, and the `hoymiles/` family belongs to this end as well.
+- Every row shows the time, a direction badge, the topic with the boilerplate
+  stripped (`sensor/quick/state`; the full topic is the tooltip) and the payload,
+  pretty printed when it is JSON and truncated when it is long.
+- The list keeps the **latest 200 messages** (a `quick/state` a second is about
+  three minutes), counts what it dropped, and scrolls to the newest message
+  unless you have scrolled up to read.
+- While it is off **nothing is subscribed**, so the card costs nothing; leaving
+  the view unsubscribes and coming back resumes it.
+- We could not make this cheaper: `mqtt/subscribe` is **admin-only** in Home
+  Assistant, so a non-admin user sees an explanation instead of a stream.
 
 ### Behaviour notes
 
@@ -531,6 +558,8 @@ title: 设备控制
   the device reports it, then keeps a tick visible for a moment.
 - MQTT topics are hidden by default because they are engineering detail that
   crowds out the content; enable `show_topics: true` when debugging.
+- The **MQTT log** (see above) is a per-card switch, not a global one: it is off
+  until you turn it on, and `show_log: false` removes the row entirely.
 
 ---
 

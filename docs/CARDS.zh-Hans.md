@@ -450,6 +450,7 @@ title: 设备控制
 | `language` | `zh` \| `en` | *自动* | 钉死卡片语言；不填则跟随当前 Home Assistant 用户的语言。 |
 | `show_power_ctrl` | bool | `true` | `false` 隐藏「功率控制」行 |
 | `show_phase` | bool | `true` | `false` 隐藏「多相输出功率」行 |
+| `show_log` | bool | `true` | `false` 隐藏「MQTT 日志」行（日志本身默认是关的） |
 | `show_topics` | bool | `false` | 在每行下方显示 MQTT 主题（调试用） |
 | `subtitle` | bool | `true` | `false` 隐藏标题右侧的灰色说明 |
 
@@ -464,6 +465,26 @@ title: 设备控制
 | 多相输出功率 | `number/<dev_id>/phase_output_power/set` | 按 `{"phase_a":..,"phase_b":..,"phase_c":..}` 下发 |
 | 获取 TOU 计划 | `sensor/<dev_id>/tou_plan/get` | 应答发布在 `tou_plan/status` |
 | 重启设备 | `button/<dev_id>/reboot/trigger` | 二次确认后发 `RESTART` |
+| MQTT 日志 | （不发送，只是订阅） | 默认关闭；打开后实时显示设备上报与 HA 下发的数据 |
+
+### MQTT 日志
+
+「计划与维护」最后一行是 **MQTT 日志**，**默认关闭**。打开后卡片会通过 Home Assistant 的
+WebSocket（`mqtt/subscribe` 命令）订阅两个通配主题，把两个方向的数据混在一条时间线上显示：
+
+| 通配主题 | 内容 |
+|---|---|
+| `homeassistant/+/<dev_id>/#` | 设备上报的状态（`quick/state` 1 秒、`device/state`、`system/state`、`tou_plan/status`、discovery 配置）+ HA 下发的命令（`set`/`command`/`trigger`/`get`） |
+| `hoymiles/<dev_id>/#` | 集成自己的主题（`availability` 在线看护、`ems_mode/state` 回显） |
+
+- 方向按主题判定：**HA 写命令侧**（`/set`、`/command`、`/trigger`、`/get`）记作
+  「HA 下发」，其余记作「设备上报」；`hoymiles/` 那一族是集成自己的，也算下发。
+- 每行显示时间、方向胶囊、去掉样板后的主题（如 `sensor/quick/state`，完整 topic 在悬停提示里）
+  和 payload；payload 是 JSON 就自动缩进，过长则截断。
+- 列表**只保留最近 200 条**（`quick/state` 每秒一条，约 3 分钟），丢弃的旧条数会计数显示。
+- 关闭时**不订阅任何主题**（不看就不占资源）；离开页面会退订，回到页面时若还开着会自动恢复。
+- 🔴 `mqtt/subscribe` 在 Home Assistant 里**仅管理员可用**，所以非管理员账号打开时会看到
+  一行提示而不是数据流。
 
 ### 行为说明
 
@@ -476,6 +497,8 @@ title: 设备控制
   显示为「待确认」最多 5 秒，直到设备回读到位，随后短暂显示对勾。
 - 每行的 MQTT topic **默认不显示**（它们是调试信息，会挤掉正文）；需要时用
   `show_topics: true` 打开。
+- **MQTT 日志**：见上一节。它默认关闭，开关就在「计划与维护」那一行；`show_log: false`
+  可以把整行去掉。
 
 ---
 
