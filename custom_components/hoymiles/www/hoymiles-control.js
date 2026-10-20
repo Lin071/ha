@@ -384,7 +384,7 @@ function _hmControlRegister() {
                                color: var(--secondary-text-color);
                                font-variant-numeric: tabular-nums; }
         .log-list { display: flex; flex-direction: column; gap: 6px;
-                    max-height: 280px; overflow: auto; padding: 0 14px 8px; }
+                    max-height: 340px; overflow: auto; padding: 0 14px 8px; }
         .log-row { font-size: 12px; border-radius: 10px; padding: 6px 8px;
                    background: var(--secondary-background-color, rgba(120,120,128,.10)); }
         .log-row .log-meta { display: flex; align-items: center; gap: 6px;
@@ -400,9 +400,16 @@ function _hmControlRegister() {
         .log-row .log-topic { font-family: ui-monospace, SFMono-Regular, Menlo,
                               Consolas, monospace; word-break: break-all;
                               color: var(--primary-text-color); }
+        /* The device id repeats on every line; dimming it keeps the paths easy
+           to scan. It is still part of the text, so a selection copies the
+           real topic. */
+        .log-row .log-topic .log-dev { color: var(--secondary-text-color); }
+        /* No max-height, no overflow: the payload grows the row and the list is
+           the single scroll region. The old inner scrollbar meant two nested
+           scrollbars whenever a payload was long. */
         .log-row pre.log-payload { margin: 4px 0 0; white-space: pre-wrap;
-                                   word-break: break-all; max-height: 140px;
-                                   overflow: auto; font-size: 11.5px;
+                                   word-break: break-all; line-height: 1.45;
+                                   font-size: 11.5px;
                                    font-family: ui-monospace, SFMono-Regular, Menlo,
                                    Consolas, monospace;
                                    color: var(--secondary-text-color); }
@@ -838,20 +845,41 @@ function _hmControlRegister() {
     }
 
     /**
-     * Topic with the boilerplate stripped: `homeassistant/sensor/<dev>/quick/
-     * state` -> `sensor/quick/state`, `hoymiles/<dev>/availability` ->
-     * `integration/availability`. The full topic stays in the tooltip.
+     * The topic of one message, split so the device id can be dimmed: every
+     * line carries it, and it is the least interesting part. The three pieces
+     * are spans, not one string, but their text adds up to the topic exactly as
+     * it goes over the wire, so selecting a row still copies the real thing.
+     *
+     * The full path is shown on purpose: `sensor/quick/state` is shorter, but it
+     * is not the topic - the user has to be able to read (and copy) what was
+     * actually published.
      */
-    _logShort(topic) {
-      const text = String(topic);
-      const cut = `/${this._dev()}/`;
-      const i = text.indexOf(cut);
-      if (i < 0) return text;
-      const head = text.slice(0, i).replace(/^homeassistant\//, "").replace(/^hoymiles$/, "integration");
-      return `${head}/${text.slice(i + cut.length)}`;
+    _logTopic(topic, host) {
+      const dev = this._dev();
+      const at = String(topic).indexOf(`/${dev}/`);
+      if (at < 0) {
+        host.textContent = String(topic);
+        return;
+      }
+      const before = document.createElement("span");
+      before.textContent = String(topic).slice(0, at + 1);
+      const id = document.createElement("span");
+      id.className = "log-dev";
+      id.textContent = dev;
+      const after = document.createElement("span");
+      after.textContent = String(topic).slice(at + 1 + dev.length);
+      host.append(before, id, after);
     }
 
-    /** Pretty print the payload when it is JSON, and cap what is shown. */
+    /**
+     * The payload, on a single wrapped line when it is JSON, and capped.
+     *
+     * It used to be pretty printed, but that turned a `quick/state` (once a
+     * second) into a sixty line block, and every long payload then needed its
+     * own scrollbar inside the list's scrollbar. Compact keeps a row readable,
+     * keeps the list the only thing that scrolls, and still shows every value -
+     * the user asked for exactly that ("one scrollbar is enough").
+     */
     _logPayload(payload) {
       const text = String(payload == null ? "" : payload);
       if (text.trim() === "") return this._t("(empty)", "（空）");
@@ -859,7 +887,7 @@ function _hmControlRegister() {
       const trimmed = text.trim();
       if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
         try {
-          out = JSON.stringify(JSON.parse(text), null, 2);
+          out = JSON.stringify(JSON.parse(text));
         } catch (err) {
           out = text; // not valid JSON after all - show it raw
         }
@@ -882,7 +910,6 @@ function _hmControlRegister() {
       const pad = (n) => String(n).padStart(2, "0");
       return {
         topic,
-        short: this._logShort(topic),
         down,
         text: this._logPayload(payload),
         clock: `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`,
@@ -910,7 +937,7 @@ function _hmControlRegister() {
         : this._t("device → HA", "设备上报");
       const topic = document.createElement("span");
       topic.className = "log-topic";
-      topic.textContent = entry.short;
+      this._logTopic(entry.topic, topic);
       topic.title = entry.topic;
       meta.append(time, dir, topic);
 
