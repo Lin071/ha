@@ -11,6 +11,12 @@
  *     `pack_count` sensor and cross-checked against `packN_soc`);
  *   - every module gets a callout with its own SOC and temperature, the
  *     callouts alternate left / right like in the app;
+ *   - the unit itself is drawn like the product photos: one body with a
+ *     single light-to-dark gradient, thin seams between the modules, and a
+ *     dark head carrying the status display (signal, battery, SOC);
+ *   - the dark head module (the BMS / PCS "host" unit) is the host
+ *     temperature — the average of the installed packs, because the head has
+ *     no temperature sensor of its own;
  *   - PV / grid-on / battery / grid-off powers frame the picture;
  *   - an optional history section plots the pack SOC and the charged /
  *     discharged energy for 日 / 月 / 年 / 总 (from long term statistics).
@@ -24,6 +30,7 @@
  *   show_title: false            # optional, hide the header title
  *   language: en                 # optional (en|zh); omit to follow Home Assistant
  *   show_history: true           # optional (default true)
+ *   show_host_temp: false        # optional, hide the head unit temperature
  *   max_width: 560               # optional px for the illustration
  *   alarm_entity: binary_sensor.x # optional, shows a bell when "on"
  *   entities:                    # optional entity id overrides
@@ -36,6 +43,7 @@
  *     soc: sensor.my_soc
  *     pack1_soc: sensor.my_pack1_soc
  *     pack1_temperature: sensor.my_pack1_temperature
+ *     battery_temperature: sensor.my_battery_temperature
  * ========================================================================== */
 
 function _hmBatteryRegister() {
@@ -99,9 +107,7 @@ function _hmBatteryRegister() {
   const MOD_H = 158;     // one battery module
   const HEAD_TOP = 96;   // y of the top of the stack
   const FRONT_W = 300;   // front face width
-  const SIDE_W = 34;     // right hand side panel width
   const FRONT_X = 130;   // x of the left edge of the front face
-
   const CALLOUT_W = 164;
   const CALLOUT_H = 62;
   const LEFT_BOX_X = 2;
@@ -185,59 +191,216 @@ function _hmBatteryRegister() {
   }
 
   /* ------------------------------------------------------------------ *
-   * The stack itself
+   * The head module's status display
+   *
+   * The hardware's display bar, keeping only the five readings that matter on
+   * a dashboard: the power symbol, the PV reading with its SOLAR caption, the
+   * SOC between two chevrons, and the battery reading with its BATTERY
+   * caption.  The hardware's small status icon cluster and the Wi-Fi / eco
+   * symbols are deliberately left out - they carry no dashboard information
+   * and only made the bar busy.
+   *
+   * The readings are plain (zero padded, monospaced) text rather than literal
+   * seven-segment strokes: at this size stroked digits read as scratchy, while
+   * text keeps the panel legible and matches the callout style used elsewhere
+   * in the card.
    * ------------------------------------------------------------------ */
-  function stackMarkup(packs, active) {
+
+  /* The readings sit a shade below pure white: on the near black panel a full
+   * white figure glares and fights the body gradient. */
+  const PANEL_INK = "#c9d1d9";
+  const PANEL_DIM = "rgba(201,209,217,0.55)";
+  /* The direction arrow is lit in plain white - it is the one element that has
+   * to read at a glance, so it sits above the (deliberately dimmer) figures. */
+  const PANEL_ARROW = "#ffffff";
+  const PANEL_MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+  const PANEL_MIN_W = 5;                  // below this the battery is idle
+
+  /**
+   * A watt reading as the hardware would show it: the real value, no zero
+   * padding, clamped to what four digits can hold.
+   */
+  function watt(value) {
+    return String(Math.min(9999, Math.round(Math.abs(num(value)))));
+  }
+
+  /**
+   * The status display on the head module.  `pv` and `battery` are watts and
+   * `soc` a percentage; both readings are the *device's own* values, because
+   * the head depicts this unit rather than the whole system.
+   *
+   * Layout: the SOC owns the middle of the panel - it and its two arrows are
+   * centred on the panel's own centre line - and the two watt groups mirror
+   * outwards from it (the power symbol, with no counterpart on the right, hangs
+   * off the left end).  Every element on the top line shares one horizontal
+   * centre, and each watt reading carries its `W` as a subscript at its bottom
+   * right.
+   *
+   * All of it is derived from the panel centre, so changing a font size or the
+   * number of digits only means re-checking the few widths above.
+   */
+  function headDisplay(pv, battery, soc) {
+    const ink = PANEL_INK;
+    const dim = PANEL_DIM;
+    // The head band is HEAD_TOP..HEAD_TOP+TOP_H (96..162), so 129 is its middle.
+    const cy = HEAD_TOP + 33;
+    // Baselines that put each font's *glyph box* on `cy`: the digits of a 13px
+    // value sit 4.4 above their baseline, an 18px SOC 6.0.
+    const valueY = cy + 4.4;
+    const unitY = valueY + 3.6;           // the W, tucked into the bottom right
+    const capY = cy + 14;                 // SOLAR / BATTERY captions
+
+    const mid = FRONT_X + FRONT_W / 2;    // 280 - the panel's centre line
+    const socHalf = 14.9;                 // half of the widest SOC ("100", 18px)
+    const arrowGap = 9;
+    const arrowW = 5;
+    const groupGap = 10;
+    const unitW = 8;                      // the "W" at 8px
+    const unitGap = 2;
+    // Width of one mono digit at 13px with the letter spacing used below; the
+    // readings are NOT zero padded, so their width follows the value.
+    const digitW = 7.45;
+    const maxValueW = 4 * digitW;         // 29.8 - what four digits occupy
+    // Distance from the centre line out to the inner edge of each watt value.
+    // The readings are right aligned, so their inner edge is what is fixed -
+    // a shorter number simply leaves more room towards the arrow.
+    const inner = socHalf + arrowGap + arrowW + groupGap + unitW + unitGap;
+
+    const pvText = watt(pv);
+    const batText = watt(battery);
+
+    const pvValueRight = mid - inner;               // 231.1
+    const pvUnit = pvValueRight + unitGap;          // 233.1 - its own bottom right
+    const pvCaption = pvValueRight - pvText.length * digitW / 2;
+    // The battery group is the *mirror* of the PV group, so that reading keeps
+    // its W at its bottom right too - which, on this side, is the outer edge.
+    // (Putting the W on the inner edge there would have parked it left of the
+    // number.)
+    const batGroupRight = mid + inner + maxValueW;  // 368.4
+    const batUnit = batGroupRight - unitW;          // 360.4
+    const batValueRight = batUnit - unitGap;        // 358.4
+    const batCaption = batValueRight - batText.length * digitW / 2;
+    // The power symbol has no counterpart on the right, so it stays put: it is
+    // anchored to where the widest battery/PV number would reach, not to the
+    // current digits (otherwise it would jitter as the reading changes).
+    const powerCx = pvValueRight - maxValueW - 14 - 6.5;  // 180.8
+
+    const parts = [];
+    const charging = num(battery) < -PANEL_MIN_W;
+    const discharging = num(battery) > PANEL_MIN_W;
+
+    // power symbol: the ring opens at the top, the stem drops through the gap
+    parts.push(`<path d="M${(powerCx - 4.43).toFixed(2)} ${(cy - 4.76).toFixed(2)}
+        A6.5 6.5 0 1 0 ${(powerCx + 4.43).toFixed(2)} ${(cy - 4.76).toFixed(2)}"
+        fill="none" stroke="${ink}" stroke-width="1.5" stroke-linecap="round"/>
+      <line x1="${powerCx.toFixed(2)}" y1="${cy - 7}" x2="${powerCx.toFixed(2)}" y2="${cy + 1}"
+        stroke="${ink}" stroke-width="1.5" stroke-linecap="round"/>`);
+
+    // PV reading (right aligned so the "W" never moves) + its caption
+    parts.push(`<text x="${pvValueRight.toFixed(1)}" y="${valueY}" text-anchor="end" font-size="13"
+        font-weight="600" letter-spacing="0.3" font-family="${PANEL_MONO}"
+        fill="${ink}">${pvText}</text>
+      <text x="${pvUnit.toFixed(1)}" y="${unitY}" font-size="8" font-weight="600"
+        fill="${dim}">W</text>
+      <text x="${pvCaption.toFixed(1)}" y="${capY}" text-anchor="middle" font-size="6.5"
+        letter-spacing="1" fill="${dim}">SOLAR</text>`);
+
+    // SOC dead centre, flanked by whichever direction arrow applies
+    const socText = soc == null
+      ? "--"
+      : String(Math.max(0, Math.min(100, Math.round(soc))));
+    parts.push(`<text x="${mid}" y="${cy + 6}" text-anchor="middle" font-size="18"
+        font-weight="600" font-family="${PANEL_MONO}"
+        fill="${ink}">${socText}</text>`);
+    if (charging) {
+      parts.push(`<path d="M${(mid - socHalf - arrowGap).toFixed(1)} ${cy - 6}
+        l-${arrowW} 6 ${arrowW} 6" fill="none"
+        stroke="${PANEL_ARROW}" stroke-width="1.6" stroke-linejoin="round"
+        stroke-linecap="round"/>`);
+    } else if (discharging) {
+      parts.push(`<path d="M${(mid + socHalf + arrowGap).toFixed(1)} ${cy - 6}
+        l${arrowW} 6 -${arrowW} 6" fill="none"
+        stroke="${PANEL_ARROW}" stroke-width="1.6" stroke-linejoin="round"
+        stroke-linecap="round"/>`);
+    }
+
+    // battery reading + its caption
+    parts.push(`<text x="${batValueRight.toFixed(1)}" y="${valueY}" text-anchor="end" font-size="13"
+        font-weight="600" letter-spacing="0.3" font-family="${PANEL_MONO}"
+        fill="${ink}">${batText}</text>
+      <text x="${batUnit.toFixed(1)}" y="${unitY}" font-size="8" font-weight="600"
+        fill="${dim}">W</text>
+      <text x="${batCaption.toFixed(1)}" y="${capY}" text-anchor="middle" font-size="6.5"
+        letter-spacing="1" fill="${dim}">BATTERY</text>`);
+
+    return parts.join("");
+  }
+
+  /* ------------------------------------------------------------------ *
+   * The stack itself
+   *
+   * Drawn the way the product photo looks: one tall body, a single gradient
+   * that runs light at the top to almost black at the foot, thin seams marking
+   * the modules, a dark head carrying the status display, and a small
+   * connector tab on the head's right shoulder.  There is deliberately no
+   * full-height side panel: the real unit is a flat front face.
+   * ------------------------------------------------------------------ */
+  function stackMarkup(packs, active, hostTemp, hostLabel, soc, pv, battery) {
     const count = Math.max(packs, 1);
     const stackH = TOP_H + count * MOD_H;
     const bottom = HEAD_TOP + stackH;
+    const bodyTop = HEAD_TOP + TOP_H;
+    const cx = FRONT_X + FRONT_W / 2;
 
     const parts = [];
 
-    // right hand side panel (the connectors live there)
-    parts.push(`<rect x="${FRONT_X + FRONT_W}" y="${HEAD_TOP + 7}"
-        width="${SIDE_W}" height="${stackH}" rx="7" fill="url(#hm-bat-side)"/>`);
-
-    // front face: one rect per module so every module gets its own shading
+    // The whole unit in one piece, painted with a single top-to-bottom
+    // gradient (`hm-bat-body` is a userSpaceOnUse gradient built from the same
+    // `bodyTop` / `bottom`, so it scales with the pack count).  The modules are
+    // marked by thin seams only - not by shading each one separately.
     parts.push(`<rect x="${FRONT_X}" y="${HEAD_TOP}" width="${FRONT_W}"
-        height="${stackH}" rx="7" fill="#b8bec6"/>`);
+        height="${stackH}" rx="7" fill="url(#hm-bat-body)"/>`);
+
+    // seams + the wordmark at the foot of every module
     for (let i = 0; i < count; i += 1) {
-      const y = HEAD_TOP + TOP_H + i * MOD_H;
-      parts.push(`<rect x="${FRONT_X}" y="${y}" width="${FRONT_W}" height="${MOD_H}"
-          fill="url(#hm-bat-mod)"/>
-        <rect x="${FRONT_X}" y="${y}" width="${FRONT_W}" height="2.5"
-          fill="rgba(255,255,255,0.35)"/>`);
-      // the vendor renders the wordmark at the foot of every module
+      const y = bodyTop + i * MOD_H;
+      if (i > 0) {
+        parts.push(`<rect x="${FRONT_X}" y="${(y - 1.2).toFixed(1)}" width="${FRONT_W}"
+          height="1.6" fill="rgba(255,255,255,0.30)"/>
+        <rect x="${FRONT_X}" y="${(y + 0.6).toFixed(1)}" width="${FRONT_W}"
+          height="1" fill="rgba(0,0,0,0.20)"/>`);
+      }
       parts.push(`<text x="${FRONT_X + 16}" y="${y + MOD_H - 14}"
           font-size="12" letter-spacing="0.4"
-          fill="rgba(255,255,255,0.6)">Hoymiles</text>`);
+          fill="rgba(255,255,255,0.55)">Hoymiles</text>`);
     }
+
+    // The brand badge sits on the first module - the head carries the status
+    // display instead of a logo, exactly like the hardware.
+    const badgeCy = bodyTop + MOD_H / 2;
+    parts.push(`<circle cx="${cx}" cy="${badgeCy}" r="25" fill="none"
+        stroke="rgba(255,255,255,0.7)" stroke-width="1.8"/>
+      <text x="${cx}" y="${badgeCy + 9}" text-anchor="middle" font-size="26"
+        font-weight="600" fill="rgba(255,255,255,0.8)">H</text>
+      <text x="${cx}" y="${badgeCy + 48}" text-anchor="middle" font-size="13"
+        letter-spacing="0.6" fill="rgba(255,255,255,0.78)">Hoymiles</text>`);
 
     // dark head module on top
     parts.push(`<path d="M${FRONT_X + 7} ${HEAD_TOP} h${FRONT_W - 14}
         a7 7 0 0 1 7 7 v${TOP_H - 7} h-${FRONT_W} v-${TOP_H - 7}
         a7 7 0 0 1 7 -7 z" fill="url(#hm-bat-top)"/>`);
-    parts.push(`<rect x="${FRONT_X}" y="${HEAD_TOP + TOP_H - 3}" width="${FRONT_W}"
+
+    // status display, and the shadow line where the head meets the body.
+    // A faint highlight along the top edge keeps the panel reading as glass.
+    parts.push(`<line x1="137" y1="96.7" x2="423" y2="96.7"
+        stroke="rgba(255,255,255,0.10)" stroke-width="1.4"/>`);
+    parts.push(headDisplay(pv, battery, soc));
+    parts.push(`<rect x="${FRONT_X}" y="${bodyTop - 3}" width="${FRONT_W}"
         height="3" fill="rgba(0,0,0,0.35)"/>`);
-
-    // brand mark on the head module
-    const cx = FRONT_X + FRONT_W / 2;
-    parts.push(`<circle cx="${cx}" cy="${HEAD_TOP + 24}" r="13" fill="none"
-        stroke="rgba(255,255,255,0.22)" stroke-width="1.6"/>
-      <text x="${cx}" y="${HEAD_TOP + 29}" text-anchor="middle" font-size="15"
-        font-weight="600" fill="rgba(255,255,255,0.5)">H</text>
-      <text x="${cx}" y="${HEAD_TOP + 52}" text-anchor="middle" font-size="11"
-        letter-spacing="0.5" fill="rgba(255,255,255,0.38)">Hoymiles</text>`);
-
-    // feet
-    for (const fx of [FRONT_X + 20, FRONT_X + FRONT_W / 2 - 12, FRONT_X + FRONT_W - 48]) {
-      parts.push(`<rect x="${fx}" y="${bottom}" width="24" height="10" rx="3"
-        fill="#23272d"/>`);
-    }
 
     // module callouts: alternate left / right, like the vendor app
     for (let i = 0; i < count; i += 1) {
-      const cy = HEAD_TOP + TOP_H + i * MOD_H + MOD_H / 2;
+      const cy = bodyTop + i * MOD_H + MOD_H / 2;
       const onLeft = i % 2 === 0;
       const dotX = onLeft ? LEFT_DOT_X : RIGHT_DOT_X;
       const boxX = onLeft ? LEFT_BOX_X : RIGHT_BOX_X - CALLOUT_W;
@@ -259,7 +422,31 @@ function _hmBatteryRegister() {
       </g>`);
     }
 
-    return { markup: parts.join(""), stackH, bottom };
+    // Head-unit temperature, drawn as one more callout so it looks exactly like
+    // the pack callouts above it (same box, same connector dot and line).  The
+    // head module on top of the stack is the BMS / PCS unit and has no
+    // temperature sensor of its own, so the reading is the average of the
+    // installed packs (see `_hostTemp`).  It goes on the right - opposite
+    // Battery 1 - and low enough that its dot clears the status display
+    // (the BATTERY caption, the Wi-Fi ring and the connector tab).
+    if (hostTemp != null) {
+      const cy = HEAD_TOP + TOP_H - 5;
+      const boxX = RIGHT_BOX_X - CALLOUT_W;
+      const dotX = 368;
+
+      parts.push(`<line x1="${boxX}" y1="${cy}" x2="${dotX}" y2="${cy}"
+        stroke="${DOT_COLOR}" stroke-width="1.8"/>`);
+      parts.push(`<circle cx="${dotX}" cy="${cy}" r="5" fill="${DOT_COLOR}"
+        stroke="#fff" stroke-width="1.6"/>`);
+      parts.push(`<g class="bat-call">
+        <rect x="${boxX}" y="${cy - CALLOUT_H / 2}" width="${CALLOUT_W}"
+          height="${CALLOUT_H}" rx="13" fill="rgba(56,61,70,0.88)"/>
+        <text x="${boxX + 16}" y="${cy - 7}" class="bat-call-t">${esc(hostLabel)}</text>
+        <text x="${boxX + 16}" y="${cy + 17}" class="bat-call-v">${hostTemp.toFixed(1)}°C</text>
+      </g>`);
+    }
+
+    return { markup: parts.join(""), bodyTop, bottom };
   }
 
   /* ------------------------------------------------------------------ *
@@ -310,7 +497,11 @@ function _hmBatteryRegister() {
                  justify-content: flex-end; }
         .hstat svg { display: block; }
         .bell { color: var(--error-color); font-size: 17px; line-height: 1; }
-        .wrap { display: flex; justify-content: center; }
+        .wrap { display: flex; justify-content: center;
+                /* max_width caps the illustration, and the dashboard column is
+                   usually wider than that - without auto margins the leftover
+                   space piles up on the right and the unit looks shoved left. */
+                margin: 0 auto; }
         .wrap svg { display: block; width: 100%; height: auto; }
 
         .bat-v { font-size: 24px; font-weight: 600;
@@ -402,8 +593,15 @@ function _hmBatteryRegister() {
         this._read("rssi", null), this._alarmOn(),
         this._read("pv_power", 0), this._read("grid_on_power", 0),
         this._read("grid_off_power", 0),
+        // The head display and the bottom-left readout use the system level
+        // values when they exist, so both have to be in the signature or the
+        // drawing would go stale while the device is grouped.
+        this._read("system_pv_power", null), this._read("system_battery_power", null),
+        this._read("bat_power", null),
         this._packCount(), packs.join(","),
         this._readText("battery_status"), this._readText("bat_sts"),
+        this._showHostTemp() ? this._hostTemp() : null,
+        this._read("soc", null),
         this._history ? `${this._history.soc.length}:${this._history.charge}:${this._history.discharge}` : "none",
         this._histError || "",
       ].join("\u0001");
@@ -569,6 +767,36 @@ function _hmBatteryRegister() {
       return Math.max(1, Math.min(count, PACK_MAX));
     }
 
+    /** `show_host_temp: false` (also accepts the editor's "false") hides it. */
+    _showHostTemp() {
+      const value = (this._config || {}).show_host_temp;
+      return !(value === false || value === "false");
+    }
+
+    /**
+     * Head-unit ("主机") temperature.
+     *
+     * The head module on top of the stack is the BMS / PCS unit; it has no
+     * temperature sensor of its own, so the vendor app shows the average of the
+     * installed packs.  Only the packs the card actually draws are averaged,
+     * and a pack that reports no temperature is skipped rather than counted as
+     * zero.  If none of them report one, the firmware's own
+     * `battery_temperature` (`device/state` → `bat_temp`, itself an average) is
+     * used as a fallback; `null` leaves the readout off the drawing.
+     */
+    _hostTemp() {
+      const count = this._packCount();
+      const temps = [];
+      for (let i = 1; i <= count; i += 1) {
+        const temp = this._read(`pack${i}_temperature`, null);
+        if (temp !== null) temps.push(temp);
+      }
+      if (temps.length) {
+        return temps.reduce((sum, value) => sum + value, 0) / temps.length;
+      }
+      return this._read("battery_temperature", null);
+    }
+
     _batteryStatus(battery) {
       const raw = (this._readText("battery_status") || this._readText("bat_sts"))
         .toLowerCase();
@@ -607,6 +835,13 @@ function _hmBatteryRegister() {
         });
       }
       const batteryCaption = this._t("Battery ", "电池") + status.text;
+      const hostTemp = this._showHostTemp() ? this._hostTemp() : null;
+      // The head's status display shows the device level SOC (1 s), the same
+      // reading the power flow card and the SOC gauges use, plus this unit's
+      // own PV and battery power.
+      const soc = this._read("soc", null);
+      const pvDev = this._read("pv_power", 0);
+      const batDev = this._read("bat_power", 0);
 
       return html`
         <ha-card>
@@ -620,6 +855,7 @@ function _hmBatteryRegister() {
           <div class="wrap" style=${this._wrapStyle()}>
             ${this._untrusted(this._svg({
               count, packs, pv, gridOn, gridOff, battery, status, batteryCaption,
+              hostTemp, soc, pvDev, batDev,
             }))}
           </div>
           ${this._config.show_history === false ? "" : this._historySection()}
@@ -662,25 +898,29 @@ function _hmBatteryRegister() {
     /* --------------------------- the diagram --------------------------- */
 
     _svg(d) {
-      const { markup, bottom } = stackMarkup(d.count, d.packs);
+      // The head shows this unit's own readings, the corner callouts the system
+      // level ones - the panel draws the device itself, not the whole system.
+      const { markup, bodyTop, bottom } = stackMarkup(
+        d.count, d.packs, d.hostTemp, this._t("Host", "主机"),
+        d.soc, d.pvDev, d.batDev,
+      );
       const bottomY = bottom + HEADER_GAP;
       const totalH = bottomY + TAIL_GAP;
 
       return `<svg viewBox="0 0 ${VB_W} ${totalH}" preserveAspectRatio="xMidYMid meet"
                    xmlns="http://www.w3.org/2000/svg" role="img">
         <defs>
-          <linearGradient id="hm-bat-top" x1="0" y1="0" x2="0.3" y2="1">
-            <stop offset="0" stop-color="#40464f"/>
-            <stop offset="1" stop-color="#1e2227"/>
+          <linearGradient id="hm-bat-top" x1="0" y1="0" x2="0.25" y2="1">
+            <stop offset="0" stop-color="#333a42"/>
+            <stop offset="1" stop-color="#14181c"/>
           </linearGradient>
-          <linearGradient id="hm-bat-mod" x1="0" y1="0" x2="0.15" y2="1">
-            <stop offset="0" stop-color="#e3e6ea"/>
-            <stop offset="0.55" stop-color="#c3c9d0"/>
-            <stop offset="1" stop-color="#a7aeb7"/>
-          </linearGradient>
-          <linearGradient id="hm-bat-side" x1="0" y1="0" x2="1" y2="0">
-            <stop offset="0" stop-color="#4c525b"/>
-            <stop offset="1" stop-color="#282d33"/>
+          <linearGradient id="hm-bat-body" x1="0" y1="${bodyTop}" x2="0" y2="${bottom}"
+              gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#d2d7dc"/>
+            <stop offset="0.32" stop-color="#bcc2c9"/>
+            <stop offset="0.58" stop-color="#949ba3"/>
+            <stop offset="0.82" stop-color="#4a5058"/>
+            <stop offset="1" stop-color="#16181b"/>
           </linearGradient>
         </defs>
         ${markup}
@@ -939,6 +1179,9 @@ function _hmBatteryRegister() {
           <ha-textfield label="show_title (false = hide the heading)"
             .value=${config.show_title === false ? "false" : ""}
             @change=${this._changed("show_title")}></ha-textfield>
+          <ha-textfield label="show_host_temp (false = hide the head unit temperature)"
+            .value=${config.show_host_temp === false ? "false" : ""}
+            @change=${this._changed("show_host_temp")}></ha-textfield>
           <ha-textfield label="language (auto|en|zh, auto follows Home Assistant)"
             .value=${config.language || ""} @change=${this._changed("language")}></ha-textfield>
           <ha-textfield label="max_width (px)" .value=${config.max_width || ""}
@@ -964,7 +1207,8 @@ function _hmBatteryRegister() {
       name: "Hoymiles Battery",
       description:
         "Battery stack of a Hoymiles micro storage device with per-pack SOC / "
-        + "temperature callouts, scaled to the number of installed packs.",
+        + "temperature callouts and the head unit temperature (the average of "
+        + "the installed packs), scaled to the number of installed packs.",
       preview: false,
     });
   }
