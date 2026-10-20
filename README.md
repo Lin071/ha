@@ -172,8 +172,8 @@ Configuring a TOU plan, either way works:
 
 | Card | What it does |
 |---|---|
-| `custom:hoymiles-power-flow` | Home illustration with live PV / storage / grid / load power and animated flow |
-| `custom:hoymiles-battery` | Battery stack drawn to match the *actual* pack count (1–4), with per-pack SOC & temperature |
+| `custom:hoymiles-power-flow` | Wiring schematic of PV1 / PV2 / grid / load / smart plug / storage with live power and animated flow |
+| `custom:hoymiles-battery` | Battery stack drawn to match the *actual* pack count (1–4), with per-pack SOC & temperature, the host temperature and the head status display |
 | `custom:hoymiles-pack-list` | Compact pack list — SOC bar, temperature, heating flag |
 | `custom:hoymiles-history-chart` | Day / month / year curves with date navigation, reads long-term statistics |
 | `custom:hoymiles-gauge` | Single-value gauge with range switching (e.g. Wh → kWh) |

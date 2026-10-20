@@ -162,8 +162,8 @@ cards:
 
 | 卡片 | 作用 |
 |---|---|
-| `custom:hoymiles-power-flow` | 家居插图，叠加实时光伏 / 微储 / 电网 / 负载功率与流动动画 |
-| `custom:hoymiles-battery` | 按**实际电池包数量**（1~4）自适应的电池堆，逐包 SOC 与温度 |
+| `custom:hoymiles-power-flow` | 接线示意图，叠加光伏1 / 光伏2 / 电网 / 负载 / 智能插座 / 微储实时功率与流动动画 |
+| `custom:hoymiles-battery` | 按**实际电池包数量**（1~4）自适应的电池堆，逐包 SOC 与温度，以及主机温度和头部状态显示条 |
 | `custom:hoymiles-pack-list` | 紧凑电池包列表 —— SOC 进度条、温度、加热标记 |
 | `custom:hoymiles-history-chart` | 日 / 月 / 年曲线 + 日期导航，读取长期统计 |
 | `custom:hoymiles-gauge` | 单值仪表盘，支持量程换挡（如 Wh → kWh） |
