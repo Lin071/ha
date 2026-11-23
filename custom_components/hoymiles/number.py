@@ -44,6 +44,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    CONF_DEV_ID,
     DOMAIN,
     MANUFACTURER,
     PHASE_A,
@@ -52,6 +53,7 @@ from .const import (
     PHASE_POWER_MAX,
     PHASE_POWER_MIN,
     PHASE_POWER_STEP,
+    device_family,
 )
 from .coordinator import HoymilesCoordinator
 
@@ -81,9 +83,21 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the per phase output power numbers."""
+    """Set up the per phase output power numbers.
+
+    Forwarded platforms resolve against the integration root package, so an
+    inverter entry arrives here too; ``inverter/number.py`` is never imported by
+    Home Assistant itself.
+    """
+    dev_id: str = entry.data.get(CONF_DEV_ID, "")
+    if device_family(dev_id) == "inverter":
+        from .inverter import number as _inverter_number  # noqa: PLC0415
+
+        await _inverter_number.async_setup_entry(hass, entry, async_add_entities)
+        return
+
     coordinator: HoymilesCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
-    dev_id: str = hass.data[DOMAIN][entry.entry_id]["dev_id"]
+    dev_id = hass.data[DOMAIN][entry.entry_id]["dev_id"]
 
     async_add_entities(
         HoymilesPhaseNumber(coordinator, dev_id, description)
