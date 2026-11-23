@@ -11,9 +11,9 @@
     "frontend",
     "lovelace"
   ],
-  "documentation": "https://github.com/hoymiles-ha/ha_G2",
+  "documentation": "https://github.com/hoymiles-ha/ha_beta",
   "integration_type": "hub",
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/hoymiles-ha/ha_G2/issues",
+  "issue_tracker": "https://github.com/hoymiles-ha/ha_beta/issues",
   "version": "0.6.6"
 }

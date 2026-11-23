@@ -251,3 +251,102 @@ DASHBOARD_ICON: Final = "mdi:home-battery"
 # ---------------------------------------------------------------------------
 # Statistics query period used by the energy sankey card.
 SANKEY_PERIOD: Final = "day"
+
+# ---------------------------------------------------------------------------
+# Product families: PID -> which code path serves the device
+# ---------------------------------------------------------------------------
+# The four digits right after the client prefix are the **PID** - the firmware's
+# product identification number - and every discriminating decision is made on
+# them rather than on the prefix.
+#
+# The prefix in front of the serial (``RMI-``, ``MSA-``, ...) is a *user
+# setting*: it is the MQTT client prefix and the user may change it to anything.
+# So ``RMI-`` cannot be used to recognise a device, and neither can the firmware's
+# model string, which names a whole family ("HiFlow" covers both the 1-input 1650
+# and the 1-input 4160).  The PID is stable, is present in every spelling of the
+# serial, and - unlike ``device/state["pv_num"]`` - is known *before* the first
+# payload arrives, which matters because entities are created during setup.
+#
+
+# Two families are served by this integration and they share nothing but the
+# MQTT transport:
+#
+#   inverter  1650 / 4160 / 4161 / 4162   grid-tied micro inverters (HiFlow)
+#   storage   2800                        battery storage units (HiBattery)
+#
+# ``inverter/`` implements the first family on its own coordinator, entity
+# tables, dashboard engine and cards; ``__init__`` dispatches on the PID before
+# anything else happens, so the storage code path - entity set, dashboard,
+# services - is byte for byte the one that shipped before the inverters were
+# added.
+PID_PV_COUNT: Final[dict[str, int]] = {
+    "1650": 1,  # HiFlow, single input
+    "4160": 1,  # HiFlow Pro 1-in-1
+    "4161": 2,  # HiFlow Pro 2-in-1
+    "4162": 4,  # HiFlow Pro 4-in-1
+}
+# Every PID above is a grid-tied micro inverter.  Storage units carry a
+# different PID and are recognised by *not* being in this set - the firmware
+# reports their port count as ``pv_num`` instead.  ``2800`` is the only storage
+# PID seen in the field (``MSA-2800...``); a unit with an unlisted PID can still
+# be added by typing its serial, because the config flow accepts custom values.
+INVERTER_PIDS: Final[frozenset[str]] = frozenset(PID_PV_COUNT)
+STORAGE_PIDS: Final[frozenset[str]] = frozenset({"2800", "2804", "2805", "2806"})
+# What the config flow will offer on its own.  Deliberately a closed set: the
+# discovery wildcard also matches unrelated devices that publish under
+# ``homeassistant/``, and offering those would be noise in the picker.
+KNOWN_PIDS: Final[frozenset[str]] = INVERTER_PIDS | STORAGE_PIDS
+# Storage units do not publish a fixed port count in their serial; the firmware
+# reports ``pv_num`` instead.  Four is the documented maximum, so it is used as
+# the default whenever the count cannot be derived up front.
+PV_COUNT_MAX: Final = 4
+
+# Kept under its old name because the cards' JS mirrors this table and the docs
+# refer to it; it is the same mapping as :data:`PID_PV_COUNT`.
+PV_COUNT_BY_CODE: Final[dict[str, int]] = PID_PV_COUNT
+
+def serial_body(dev_id: str) -> str:
+    """Return the serial without its (user changeable) client prefix.
+
+    ``RMI-4161A0209FF6`` -> ``"4161A0209FF6"``, and a bare ``4161A0209FF6`` is
+    returned unchanged.  Splitting on ``-`` and keeping the last part survives
+    any prefix the user configures, including one that itself contains ``-``.
+    """
+    return dev_id.split("-")[-1].strip()
+
+def serial_pid(dev_id: str) -> str | None:
+    """Return the four digit product id at the start of the serial, if any.
+
+    ``RMI-4161A0209FF6`` -> ``"4161"`` and ``MSA-280024180016`` -> ``"2800"``.
+    The prefix plays no part: only the serial body is inspected.
+    """
+    digits = serial_body(dev_id)[:4]
+    if len(digits) != 4 or not digits.isdigit():
+        return None
+    return digits
+
+def is_inverter_dev_id(dev_id: str) -> bool:
+    """True when this serial belongs to a grid-tied micro inverter.
+
+    Recognition is by PID, so it works for any client prefix the user chooses.
+    A serial whose PID is unknown is treated as storage, which is the
+    conservative answer: it is the family this integration has always served.
+    """
+    pid = serial_pid(dev_id)
+    return pid is not None and pid in INVERTER_PIDS
+
+def pv_count_from_dev_id(dev_id: str) -> int | None:
+    """Return how many PV inputs this unit has, or ``None`` when unknown.
+
+    ``RMI-4161A0209FF6`` -> ``"4161"`` -> ``2``.  A serial that is not a known
+    inverter PID returns ``None`` so the caller can fall back to the firmware's
+    own ``pv_num`` or to the maximum.
+    """
+    pid = serial_pid(dev_id)
+    if pid is None:
+        return None
+    return PID_PV_COUNT.get(pid)
+
+def device_family(dev_id: str) -> str:
+    """Return ``"inverter"`` or ``"storage"`` for a config entry's serial."""
+    return "inverter" if is_inverter_dev_id(dev_id) else "storage"
