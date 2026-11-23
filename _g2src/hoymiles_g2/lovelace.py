@@ -559,6 +559,30 @@ def _state_exists(hass: HomeAssistant, entity_id: str) -> bool:
         return True  # assume live, so an unreadable state never triggers a rewrite
 
 
+def _state_usable(hass: HomeAssistant, entity_id: str) -> bool:
+    """True when ``entity_id`` holds a state a card can actually print.
+
+    :func:`_state_exists` answers "is this key in the state machine", which is
+    the right question for telling a *dead* reference from a live one, and the
+    wrong one for telling a *working* reference from a broken one: a sensor this
+    integration created but whose device never publishes the topic sits at
+    ``unknown`` (or ``unavailable`` while the coordinator has given up), so the
+    key exists, the card reads it, refuses the value, and prints 「—」 forever.
+
+    That is what kept :func:`_heal_entity_ids` from repairing the 今日发电 /
+    总发电量 tiles: the stored id was neither dead enough to be rewritten nor
+    live enough to render, and every setup re-read the dashboard and changed
+    nothing.
+    """
+    try:
+        state = hass.states.get(entity_id)
+    except Exception:  # noqa: BLE001 - a card is never worth breaking setup for
+        return True  # assume usable, so an unreadable state never triggers a rewrite
+    if state is None:
+        return False
+    return str(state.state) not in ("", "unknown", "unavailable", "none", "None")
+
+
 def _heal_entity_ids(
     config: dict[str, Any], hass: HomeAssistant, dev_id: str
 ) -> bool:
@@ -618,12 +642,18 @@ def _heal_entity_ids(
         # match on the key it ends with instead.  Requires an `_` boundary so
         # `soc` cannot match `system_soc`.
         #
-        # Only a *dead* id is repointed.  Without that test the tail match would
+        # A *working* id is left alone.  Without that test the tail match would
         # also rewrite ids that resolve fine and merely belong to someone else -
         # a card the user deliberately pointed at another integration's sensor
-        # would be silently dragged back.  A broken id is the only thing this
-        # pass claims to repair.
-        if _state_exists(hass, value):
+        # would be silently dragged back.
+        #
+        # "Working" has to mean "prints a number", not "exists in the state
+        # machine": a sensor of *this* integration whose topic the device never
+        # publishes sits at `unknown` (or `unavailable` once the coordinator has
+        # given up), so the key is there, the gauge refuses the value, and the
+        # tile reads 「—」 with nothing ever repairing it.  That is exactly the
+        # 今日发电 / 总发电量 report, and why `_state_usable` exists.
+        if _state_usable(hass, value):
             return value
         for key in by_tail:
             for candidate in keys_of(value[len("sensor.") :]):
@@ -1475,7 +1505,7 @@ async def _async_upgrade_layout(
         alarm_entity = _alarm_entity_id(hass, dev_id) if _is_inverter(dev_id) else None
         changed = _migrate_axis_cards(config)
         changed = _migrate_control_cards(config, dev_id) or changed
-        changed = _migrate_energy_total_card(config, dev_id) or changed
+        changed = _migrate_energy_total_card(config, dev_id, hass=hass) or changed
         changed = _migrate_device_alarm_card(config, dev_id, alarm_entity) or changed
         changed = (
             _migrate_device_alarm_columns(config, dev_id, alarm_entity) or changed
@@ -1560,7 +1590,9 @@ def _migrate_control_cards(config: dict[str, Any], dev_id: str) -> bool:
     return changed
 
 
-def _migrate_energy_total_card(config: dict[str, Any], dev_id: str) -> bool:
+def _migrate_energy_total_card(
+    config: dict[str, Any], dev_id: str, hass: HomeAssistant | None = None
+) -> bool:
     """Add the lifetime PV energy card next to "today" on an existing dashboard.
 
     The System view already shows a "PV today" gauge; this release puts the
@@ -1581,6 +1613,12 @@ def _migrate_energy_total_card(config: dict[str, Any], dev_id: str) -> bool:
     * only micro inverters are touched, because the lifetime counter is created
       with ``requires_absent=CAP_SYSTEM_STATE`` and does not exist on a storage
       unit.
+
+    ``hass`` is forwarded to :func:`_energy_total_gauge` so the inserted card is
+    written with the id the registry really holds.  Without it the card got
+    :func:`_entity`'s guess, which is precisely the id that rendered 「—」 - and
+    this migration is idempotent (it refuses to add a second total card), so a
+    wrong guess written once could never be corrected by it again.
     """
     if not _is_inverter(dev_id):
         return False
@@ -1589,18 +1627,36 @@ def _migrate_energy_total_card(config: dict[str, Any], dev_id: str) -> bool:
     if not isinstance(views, list):
         return False
 
-    today_entity = _entity(dev_id, "system_pv_energy_today")
+    today_entity = (
+        _resolve_entity(hass, dev_id, "system_pv_energy_today")
+        if hass is not None
+        else _entity(dev_id, "system_pv_energy_today")
+    )
     total_entities = {
         _entity(dev_id, "plant_pv_energy_total"),
         _entity(dev_id, "pv_energy_total"),
     }
+    # Both the anchor and the "already there" test compare through
+    # :func:`_strip_suffix` as well, because a dashboard that has already been
+    # through :func:`_heal_entity_ids` holds the *registry's* spelling of these
+    # ids, which is not necessarily :func:`_entity`'s guess.  Without the
+    # tolerant comparison that healed dashboard would look like it has no
+    # anchor and no total card - i.e. this migration would try to insert a
+    # second total gauge on every setup.
+
+    def same(left: Any, right: str) -> bool:
+        if not isinstance(left, str):
+            return False
+        return left == right or _strip_suffix(left) == _strip_suffix(right)
 
     # Never add the card twice: an install that has been through this migration
     # already (or was generated fresh) must be left alone.  Both the current and
     # the pre-rev.26 entity count as "already there", so an upgraded dashboard is
     # not given a second, per-unit card beside the aggregated one.
     for card in _walk_cards(views):
-        if isinstance(card, dict) and card.get("entity") in total_entities:
+        if isinstance(card, dict) and any(
+            same(card.get("entity"), wanted) for wanted in total_entities
+        ):
             return False
 
     added = False
@@ -1615,8 +1671,8 @@ def _migrate_energy_total_card(config: dict[str, Any], dev_id: str) -> bool:
                     return
                 # The anchor lives in a ``cards`` list; splice right after it, so
                 # the new card lands immediately to its right.
-                if isinstance(item, dict) and item.get("entity") == today_entity:
-                    node.insert(index + 1, _energy_total_gauge(dev_id))
+                if isinstance(item, dict) and same(item.get("entity"), today_entity):
+                    node.insert(index + 1, _energy_total_gauge(dev_id, hass=hass))
                     added = True
                     return
                 walk(item)
@@ -3611,6 +3667,19 @@ def _build_inverter_views(
     # power chart onto the same statistic grid.
     system_energy_group = f"{slug}-energy"
 
+    def _id(key: str) -> str:
+        """The real ``entity_id`` of this device's ``key`` sensor.
+
+        Every card in this layout goes through here.  :func:`_entity` only
+        *guesses* (``sensor.<slug>_<key>``), which is wrong the moment Home
+        Assistant numbers a colliding id (``_2``) or the user renames either the
+        entity or the device - and the chart and gauge cards read
+        ``hass.states[config.entity]`` verbatim, so a guess renders an empty
+        panel.  The registry knows the answer and is asked whenever ``hass`` was
+        supplied; the guess stays as the fallback for a caller that has none.
+        """
+        return _resolve_entity(hass, dev_id, key) if hass is not None else _entity(dev_id, key)
+
     # The PV curve reads `system_plug_power` (`sys_plug_p`) rather than
     # `system_pv_power` (`sys_pv_p`).  The two are different measurements and
     # only one of them answers "how much did my roof make": `sys_pv_p` is the
@@ -3623,17 +3692,17 @@ def _build_inverter_views(
     # the schematic's PV node is read from the same field so the card and the
     # curve cannot disagree.
     pv_series = {
-        "entity": _entity(dev_id, "system_plug_power"),
+        "entity": _id("system_plug_power"),
         "name": _t("PV Power", "光伏功率"),
         "color": "#22c55e",
     }
     grid_series = {
-        "entity": _entity(dev_id, "system_grid_power"),
+        "entity": _id("system_grid_power"),
         "name": _t("Grid Output [+]/Input [-]", "电网 输出[+]/输入[-]"),
         "color": "#22d3ee",
     }
     load_series = {
-        "entity": _entity(dev_id, "system_load_power"),
+        "entity": _id("system_load_power"),
         "name": _t("Load", "负载"),
         "color": "#f5a623",
     }
@@ -3648,9 +3717,8 @@ def _build_inverter_views(
     _PORT_COLORS = ("#22c55e", "#4a90d9", "#8b5cf6", "#06b6d4")
     port_series = [
         {
-            "entity": _entity(
-                dev_id,
-                "pv_total_power" if ports == 1 else f"pv{port}_power",
+            "entity": _id(
+                "pv_total_power" if ports == 1 else f"pv{port}_power"
             ),
             "name": _t(f"PV{port}", f"PV{port}"),
             "color": _PORT_COLORS[(port - 1) % len(_PORT_COLORS)],
@@ -3771,7 +3839,7 @@ def _build_inverter_views(
                         _t("PV Energy", "发电量"),
                         [
                             {
-                                "entity": _entity(dev_id, "plant_pv_energy_total"),
+                                "entity": _id("plant_pv_energy_total"),
                                 "name": _t("Generation", "发电量"),
                                 "color": "#22c55e",
                             }
@@ -3848,7 +3916,7 @@ def _build_inverter_views(
                         _t("Grid Voltage", "电网电压"),
                         [
                             {
-                                "entity": _entity(dev_id, "grid_on_voltage"),
+                                "entity": _id("grid_on_voltage"),
                                 "name": _t("Grid Voltage", "电网电压"),
                                 "color": "#60a5fa",
                             }
@@ -3862,7 +3930,7 @@ def _build_inverter_views(
                         _t("Energy Today", "今日发电量"),
                         [
                             {
-                                "entity": _entity(dev_id, "system_pv_energy_today"),
+                                "entity": _id("system_pv_energy_today"),
                                 "name": _t("PV Today", "今日发电"),
                                 "color": "#fbbf24",
                             }
@@ -4147,6 +4215,13 @@ def _gauge(
             _resolve_entity(hass, dev_id, key) if hass is not None
             else _entity(dev_id, key)
         ),
+        # `dev_id` and `key` are not ornaments: the card uses them to re-resolve
+        # the entity itself when the id above goes stale - a renamed device, or a
+        # sensor the registry has not created yet at the instant the dashboard was
+        # written.  Without them the card can only read the id it was handed, and
+        # an id it cannot read renders 「—」 forever.
+        "dev_id": dev_id,
+        "key": key,
         "name": name,
         "unit": unit,
     }

@@ -1854,6 +1854,14 @@ function _hmPowerFlowRegister() {
            system totals, so they are part of the key as well - all of them, so
            a 4-input unit redraws when its third or fourth port starts. */
         d.pvPorts.map(wkey).join(","),
+        /* Except that a unit which mirrors one physical string onto two inputs
+           (the 1650 does) is drawn from the *summed* total instead, and a sum
+           changes when either addend does - including the case where both
+           ports move by equal and opposite amounts and every individual
+           `pvPorts` value above stays put.  Without this the 1650's PV node
+           froze on the first total it drew, which is the 「PV 数值显示很慢」
+           report: the number was there, the diagram just never repainted. */
+        wkey(d.pvTotal),
         d.soc === null || d.soc === undefined ? "x" : num(d.soc).toFixed(2),
         d.status, d.rssi, d.packs,
         /* The role still changes the drawing: `solar2` decides whether a second
