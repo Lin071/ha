@@ -629,6 +629,30 @@ def _heal_entity_ids(
             out.insert(0, base)
         return out
 
+    def key_of(value: Any) -> str | None:
+        """Which of this device's description keys ``value`` encodes, if any.
+
+        Pure suffix matching against the registry map, deliberately blind to
+        whether the state is usable: the caller needs the *identity* of a card
+        (so it can be written into ``key``/``dev_id``), not a verdict on its
+        value.  Longest key first, so ``plant_pv_energy_total`` is never
+        mistaken for a shorter key that happens to be its tail.
+        """
+        if not isinstance(value, str) or not value.startswith("sensor."):
+            return None
+        tail = value[len(prefix) :] if value.startswith(prefix) else None
+        candidates = keys_of(tail) if tail is not None else keys_of(
+            value[len("sensor.") :]
+        )
+        for candidate in candidates:
+            if candidate in mapping:
+                return candidate
+        for key in by_tail:
+            for candidate in candidates:
+                if candidate == key or candidate.endswith(f"_{key}"):
+                    return key
+        return None
+
     def fix(value: Any) -> Any:
         if not isinstance(value, str) or not value.startswith("sensor."):
             return value
@@ -665,6 +689,26 @@ def _heal_entity_ids(
     for card in _walk_cards(config.get("views") or []):
         if not isinstance(card, dict):
             continue
+        # Repointing the id is only half of what a gauge card needs to repair
+        # itself.  ``hoymiles-g2-gauge`` resolves its own entity when the stored
+        # id goes stale, but only through ``_scan(config.key)`` - and a card
+        # written by an earlier release carries no ``key`` (nor the ``dev_id``
+        # the scan compares against), so that whole ladder is dead on exactly
+        # the dashboards that need it.  The card is then left with its one
+        # hard-coded id: usable and it renders, ``unknown`` and it prints 「—」
+        # forever with no fallback.
+        #
+        # So the identity is back-filled here from the id the card already
+        # carries.  Only when a key can actually be derived, which keeps a card
+        # the user pointed at another integration's sensor untouched.
+        if card.get("type") == GAUGE_CARD:
+            wanted_key = card.get("key") or key_of(card.get("entity"))
+            if wanted_key and card.get("key") != wanted_key:
+                card["key"] = wanted_key
+                changed = True
+            if wanted_key and card.get("dev_id") != dev_id:
+                card["dev_id"] = dev_id
+                changed = True
         for key in ("entity", "entity_id"):
             current = card.get(key)
             fixed = fix(current)
