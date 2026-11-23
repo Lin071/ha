@@ -242,6 +242,27 @@ function _hmBatteryRegister() {
     return String(name).toLowerCase().replace(/[^a-z0-9]+/g, "");
   }
 
+  /**
+   * Drop the `_2` / `_3` … Home Assistant appends to a colliding entity id.
+   *
+   * HA never fails a registration whose derived id is taken; it numbers it.
+   * A unit whose serial was registered once before therefore has every id off
+   * by one suffix (`sensor.<serial>_pack_1_soc_2`), while the card derives the
+   * plain one.  Comparing the two has to look past that number, so the tail is
+   * run through this before `norm()`.
+   *
+   * Only a trailing `_<digits>` is removed, so a key that legitimately ends in
+   * digits (`pv1_power`, `pack_1_soc`) is untouched.
+   */
+  function stripAuditSuffix(value) {
+    const text = String(value == null ? "" : value);
+    const at = text.lastIndexOf("_");
+    if (at <= 0) return text;
+    const tail = text.slice(at + 1);
+    if (!/^[0-9]+$/.test(tail) || /^0+$/.test(tail)) return text;
+    return text.slice(0, at);
+  }
+
   function esc(text) {
     return String(text == null ? "" : text).replace(/[&<>"']/g, (ch) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -560,6 +581,9 @@ function _hmBatteryRegister() {
       this._hass = null;
       this._config = null;
       this._cache = new Map();
+      /* Registry device ids owning this serial, filled lazily by `_deviceIds`
+         and only used by the name-matching fallback of `_resolveEntity`. */
+      this._deviceIdsCache = null;
       this._range = RANGES[0].id;
       this._history = null;
       this._histLoading = false;
@@ -849,6 +873,20 @@ connectedCallback() {
       return config.show_title !== false && config.title !== false;
     }
 
+    /**
+     * Resolve an entity id for this device.
+     *
+     * Five strategies, cheapest first: the conventional
+     * ``<domain>.<slug(dev_id)>_<suffix>`` id, a prefix+suffix scan, both of
+     * those again with Home Assistant's disambiguation number stripped, a scan
+     * keyed on the serial for a renamed device, and finally the registry's
+     * ``name`` / ``translation_key``.
+     *
+     * The numbered pass is what makes a colliding serial work at all.  HA does
+     * not fail a registration whose derived ``entity_id`` is taken - it appends
+     * ``_2``, ``_3`` … - so a unit registered once before carries every id one
+     * suffix away from the conventional one.
+     */
     _resolveEntity(suffix, domain = "sensor") {
       const overrides = (this._config.entities || {});
       if (overrides[suffix]) return overrides[suffix];
@@ -877,6 +915,19 @@ connectedCallback() {
       }
 
       if (!found) {
+        // The same, tolerating Home Assistant's `_2`.  Tried after the exact
+        // pass so an unsuffixed id always wins, and shortest first so `_2`
+        // beats `_10`.
+        const prefix = `${domain}.${dev}`;
+        const wanted = norm(suffix);
+        for (const entityId of Object.keys(hass.states)) {
+          if (!entityId.startsWith(prefix)) continue;
+          if (norm(stripAuditSuffix(entityId.slice(prefix.length + 1))) !== wanted) continue;
+          if (!found || entityId.length < found.length) found = entityId;
+        }
+      }
+
+      if (!found) {
         // A renamed device.  Renaming it in Home Assistant rewrites every
         // entity id to the new name, so the `<slug(dev_id)>_` prefix the two
         // strategies above rely on is gone and the card would silently fall
@@ -895,18 +946,70 @@ connectedCallback() {
         }
       }
 
+      if (!found) {
+        // Same rename-tolerant pass, tolerating the disambiguation number.
+        const marker = norm(this._dev());
+        const wanted = norm(suffix);
+        for (const entityId of Object.keys(hass.states)) {
+          const flat = norm(entityId);
+          const at = marker ? flat.indexOf(marker) : -1;
+          if (at < 0) continue;
+          if (norm(stripAuditSuffix(flat.slice(at + marker.length))) !== wanted) continue;
+          if (!found || entityId.length < found.length) found = entityId;
+        }
+      }
+
       if (!found && hass.entities) {
-        const uniqueSuffix = `hoymiles_${this._dev()}_${suffix}`;
+        // Last resort: match the registry `name` (or its `translation_key`),
+        // which is what the sensor description gives.  The unique_id check
+        // this replaced was dead code - `hass.entities` does not carry it.
+        // Scoped to this unit's devices where the serial can be traced, since
+        // a name match across the whole registry would happily return another
+        // unit's sensor, and showing the wrong battery's SOC is worse than
+        // showing a placeholder.
+        const deviceIds = this._deviceIds();
+        const wanted = norm(suffix);
         for (const [entityId, entry] of Object.entries(hass.entities)) {
-          if (entry && entry.unique_id === uniqueSuffix) {
-            found = entityId;
-            break;
-          }
+          if (!entry || !entityId.startsWith(`${domain}.`)) continue;
+          if (deviceIds.size && !deviceIds.has(entry.device_id)) continue;
+          if (norm(stripAuditSuffix(entry.name)) !== wanted
+            && norm(stripAuditSuffix(entry.translation_key)) !== wanted) continue;
+          if (!hass.states[entityId]) continue;
+          if (!found || entityId.length < found.length) found = entityId;
         }
       }
 
       if (found) this._cache.set(cacheKey, found);
       return found;
+    }
+
+    /**
+     * The registry device ids that belong to this card's serial, resolved once.
+     *
+     * `hass.devices` holds an array of `[domain, identifier]` pairs per device
+     * and the integration registers the serial verbatim, so a surviving serial
+     * in an identifier is what ties a device record to this card.  An empty set
+     * means "could not tell" - the caller then skips the scoped fallback rather
+     * than guessing.
+     */
+    _deviceIds() {
+      if (this._deviceIdsCache) return this._deviceIdsCache;
+      const out = new Set();
+      const devices = (this._hass && this._hass.devices) || {};
+      const serial = String(this._dev() || "");
+      if (serial) {
+        for (const [deviceId, device] of Object.entries(devices)) {
+          if (!device) continue;
+          for (const pair of device.identifiers || []) {
+            if (Array.isArray(pair) && String(pair[1]) === serial) {
+              out.add(deviceId);
+              break;
+            }
+          }
+        }
+      }
+      this._deviceIdsCache = out;
+      return out;
     }
 
     _stateOf(suffix, domain = "sensor") {

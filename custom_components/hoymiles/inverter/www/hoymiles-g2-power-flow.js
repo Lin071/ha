@@ -305,6 +305,85 @@ function _hmPowerFlowRegister() {
   const LAMP_ROUTE = `M${LAMP_A.x} ${LAMP_A.y} L${LAMP_B.x} ${LAMP_B.y}`;
 
   /* ------------------------------------------------------------------ *
+   * One schematic, two vertical rhythms
+   *
+   * The storage drawing and a micro inverter's System tab are the same wiring
+   * diagram, but not the same *amount* of it: the micro inverter has no 微储
+   * branch and no 光伏2 branch (`_isInverterSystem`), so two of its four
+   * rows are empty and the rings sat in a canvas sized for the storage chart.
+   * Measured on the test installation at a 725 px card width, that left the
+   * System tab's card 176 px taller than the Device tab's while carrying
+   * *less* ink - that is what the user saw as "too tall, the page looks bad".
+   *
+   * So the geometry lives here instead of in `_svgSystem`, in two named
+   * profiles.  Every number is in viewBox units, and because the SVG is
+   * scaled by CSS the rendered height follows `vbH` linearly, which is the
+   * only lever that actually changes the card's height (a narrower
+   * `max_width` would shrink the drawing without making the card shorter
+   * *relative* to its width).
+   *
+   * `SYS_FULL` reproduces the original storage drawing **exactly** - same
+   * routes, same caption offsets - so the 微储 dashboards are untouched.  The
+   * profiles are only selected by `_isInverterSystem`, never by anything a
+   * user can change, so this cannot drift between the two product families.
+   * ------------------------------------------------------------------ */
+  /* The storage profile is the original, untouched geometry. */
+  const SYS_FULL = {
+    vbH: VB_H,
+    rowTop: NODE_ROW_TOP,
+    rowBot: NODE_ROW_BOT,
+    midY: JUNCTION.y,
+    unitY: INV.y,
+    pvRoute: "M104 142 V190 Q104 200 114 200 H283",
+    batteryRoute: "M104 322 V274 Q104 264 114 264 H283",
+    gridRoute: `M600 142 V${JUNCTION.y - 6}`,
+    plugRoute: `M600 322 V${JUNCTION.y + 6}`,
+    loadRoute: LAMP_ROUTE,
+    /* Captions above a ring, and below it.  The storage drawing needs the
+       wider offsets because the diagonals of 光伏2 / 负载 pass close to the
+       text there. */
+    capTop: { v: -(NODE_R + 28), c: -(NODE_R + 48) },
+    capBot: { v: NODE_R + 26, c: NODE_R + 46 },
+  };
+
+  /* The micro inverter profile.
+   *
+   * `rowTop` / `rowBot` are 8 and 88 units closer to the middle than the
+   * storage drawing's, and `midY` is where the unit sits (`unitY`), so the two
+   * horizontal runs entering it are collinear - the storage drawing has to
+   * offset them by 32 units to leave the 微储 branch its mirrored slot.
+   *
+   * Every coordinate below is derived from those three numbers rather than
+   * hand-placed, so the rings and the connectors cannot drift apart:
+   *
+   *   pv      starts on the ring's bottom edge (rowTop + NODE_R)
+   *   battery starts on the ring's top edge    (rowBot - NODE_R)
+   *   grid    the same edge on the right column
+   *   plug    the same edge, rising
+   *   load    a straight run from its ring to the junction, starting 34 units
+   *           along the line itself (the rule `PV2_A` already follows)
+   *
+   * `vbH` is then set from the *ink*: the highest text is the top row's caption
+   * at `rowTop - 74`, so it starts at 16; the lowest is the bottom row's caption
+   * at `rowBot + 72`, so it ends at 344 in a 360 tall canvas - 16 units of
+   * margin either side, which is the tightest that does not clip a descender.
+   * Rendered at 725 px wide that is 373 px against 487 px before. */
+  const SYS_COMPACT = {
+    vbH: 360,
+    rowTop: 100,
+    rowBot: 268,
+    midY: 184,
+    unitY: 184,
+    pvRoute: "M104 134 V174 Q104 184 114 184 H283",
+    batteryRoute: "M104 234 V194 Q104 184 114 184 H283",
+    gridRoute: "M600 134 V178",
+    plugRoute: "M600 234 V190",
+    loadRoute: "M496.7 249.8 L600 190",
+    capTop: { v: -(NODE_R + 24), c: -(NODE_R + 40) },
+    capBot: { v: NODE_R + 22, c: NODE_R + 38 },
+  };
+
+  /* ------------------------------------------------------------------ *
    * The micro-inverter layout (`variant: inverter`)
    *
    * A HiFlow is a grid-tied micro inverter: it has no battery and no
@@ -424,11 +503,13 @@ function _hmPowerFlowRegister() {
    * ports report the identical figure.
    *
    * The one reading is printed **once**, and printed *with its caption*: the
-   * two text lines sit together in the blank the rings leave beside the bus,
-   * right-aligned on the bus so they grow away from it and just above the
-   * horizontal lead so the cable never runs through the number.  Putting the
-   * figure in one place and 「PV端口」 far below it made the value look like it
-   * belonged to a ring and the wording like it belonged to nothing.
+   * two text lines sit together in the notch the two rings leave to the left of
+   * the merge bar, right-aligned on that bar so they grow away from it, and
+   * centred on the horizontal lead so the pair reads as belonging to the
+   * junction rather than to either ring.  Putting the figure in one place and
+   * 「PV端口」 far below it made the value look like it belonged to a ring and the
+   * wording like it belonged to nothing; stacking both *above* the bar put them
+   * in the ring band instead of in the blank the notch is.
    *
    * `IV_SPLIT_BUS_X` is how far that bus stands off the rings, wide enough that
    * the two runs read as separate horizontals and not as one thick line, while
@@ -439,11 +520,13 @@ function _hmPowerFlowRegister() {
      leave a band of clear canvas between them for the value + caption block. */
   const IV_SPLIT_GAP = 120;
   const IV_SPLIT_BUS_X = 172;
-  /* Baseline distance between the reading and the caption under it. */
-  const IV_SPLIT_LINE = 18;
-  /* How far the caption's baseline is kept above the horizontal lead, so the
-     cable never runs through the text block. */
-  const IV_SPLIT_CLEAR = 10;
+  /* Baseline distance between the reading and the caption beside it.  The two
+     lines straddle the lead by half of it, so the block's own optical centre
+     lands *on* the junction instead of floating above it. */
+  const IV_SPLIT_LINE = 22;
+  /* Clear canvas kept between the right edge of the text block and the merge
+     bar, so neither line ever touches the vertical stroke. */
+  const IV_SPLIT_TEXT_GAP = 8;
   /* The drawing is shorter than `IV_H` in this variant: the ports sit against
      the body's own top and bottom edges instead of along the bottom row, so the
      strip under it `IV_H` reserves for a row of caption blocks is empty.  The
@@ -1190,6 +1273,29 @@ function _hmPowerFlowRegister() {
     return String(name).toLowerCase().replace(/[^a-z0-9]+/g, "");
   }
 
+  /**
+   * Drop the `_2` / `_3` … Home Assistant appends to a colliding entity id.
+   *
+   * HA never fails a registration whose derived id is taken; it numbers it.
+   * A unit whose serial was registered once before - the very case behind
+   * `sensor.<serial>_system_pv_power_2` - therefore has *every* id off by one
+   * suffix, while the card derives the plain one from the config.  Comparing
+   * the two has to look past that number, so the tail is run through this
+   * before `norm()`.
+   *
+   * Only a trailing `_<digits>` is removed, so a key that legitimately ends in
+   * digits (`pv1_power`, `grid_on_power_5_min`) is untouched - that is what
+   * makes this safe to compare, unlike a blanket digit strip.
+   */
+  function stripAuditSuffix(value) {
+    const text = String(value == null ? "" : value);
+    const at = text.lastIndexOf("_");
+    if (at <= 0) return text;
+    const tail = text.slice(at + 1);
+    if (!/^[0-9]+$/.test(tail) || /^0+$/.test(tail)) return text;
+    return text.slice(0, at);
+  }
+
   function esc(text) {
     return String(text == null ? "" : text).replace(/[&<>"']/g, (ch) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -1287,6 +1393,9 @@ function _hmPowerFlowRegister() {
       this._hass = null;
       this._config = null;
       this._cache = new Map();
+      /* Registry device ids owning this serial, filled lazily by `_deviceIds`
+         and only used by the name-matching fallback of `_resolveEntity`. */
+      this._deviceIdsCache = null;
       /* Start of the shared flow clock, in `performance.now()` milliseconds.
          0 means "not started yet", which `_beamPlan` fills in on the first
          render.  All the streaks are driven by CSS animations from this one
@@ -1888,12 +1997,18 @@ function _hmPowerFlowRegister() {
     /**
      * Resolve an entity id for this device.
      *
-     * Four strategies, cheapest first: the conventional
+     * Five strategies, cheapest first: the conventional
      * ``<domain>.<slug(dev_id)>_<suffix>`` id, a prefix+suffix scan, a scan
-     * keyed on the serial for a renamed device, and finally the integration's
-     * ``hoymiles_<dev_id>_<suffix>`` unique id.  Results are cached,
-     * because the scan is O(entities) and the card re-renders on every state
-     * change.
+     * keyed on the serial for a renamed device, both of those again with Home
+     * Assistant's disambiguation number stripped, and finally the registry's
+     * ``name``/``translation_key``.  Results are cached, because the scan is
+     * O(entities) and the card re-renders on every state change.
+     *
+     * The numbered pass is what makes a colliding serial work at all.  HA does
+     * not fail a registration whose derived ``entity_id`` is taken - it appends
+     * ``_2``, ``_3`` … - so a unit registered once before carries every id one
+     * suffix away from the conventional one, and without this the card fell
+     * through to its placeholder values and drew every node as `—`.
      */
     _resolveEntity(suffix, domain = "sensor") {
       const overrides = (this._config.entities || {});
@@ -1925,6 +2040,20 @@ function _hmPowerFlowRegister() {
       }
 
       if (!found) {
+        // The same, tolerating Home Assistant's `_2`.  Tried after the exact
+        // pass so an unsuffixed id always wins and only a genuinely numbered
+        // one is picked up; shortest wins for the same reason, which prefers
+        // `_2` over `_10`.
+        const prefix = `${domain}.${dev}`;
+        const wanted = norm(suffix);
+        for (const entityId of Object.keys(hass.states)) {
+          if (!entityId.startsWith(prefix)) continue;
+          if (norm(stripAuditSuffix(entityId.slice(prefix.length + 1))) !== wanted) continue;
+          if (!found || entityId.length < found.length) found = entityId;
+        }
+      }
+
+      if (!found) {
         // A renamed device.  Renaming it in Home Assistant rewrites every
         // entity id to the new name, so `sensor.rmi_4161a0209ff6_grid_port_power`
         // became `sensor.wo_shi_rmi_4161a0209ff6_grid_port_power` and the
@@ -1944,18 +2073,73 @@ function _hmPowerFlowRegister() {
         }
       }
 
+      if (!found) {
+        // Same rename-tolerant pass, tolerating the disambiguation number.
+        const marker = norm(this._dev());
+        const wanted = norm(suffix);
+        for (const entityId of Object.keys(hass.states)) {
+          const flat = norm(entityId);
+          const at = marker ? flat.indexOf(marker) : -1;
+          if (at < 0) continue;
+          if (norm(stripAuditSuffix(flat.slice(at + marker.length))) !== wanted) continue;
+          if (!found || entityId.length < found.length) found = entityId;
+        }
+      }
+
       if (!found && hass.entities) {
-        const uniqueSuffix = `hoymiles_${this._dev()}_${suffix}`;
+        // Last resort, and the only one that still works when neither the
+        // serial nor the slug survives in the id: match the registry `name`
+        // (or its `translation_key`) our own sensor description gives, exactly
+        // as the number card does.  Scoped to this unit's devices, because a
+        // name match across the whole registry would happily return another
+        // inverter's sensor - showing the wrong unit's watts is worse than
+        // showing `—`.  The unique_id the comment above used to rely on is
+        // **not** in `hass.entities` (the frontend payload omits it), so that
+        // branch was dead code.
+        const deviceIds = this._deviceIds();
+        const wanted = norm(suffix);
         for (const [entityId, entry] of Object.entries(hass.entities)) {
-          if (entry && entry.unique_id === uniqueSuffix) {
-            found = entityId;
-            break;
-          }
+          if (!entry || !entityId.startsWith(`${domain}.`)) continue;
+          if (deviceIds.size && !deviceIds.has(entry.device_id)) continue;
+          if (norm(stripAuditSuffix(entry.name)) !== wanted
+            && norm(stripAuditSuffix(entry.translation_key)) !== wanted) continue;
+          if (!hass.states[entityId]) continue;
+          if (!found || entityId.length < found.length) found = entityId;
         }
       }
 
       if (found) this._cache.set(cacheKey, found);
       return found;
+    }
+
+    /**
+     * The registry device ids that belong to `dev_id`, resolved once.
+     *
+     * `hass.devices` keys an array of `[domain, identifier]` pairs, and the
+     * integration registers the serial verbatim, so the serial surviving in the
+     * identifier is what ties a device to this card.  An empty set means "could
+     * not tell" - the caller then skips the scoped fallback rather than guessing.
+     */
+    _deviceIds() {
+      if (this._deviceIdsCache) return this._deviceIdsCache;
+      const out = new Set();
+      const devices = (this._hass && this._hass.devices) || {};
+      const serial = String(this._dev() || "");
+      if (!serial) {
+        this._deviceIdsCache = out;
+        return out;
+      }
+      for (const [deviceId, device] of Object.entries(devices)) {
+        if (!device) continue;
+        for (const pair of device.identifiers || []) {
+          if (Array.isArray(pair) && String(pair[1]) === serial) {
+            out.add(deviceId);
+            break;
+          }
+        }
+      }
+      this._deviceIdsCache = out;
+      return out;
     }
 
     /** Numeric state of a device sensor, or `fallback` when unavailable. */
@@ -2748,18 +2932,21 @@ function _hmPowerFlowRegister() {
         );
         const cyTop = centre - half;
         const cyBot = centre + half;
-        /* The reading and its caption, one block, *centred on* the merge bus in
-           the clear canvas between the two rims and above the lead: the
-           figure on top, 「PV端口」 directly under it, both clear of the cable so
-           the line never runs through the number.  Centring on the bus is what
-           makes the pair read as belonging to the junction instead of hanging
-           off its left side. */
+        /* The reading and its caption, one block, in the blank the two rings
+           leave to the **left** of the merge bar: the figure on top,
+           「PV端口」 directly under it, and the pair centred on the lead's own
+           height so it lines up with the junction on the bar.  Both lines are
+           right-aligned on the bar (`align: "end"`) so they grow *away* from
+           it into the notch - centring them on the bar put half the block on
+           the far side, where the bus and the lead already are, and stacking
+           them above it landed them in the ring band. */
         pvNodes.push({
           kind: "value",
           id: "pv-value",
-          x: busX,
-          y: centre - IV_SPLIT_CLEAR - IV_SPLIT_LINE,
-          captionY: centre - IV_SPLIT_CLEAR,
+          x: busX - IV_SPLIT_TEXT_GAP,
+          align: "end",
+          y: centre - IV_SPLIT_LINE / 2,
+          captionY: centre + IV_SPLIT_LINE / 2,
           power: value,
           value: reading(value),
           caption: "PV Port",
@@ -3004,15 +3191,17 @@ function _hmPowerFlowRegister() {
 
       for (const n of opts.pv) {
         /* The one reading of the pair, printed together with its caption:
-           `value` on the first baseline, 「PV端口」 right under it.  Both are
-           centred on `n.x` - the merge bus - so the two lines sit on the
-           junction the two panels flow into, instead of hanging off its left
-           side.  See `IV_SPLIT_PV_CODE`. */
+           `value` on the upper line, 「PV端口」 right under it, the pair centred
+           on the junction's own height.  `n.x` is the merge bar *minus* a gap
+           and `n.align` is `end`, so both lines end just short of the bar and
+           grow leftwards into the notch between the two rings instead of
+           straddling the junction.  See `IV_SPLIT_PV_CODE`. */
         if (n.kind === "value") {
+          const anchor = n.align || "middle";
           parts.push(`<text class="pf-v pf-iv pf-panel-value" x="${n.x}"
-                y="${n.y}" text-anchor="middle" dominant-baseline="middle">${esc(n.value)}</text>`);
+                y="${n.y}" text-anchor="${anchor}" dominant-baseline="middle">${esc(n.value)}</text>`);
           parts.push(`<text class="pf-c pf-iv-c pf-panel-c" x="${n.x}"
-                y="${n.captionY}" text-anchor="middle" dominant-baseline="middle">${esc(t(n.caption, n.captionZh))}</text>`);
+                y="${n.captionY}" text-anchor="${anchor}" dominant-baseline="middle">${esc(t(n.caption, n.captionZh))}</text>`);
           continue;
         }
         if (n.kind === "bus" || n.kind === "lead") {
@@ -3051,6 +3240,12 @@ function _hmPowerFlowRegister() {
     }
 
     _svgSystem(d) {
+      /* Which vertical rhythm this drawing uses.  A micro inverter's System tab
+         has neither a 微储 nor a 光伏2 branch, so it gets the compact profile
+         and its card comes out at the Device tab's height; the storage chart
+         keeps the original geometry byte for byte.  See `SYS_FULL` /
+         `SYS_COMPACT`. */
+      const g = this._isInverterSystem() ? SYS_COMPACT : SYS_FULL;
       const present = (v) => v !== null && v !== undefined && !Number.isNaN(num(v));
       /* A missing reading prints a dash, not "0.0 W".  Until a unit reports for
          the first time every `system_*` entity is `unknown`, and rendering that
@@ -3133,24 +3328,24 @@ function _hmPowerFlowRegister() {
        * the same AC bus the grid and the house hang from, so it belongs on that
        * node rather than on a wire of its own. */
       const routes = [
-        { id: "pv", d: "M104 142 V190 Q104 200 114 200 H283", power: d.pv,
+        { id: "pv", d: g.pvRoute, power: d.pv,
           color: COLORS.pv, reverse: num(d.pv) < 0,
           stage: stageLeft(num(d.pv) < 0) },
-        ...(hasBattery ? [{ id: "battery", d: "M104 322 V274 Q104 264 114 264 H283",
+        ...(hasBattery ? [{ id: "battery", d: g.batteryRoute,
           power: d.battery, color: COLORS.battery, reverse: charging,
           stage: stageLeft(charging) }] : []),
         /* The trunk is the one connector whose stage never changes: it *is* the
            middle of the cycle, the moment everything meets. */
-        { id: "trunk", d: `M361 ${JUNCTION.y} H594`, power: trunk,
+        { id: "trunk", d: `M361 ${g.midY} H594`, power: trunk,
           color: COLORS.pv, reverse: trunk < 0, stage: 1 },
-        { id: "grid", d: `M600 142 V${JUNCTION.y - 6}`, power: d.grid,
+        { id: "grid", d: g.gridRoute, power: d.grid,
           color: num(d.grid) > 0 ? COLORS.grid : COLORS.grid_out,
           reverse: num(d.grid) < 0,
           stage: stageRight(num(d.grid) < 0) },
-        { id: "load", d: LAMP_ROUTE, power: d.load,
+        { id: "load", d: g.loadRoute, power: d.load,
           color: COLORS.load, reverse: num(d.load) >= 0,
           stage: stageRight(num(d.load) >= 0) },
-        { id: "plug", d: `M600 322 V${JUNCTION.y + 6}`, power: d.smartPlug,
+        { id: "plug", d: g.plugRoute, power: d.smartPlug,
           color: COLORS.sp, reverse: num(d.smartPlug) >= 0,
           stage: stageRight(num(d.smartPlug) >= 0) },
         ...(this._isInverterSystem() ? [] : [{ id: "pv2", d: PV2_ROUTE, power: d.pv2,
@@ -3184,10 +3379,18 @@ function _hmPowerFlowRegister() {
          energy into it.  That inversion is why the colours are picked from the
          sign here instead of from `d.grid` like the two-node branch does. */
       const merged = d.meter === false;
-      const combined = merged ? num(d.gridPort) : 0;
+      /* What the lumped 「电网&负载」 node carries.  `system_load_power` (protocol
+         `sys_load_p`) is the *plant's* own load and is the figure the vendor app
+         prints on that node, so it wins whenever the installation reports it.
+         The unit's own AC port (`gridPort`) is only the fallback: measured on a
+         master it reads 0 W while the house is plainly drawing - one live
+         payload had `sys_load_p` 98.9 W against `grid_on_p` 0 - and printing
+         that zero said the house was idle. */
+      const lumped = present(d.load) ? d.load : d.gridPort;
+      const combined = merged ? num(lumped) : 0;
       if (merged) {
         const grid = routes.find((r) => r.id === "grid");
-        grid.power = d.gridPort;
+        grid.power = lumped;
         grid.color = combined < 0 ? COLORS.grid : COLORS.grid_out;
         grid.reverse = combined >= 0;
         grid.stage = stageRight(combined >= 0);
@@ -3240,6 +3443,14 @@ function _hmPowerFlowRegister() {
            a house that exports more than it generates shows a lit node rather
            than a dim, grey one carrying a healthy positive number. */
         pvValue,
+        /* The figure the lumped 「电网&负载」 node prints on a unit without a
+           meter - `sys_load_p` when there is one, the AC port otherwise.  Passed
+           in rather than recomputed in `_nodes` so the node and its connector
+           can never disagree about which reading they show. */
+        gridLoadValue: merged ? lumped : undefined,
+        /* The row centres and caption offsets of the profile chosen above, so
+           the rings land on the ends of the connectors that were just built. */
+        geometry: g,
       });
 
       /* The unit in the middle works as soon as *anything* flows through it, so
@@ -3247,18 +3458,18 @@ function _hmPowerFlowRegister() {
       const busy = [d.pv, d.pv2, d.grid, d.load, d.smartPlug, d.battery]
         .some((v) => present(v) && Math.abs(num(v)) >= MIN_FLOW);
 
-      return `<svg viewBox="0 0 ${VB_W} ${VB_H}" preserveAspectRatio="xMidYMid meet"
+      return `<svg viewBox="0 0 ${VB_W} ${g.vbH}" preserveAspectRatio="xMidYMid meet"
                    xmlns="http://www.w3.org/2000/svg" role="img">
         ${this._config.gradient === false
           ? ""
-          : `<rect x="0" y="0" width="${VB_W}" height="${VB_H}" fill="#ffffff"/>`}
+          : `<rect x="0" y="0" width="${VB_W}" height="${g.vbH}" fill="#ffffff"/>`}
         <clipPath id="${NODE_CLIP_ID}" clipPathUnits="userSpaceOnUse">
           <circle cx="0" cy="0" r="${NODE_CLIP_R}"/>
         </clipPath>
         ${edges}
         ${beams}
-        ${this._inverter(busy)}
-        <circle class="pf-junction" cx="${JUNCTION.x}" cy="${JUNCTION.y}" r="6"/>
+        ${this._inverter(busy, g.unitY)}
+        <circle class="pf-junction" cx="${JUNCTION.x}" cy="${g.midY}" r="6"/>
         ${nodes}
       </svg>`;
     }
@@ -3269,13 +3480,15 @@ function _hmPowerFlowRegister() {
      * nothing is stroked on top of it and there is no separate stem.
      *
      * `busy` picks the coloured or the dim variant, the same two-tone rule the
-     * nodes use.
+     * nodes use.  `cy` is the row profile's mid line; the storage drawing and
+     * the micro inverter drawing put it in different places (see `SYS_FULL` /
+     * `SYS_COMPACT`), so it is passed in rather than read from `INV`.
      */
-    _inverter(busy) {
-      const { x, y } = INV;
+    _inverter(busy, cy = INV.y) {
+      const x = INV.x;
       const half = INV_ICON / 2;
       const art = PF_ICONS[`inverter.${busy ? "on" : "off"}`] || "";
-      return `<image class="pf-ic pf-unit" x="${x - half}" y="${y - half}"
+      return `<image class="pf-ic pf-unit" x="${x - half}" y="${cy - half}"
                     width="${INV_ICON}" height="${INV_ICON}" href="${art}"/>`;
     }
 
@@ -3315,6 +3528,10 @@ function _hmPowerFlowRegister() {
       /* A micro inverter's system view needs two departures from the storage
          layout; both are explained in full on `_isInverterSystem`. */
       const inverterSystem = this._isInverterSystem();
+      /* The row centres and caption offsets that `_svgSystem` chose for this
+         drawing.  Defaulted to the storage profile so a future caller that
+         forgets to pass it cannot silently move a ring off its connector. */
+      const geo = opts.geometry || SYS_FULL;
       /* What the 光伏 node prints.  It equals `d.pv` on every view but a micro
          inverter's system view showing a negative 负载, where the caller has
          already added those watts in (`_svgSystem`).  Read here rather than
@@ -3330,8 +3547,11 @@ function _hmPowerFlowRegister() {
          the connector stays legible. */
       const node = (x, y, icon, on, value, caption, above = false) => {
         const art = PF_ICONS[`${icon}.${on ? "on" : "off"}`] || "";
-        const vy = above ? -(NODE_R + 28) : NODE_R + 26;
-        const cy = above ? -(NODE_R + 48) : NODE_R + 46;
+        /* The caption placement comes from the profile: the storage rings need
+           the wider offsets there, the micro inverter's tighter rows do not. */
+        const cap = above ? geo.capTop : geo.capBot;
+        const vy = cap.v;
+        const cy = cap.c;
         parts.push(`<g class="pf-node" transform="translate(${x} ${y})">
             <image class="pf-ic" x="${-NODE_R}" y="${-NODE_R}"
                    width="${NODE_R * 2}" height="${NODE_R * 2}"
@@ -3357,12 +3577,12 @@ function _hmPowerFlowRegister() {
          node and says it without a legend.  On a micro inverter there is no
          光伏2 at all (`_isInverterSystem`), so the qualifier on 光伏1 has
          nothing left to distinguish it from - it is dropped there. */
-      node(NODE_COL_L, NODE_ROW_TOP, "pv", working(pvReading),
+      node(NODE_COL_L, geo.rowTop, "pv", working(pvReading),
         reading(pvReading),
         inverterSystem ? t("PV", "光伏") : t("PV1 (in system)", "光伏1（系统内）"),
         inverterSystem);
       if (opts.battery) {
-        node(NODE_COL_L, NODE_ROW_BOT, "battery", working(d.battery),
+        node(NODE_COL_L, geo.rowBot, "battery", working(d.battery),
           `${reading(d.battery)}${d.soc === null ? "" : `　${num(d.soc).toFixed(2)}%`}`,
           t("Storage", "微储"));
       }
@@ -3372,17 +3592,21 @@ function _hmPowerFlowRegister() {
          `routes` is what keeps the two layers agreeing - a node without a
          connector would have hung in empty canvas. */
       if (!inverterSystem) {
-        node(NODE_COL_M, NODE_ROW_TOP, "pv", working(d.pv2),
+        node(NODE_COL_M, geo.rowTop, "pv", working(d.pv2),
           reading(d.pv2), t("PV2 (external)", "光伏2（系统外）"));
       }
       if (d.meter === false) {
         /* No meter: one lumped 「电网&负载」 node where 电网 used to be.  It has
-           no 电网输入 / 电网输出 pill - the reading is the unit's AC port, which
-           cannot be attributed to either side of a border the firmware cannot
-           see - and it prints the magnitude, so the number matches the vendor
-           app's own dashboard.  See `_svgSystem` for the connector. */
-        node(NODE_COL_R, NODE_ROW_TOP, "gridload", working(d.gridPort),
-          reading(d.gridPort), t("Grid & Load", "电网&负载"), inverterSystem);
+           no 电网输入 / 电网输出 pill - the reading cannot be attributed to
+           either side of a border the firmware cannot see - and it prints the
+           magnitude, so the number matches the vendor app's own dashboard.
+           What it prints is the plant's `sys_load_p` when that is reported (see
+           `_svgSystem`), the unit's AC port only as a fallback. */
+        const lumped = opts.gridLoadValue === undefined
+          ? d.gridPort
+          : opts.gridLoadValue;
+        node(NODE_COL_R, geo.rowTop, "gridload", working(lumped),
+          reading(lumped), t("Grid & Load", "电网&负载"), inverterSystem);
       } else {
         const g = num(d.grid);
         const importing = g > 0;
@@ -3404,7 +3628,7 @@ function _hmPowerFlowRegister() {
         const caption = inverterSystem || Math.abs(g) < MIN_FLOW
           ? t("Grid", "电网")
           : (importing ? t("Grid In", "电网输入") : t("Grid Out", "电网输出"));
-        node(NODE_COL_R, NODE_ROW_TOP, "grid", working(d.grid),
+        node(NODE_COL_R, geo.rowTop, "grid", working(d.grid),
           reading(d.grid), caption, inverterSystem);
       }
       /* 负载 is drawn in **both** layouts and at every sign, including the
@@ -3415,9 +3639,9 @@ function _hmPowerFlowRegister() {
          branch is part of the installation, so it stays, carrying its own
          (negative) reading.  On a unit that cannot meter it keeps its place
          next to the lumped node as well: see `_svgSystem`. */
-      node(NODE_COL_M, NODE_ROW_BOT, "load", working(d.load),
+      node(NODE_COL_M, geo.rowBot, "load", working(d.load),
         reading(d.load), t("Load", "负载"));
-      node(NODE_COL_R, NODE_ROW_BOT, "plug", working(d.smartPlug),
+      node(NODE_COL_R, geo.rowBot, "plug", working(d.smartPlug),
         reading(d.smartPlug), t("Smart Plug", "智能插座"));
 
       return parts.join("");

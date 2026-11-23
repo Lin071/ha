@@ -211,6 +211,24 @@ function _hmSankeyRegister() {
     return String(name).toLowerCase().replace(/[^a-z0-9]+/g, "");
   }
 
+  /**
+   * Drop the `_2` / `_3` … Home Assistant appends to a colliding entity id.
+   *
+   * HA does not fail a registration whose derived `entity_id` is taken; it
+   * numbers it.  A unit whose serial was registered once before therefore has
+   * every id one suffix away from the plain one the card derives, and the join
+   * below would find nothing.  Only a trailing `_<digits>` is removed, so a key
+   * that legitimately ends in digits (`pv1_power`) is untouched.
+   */
+  function stripAuditSuffix(value) {
+    const text = String(value == null ? "" : value);
+    const at = text.lastIndexOf("_");
+    if (at <= 0) return text;
+    const tail = text.slice(at + 1);
+    if (!/^[0-9]+$/.test(tail) || /^0+$/.test(tail)) return text;
+    return text.slice(0, at);
+  }
+
   function esc(text) {
     return String(text == null ? "" : text).replace(/[&<>"']/g, (ch) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -539,39 +557,56 @@ function _hmSankeyRegister() {
 
     _label(def) { return this._t(def.en, def.zh); }
 
-    /** Resolve an entity id for one of this device's energy sensors. */
+    /** Resolve an entity id for one of this device's energy sensors.
+     *
+     * The prefix scan runs twice: once exact, once with Home Assistant's `_2`
+     * stripped off the candidate's own tail, because a serial registered once
+     * before has every id numbered while this card derives the plain one.
+     * Without the second pass the sankey found nothing for such a unit and drew
+     * an empty diagram.
+     */
     _resolveEntity(suffix, domain = "sensor") {
       const hass = this._hass;
       if (!hass) return null;
       const states = hass.states || {};
-      const entities = hass.entities || {};
       const dev = slug(this._dev());
+      const wanted = norm(suffix);
 
       const conventional = `${domain}.${dev}_${suffix}`;
       if (states[conventional]) return conventional;
 
       const prefix = `${domain}.${dev}`;
+      // 1. normalized exact match on the tail; the raw `endsWith` this replaces
+      //    could not tell `soc` from `system_soc`.
+      let found = null;
       for (const entityId of Object.keys(states)) {
-        if (entityId.startsWith(prefix) && entityId.endsWith(suffix)) return entityId;
+        if (!entityId.startsWith(prefix)) continue;
+        if (norm(entityId.slice(prefix.length + 1)) !== wanted) continue;
+        if (!found || entityId.length < found.length) found = entityId;
       }
+      if (found) return found;
 
-      // A renamed device: Home Assistant rewrites every entity id to the new
-      // name, so the `<slug(dev_id)>_` prefix above stops matching.  The
-      // serial never changes, so look for the suffix right after it.
+      // 2. the same, tolerating the disambiguation number.
+      for (const entityId of Object.keys(states)) {
+        if (!entityId.startsWith(prefix)) continue;
+        if (norm(stripAuditSuffix(entityId.slice(prefix.length + 1))) !== wanted) continue;
+        if (!found || entityId.length < found.length) found = entityId;
+      }
+      if (found) return found;
+
+      // 3. A renamed device: Home Assistant rewrites every entity id to the new
+      //    name, so the `<slug(dev_id)>_` prefix above stops matching.  The
+      //    serial never changes, so look for the suffix right after it.
       const marker = norm(this._dev());
-      const wanted = norm(suffix);
       for (const entityId of Object.keys(states)) {
         const flat = norm(entityId);
         const at = marker ? flat.indexOf(marker) : -1;
         if (at < 0) continue;
-        if (flat.slice(at + marker.length) === wanted) return entityId;
+        const tail = flat.slice(at + marker.length);
+        if (tail !== wanted && norm(stripAuditSuffix(tail)) !== wanted) continue;
+        if (!found || entityId.length < found.length) found = entityId;
       }
-
-      const uniqueSuffix = `hoymiles_${this._dev()}_${suffix}`;
-      for (const [entityId, entry] of Object.entries(entities)) {
-        if (entry && entry.unique_id === uniqueSuffix) return entityId;
-      }
-      return null;
+      return found;
     }
 
     /** statistic_ids for a node: config override, else resolved entities. */

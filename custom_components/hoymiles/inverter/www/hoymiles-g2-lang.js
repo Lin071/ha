@@ -133,9 +133,24 @@
     const found = findActionItems();
     if (!found || !found.hass) return false;
     ensureStyle(found.shadow);
-    if (found.items.querySelector(`.${SELECT_CLASS}`)) return true;
-    /* The storage package already provides a language control here. */
-    if (found.items.querySelector(`.${FOREIGN_SELECT_CLASS}`)) return true;
+
+    const own = found.items.querySelector(`.${SELECT_CLASS}`);
+    const foreign = found.items.querySelector(`.${FOREIGN_SELECT_CLASS}`);
+
+    /* The storage package's own language control takes precedence, because it
+       is the one the user's other dashboards already show.  Two switches appear
+       when both scripts are loaded and ours won the race: on a cold load this
+       one can run before the other has inserted its <select>, so the guard
+       below sees nothing and prepends; afterwards `own` is truthy and used to
+       return early, leaving the duplicate in place for ever.  So when both are
+       present ours steps aside.  Nothing is lost: both controls read and write
+       the same `localStorage["hoymiles.language"]` and announce on the same
+       `hoymiles-language` event, so the surviving one is the same setting. */
+    if (own) {
+      if (foreign) own.remove();
+      return true;
+    }
+    if (foreign) return true;
 
     /* Left edge, which is where the language switch belongs: the region switch
        inserts itself to the right of whichever language control it finds. */

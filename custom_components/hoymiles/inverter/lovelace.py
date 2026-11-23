@@ -252,8 +252,34 @@ _ROLE_SYSTEM_KEY = "g2_role_system_view"
 #                  pushed the tiles onto the next line; 27 + 9 sums to exactly
 #                  the row and keeps the ratio.  See
 #                  :func:`_migrate_system_tile_stack`
+#   30             revisions 23 to 29 are re-run over every dashboard, this time
+#                  recognising entity ids Home Assistant numbered (``_2``) and
+#                  the names revisions 23 / 26 replaced.  A unit whose serial
+#                  collided with an earlier registration has
+#                  ``sensor.<slug>_system_pv_power_2`` where the generator
+#                  wrote ``sensor.<slug>_system_pv_power``, and revisions 23
+#                  onwards compared the stored id *exactly*.  The result was a
+#                  dashboard that silently kept the pre-revision layout: the
+#                  two energy tiles still side by side in a nested grid, the
+#                  schematic still without ``variant: inverter-system`` (so 光伏2
+#                  was drawn and the AC plug figure was not read), and 今日发电 /
+#                  总发电量 still pointing at this unit instead of the
+#                  installation.  Every such comparison now goes through
+#                  :func:`_strip_suffix`, and the ids written back are the ones
+#                  the registry actually holds.  See
+#                  :func:`_migrate_plant_view`, :func:`_migrate_plant_energy_total`
+#                  and :func:`_migrate_system_tile_stack`
+#   31             that 3:1 split is narrowed to two thirds of the row - 18 + 6
+#                  instead of 27 + 9 - because the schematic was still too tall.
+#                  Its drawing is an SVG at ``width: 100%; height: auto``, so its
+#                  height is a pure function of its width; the card therefore
+#                  has to become *narrower* to become shorter, and doing it
+#                  through the cell rather than through ``max_width`` is what
+#                  scales the whole card (header, padding and drawing) instead of
+#                  leaving a small picture in a wide one.  See
+#                  :func:`_migrate_system_tile_stack`
 _LAYOUT_KEY = "g2_layout"
-_LAYOUT_VERSION = 29
+_LAYOUT_VERSION = 31
 
 # The view titles an earlier release wrote.  Used together with the absence of
 # ``icon`` / ``max_columns`` as the fingerprint of an untouched old dashboard, so
@@ -347,11 +373,29 @@ _DEVICE_FLOW_MAX_WIDTH = 0
 # schematic to the track count (``grid-column: span min(--column-size,
 # --grid-column-count)``) and drops the tiles onto the next row, which is a
 # sane degradation to "schematic above, tiles below".
-_SYSTEM_FLOW_COLUMNS = 27
-_SYSTEM_TILES_COLUMNS = 9
-# The drawing cap for that three-quarter cell.  It used to be 700 px beside two
-# half-width tiles; with the tiles down to a quarter of the row the cell is
-# wider, so the cap follows rather than leaving the SVG small in a wide card.
+#
+# Revision 31 cuts both numbers to two thirds - 18 + 6, still 3:1, still summing
+# to the row.  The card was simply too tall, and with the drawing being an SVG
+# at ``width: 100%; height: auto`` its height is a pure function of its width
+# (700 x 360 in the compact profile), so the *only* way to shorten it without
+# distorting the schematic - or leaving a small picture floating in a wide card,
+# which a ``max_width`` cap does - is to give the card a narrower cell.  Two
+# thirds of the columns is two thirds of the width is two thirds of the height,
+# i.e. the whole card scales as one piece, and the tiles that share the row
+# shrink with it.
+#
+# Measured before the change: 830 x 459 px at a 1440 px window and 750 x 418 at
+# 824 px.  After it: 551 x 316 and 561 x 320 - two thirds of the width and, as
+# predicted, two thirds of the height.  The two windows now agree on the card's
+# size, which they did not before: a span of >= the track count clamps to the
+# full row, so 27 columns was two thirds of the row on a wide window and all of
+# it on a narrow one, and the same dashboard drew the schematic at two sizes.
+_SYSTEM_FLOW_COLUMNS = 18
+_SYSTEM_TILES_COLUMNS = 6
+# The drawing cap for that cell.  It used to be 700 px beside two half-width
+# tiles, then 960 px once the tiles dropped to a quarter of the row.  Both were
+# chosen to *not* bind, and 960 still does not - it is only the "unset" sentinel
+# the migrations write, and the narrower cell is what sizes the drawing now.
 _SYSTEM_FLOW_MAX_WIDTH = 960
 
 # Entity ids are ``sensor.<slug(dev_id)>_<key>``.  Only keys whose display name
@@ -389,6 +433,26 @@ def _entity(dev_id: str, key: str) -> str:
     :func:`_resolve_entity` instead.
     """
     return f"sensor.{_slug(dev_id)}_{key}"
+
+
+def _strip_suffix(entity_id: Any) -> str:
+    """Drop the ``_2`` / ``_3`` … Home Assistant appended to an ``entity_id``.
+
+    Home Assistant numbers a colliding ``entity_id`` instead of failing, so a
+    unit whose serial was registered once before ends up with every entity at
+    ``sensor.<slug>_<key>_2`` while the generator - which derives the id from
+    the serial alone - writes ``sensor.<slug>_<key>``.  The migrations compare
+    stored ids against generated ones, so they have to look past that number:
+    ``_strip_suffix("sensor.x_foo_2")`` is ``"sensor.x_foo"``, and an id
+    without one is returned unchanged (so anything else, including
+    ``..._power_5_min``, is untouched).
+    """
+    if not isinstance(entity_id, str):
+        return entity_id
+    base, sep, tail = entity_id.rpartition("_")
+    if sep and tail.isdigit() and tail != "0":
+        return base
+    return entity_id
 
 
 def _registry_entity(hass: HomeAssistant, dev_id: str, key: str) -> str | None:
@@ -1841,7 +1905,11 @@ def _migrate_plant_view(config: dict[str, Any], dev_id: str) -> bool:
     there is nothing here to do.
 
     Each step is independent and idempotent: a card the user removed, re-added or
-    re-pointed is left as they left it, and a second run returns ``False``.
+    re-pointed is left as they left it, and a second run returns ``False``.  The
+    stored ids are compared through :func:`_strip_suffix` since revision 30, so a
+    unit whose entities Home Assistant numbered (``_2``) is recognised too; the
+    ids written back are the plain ones, and :func:`_migrate_stale_entities` -
+    which runs after this - maps them onto the numbered ids that really exist.
     """
     if not _is_inverter(dev_id):
         return False
@@ -1878,13 +1946,15 @@ def _migrate_plant_view(config: dict[str, Any], dev_id: str) -> bool:
             series = card.get("series")
             if isinstance(series, list):
                 for item in series:
-                    if not isinstance(item, dict) or item.get("entity") != old_pv:
+                    if not isinstance(item, dict):
+                        continue
+                    if _strip_suffix(item.get("entity")) != old_pv:
                         continue
                     item["entity"] = new_pv
                     changed = True
 
             # 3. the 今日发电 gauge.
-            if card.get("entity") == old_today:
+            if _strip_suffix(card.get("entity")) == old_today:
                 card["entity"] = new_today
                 changed = True
 
@@ -1912,6 +1982,8 @@ def _migrate_plant_energy_total(config: dict[str, Any], dev_id: str) -> bool:
 
     Each rewrite is gated on the exact old entity id, so a card the user
     re-pointed themselves is left alone, and a second run returns ``False``.
+    Revision 30 compares through :func:`_strip_suffix`, so a unit whose entities
+    Home Assistant numbered (``_2``) is recognised too.
     """
     if not _is_inverter(dev_id):
         return False
@@ -1932,14 +2004,16 @@ def _migrate_plant_energy_total(config: dict[str, Any], dev_id: str) -> bool:
             if not isinstance(card, dict):
                 continue
             # 1. the 总发电量 gauge.
-            if card.get("entity") == old_total:
+            if _strip_suffix(card.get("entity")) == old_total:
                 card["entity"] = new_total
                 changed = True
             # 2. the 发电量 chart's series.
             series = card.get("series")
             if isinstance(series, list):
                 for item in series:
-                    if not isinstance(item, dict) or item.get("entity") != old_total:
+                    if not isinstance(item, dict):
+                        continue
+                    if _strip_suffix(item.get("entity")) != old_total:
                         continue
                     item["entity"] = new_total
                     changed = True
@@ -1974,6 +2048,22 @@ def _migrate_system_tile_stack(config: dict[str, Any], dev_id: str) -> bool:
     wrapping it too - and not by the card ids alone, so a user who rearranged
     the row keeps their arrangement.  A dashboard that is not shaped that way is
     left untouched and the function returns ``False``.
+
+    Revision 30 makes the pair test tolerant of the two things that kept this
+    from ever firing on a real installation: the ``_2`` Home Assistant appends
+    to a colliding entity id (:func:`_strip_suffix`) and the entity names that
+    revisions 23 and 26 replaced.  Both the current pairs
+    (``plant_pv_energy_today`` / ``plant_pv_energy_total``) and the older ones
+    (``system_pv_energy_today`` / ``pv_energy_total``) count, so the row is
+    restacked whether or not the earlier migrations have already re-pointed it.
+
+    Revision 31 keeps the pair but re-spans it to two thirds of the row.  Note
+    that the span is rewritten in the sibling branch as well - the same
+    ``_span`` calls run for all three recognised shapes - which is what lets a
+    pure width change reach a dashboard that revision 29 had already restacked.
+    That is why this function compares nothing about the stored
+    ``grid_options``: it always rewrites them from the constants, so bumping
+    ``_LAYOUT_VERSION`` is enough to apply a new width.
     """
     if not _is_inverter(dev_id):
         return False
@@ -1982,19 +2072,29 @@ def _migrate_system_tile_stack(config: dict[str, Any], dev_id: str) -> bool:
     if not isinstance(views, list):
         return False
 
-    today = _entity(dev_id, "plant_pv_energy_today")
-    total = _entity(dev_id, "plant_pv_energy_total")
+    today_names = {
+        _entity(dev_id, "plant_pv_energy_today"),
+        _entity(dev_id, "system_pv_energy_today"),
+    }
+    total_names = {
+        _entity(dev_id, "plant_pv_energy_total"),
+        _entity(dev_id, "pv_energy_total"),
+    }
 
     def _is_tile_pair(cards: Any) -> bool:
         """True when this card list is the two energy tiles, 今日 then 总."""
         if not isinstance(cards, list) or len(cards) != 2:
             return False
         entities = [
-            card.get("entity")
+            _strip_suffix(card.get("entity"))
             for card in cards
             if isinstance(card, dict) and card.get("type") == GAUGE_CARD
         ]
-        return len(entities) == 2 and entities[0] == today and entities[1] == total
+        return (
+            len(entities) == 2
+            and entities[0] in today_names
+            and entities[1] in total_names
+        )
 
     def _is_flow(card: Any) -> bool:
         return isinstance(card, dict) and card.get("type") == POWER_FLOW_CARD
@@ -2086,10 +2186,25 @@ def _migrate_system_power_axis(config: dict[str, Any], dev_id: str) -> bool:
     already exists keeps the pinned ``False`` - ``_LAYOUT_KEY`` short-circuits
     :func:`_build_views` - so the key has to be removed here as well.
 
+    Revision 30 goes one step further and pins ``symmetric: true``.  Leaving the
+    key out means "mirror only on the days the series actually goes negative",
+    and 电网 is the one curve on this card that can - so on a day without export
+    the axis collapsed back to ``0..max`` and there was no negative half at all
+    to read an export against.  Pinning the mirror keeps the zero line in the
+    middle where the ownership of the flow is legible: 光伏 above it, 负载 and
+    grid import below.
+
     Recognition is by *content*, never by title or position: the card is the
     history chart whose series are exactly the three system power entities.  The
-    key is dropped only when it is still ``False``, i.e. still what the generator
-    wrote, so a user who deliberately pinned the axis keeps their choice.
+    old value is only replaced while it is still ``False``, i.e. still what the
+    generator wrote, so a user who deliberately pinned the axis keeps their
+    choice, and a second run is a no-op.
+
+    Revision 30 also compares the series through :func:`_strip_suffix`.  The
+    exact comparison used to find nothing on a unit whose entities Home Assistant
+    numbered, so the pinned ``symmetric: False`` stayed on the stored card and
+    that dashboard's 功率 curve could never draw an export below the baseline -
+    the very defect this migration exists to remove.
     """
     if not _is_inverter(dev_id):
         return False
@@ -2111,7 +2226,7 @@ def _migrate_system_power_axis(config: dict[str, Any], dev_id: str) -> bool:
             continue
         if card.get("symmetric") is not False:
             continue
-        entities = set(_series_entities(card))
+        entities = {_strip_suffix(item) for item in _series_entities(card)}
         # A grid power series is what makes the mirrored axis necessary.  The
         # 光伏功率 entity moved between revisions (rev. 23 re-pointed it from
         # ``system_pv_power`` to ``system_plug_power``), so both are accepted and
@@ -2120,7 +2235,7 @@ def _migrate_system_power_axis(config: dict[str, Any], dev_id: str) -> bool:
             continue
         if not entities & power_entities:
             continue
-        card.pop("symmetric", None)
+        card["symmetric"] = True
         changed = True
 
     return changed
@@ -3339,13 +3454,14 @@ def _build_inverter_views(
         "system",
         "System",
         [
-            # One row of the section's 48 columns: the schematic takes 36, the
-            # two energy tiles take the other 12, stacked one above the other.
-            # They used to sit side by side beside the drawing, which made each
-            # of them a full-height card for one number and left the schematic
-            # no wider than 700 px.  Restacked and half as tall, the two tiles
-            # are read top to bottom - today first, lifetime under it - and the
-            # space they gave up went to the drawing.
+            # One row of the section's columns: the schematic takes three
+            # quarters of it, the two energy tiles the remaining quarter,
+            # stacked one above the other.  They used to sit side by side beside
+            # the drawing, which made each of them a full-height card for one
+            # number and left the schematic no wider than 700 px.  Restacked
+            # and half as tall, the two tiles are read top to bottom - today
+            # first, lifetime under it - and the space they gave up went to the
+            # drawing.
             #
             # Both cards are plain siblings of one grid section, not children of
             # a nested ``grid`` card: a ``hui-grid-card`` ignores ``grid_options``
@@ -3394,17 +3510,19 @@ def _build_inverter_views(
                         unit="W",
                         height=330,
                         sync_group=system_group,
-                        # Mirrored, or not, decided per render from the data -
-                        # **not** pinned.  ``symmetric=False`` here forced a
-                        # bottom-up ``0..max`` axis, and 电网 is a signed series:
-                        # the day the house exports, every negative grid reading
-                        # was clamped to the baseline and the curve visibly went
-                        # missing below zero.  Leaving the option out lets the
-                        # chart mirror the axis exactly when one of the three
-                        # series actually crosses zero, which is the same rule
-                        # ``_migrate_axis_cards`` uses for every other card - so
-                        # a solar-only morning still gets the full height and an
-                        # exporting afternoon still shows the export.
+                        # Mirrored **always**, not decided per render from the
+                        # data.  ``symmetric=False`` pinned a bottom-up
+                        # ``0..max`` axis, and 电网 is a signed series: the day
+                        # the house exports, every negative grid reading was
+                        # clamped to the baseline and the curve visibly went
+                        # missing below zero.  Leaving the key out (revision 24)
+                        # only mirrored on the days the data actually dipped,
+                        # which made the axis jump between layouts and left no
+                        # negative half to read an export against on a
+                        # consumption-only day.  Pinning ``True`` keeps the zero
+                        # line across the middle where the direction of the flow
+                        # is legible: 光伏 above it, 负载 and grid import below.
+                        symmetric=True,
                         stack=False,
                     )
                 ]

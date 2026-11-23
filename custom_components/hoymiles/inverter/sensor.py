@@ -1475,11 +1475,19 @@ class HoymilesPlantEnergyTotalSensor(
     plus every unit that announced ``role: slave`` (protocol §32).  A unit that
     is not a master answers with just its own figure.
 
-    Unlike ``ed``, ``et`` needs no stale-counter correction: it is monotonic and
-    survives outages, so a member that was offline for a week still contributes
-    the right number when it comes back.  That also means this total only ever
-    grows - a gap in the middle of the curve is a unit not reporting, never a
-    reset, which is what ``TOTAL_INCREASING`` promises.
+    Unlike ``ed``, ``et`` needs no stale-counter correction: it is a lifetime
+    figure that survives outages, so a member that was offline for a week still
+    contributes the right number when it comes back.  A gap in the middle of the
+    curve is a unit not reporting, never a reset.
+
+    **The published value is exactly what the units report, resets included.**
+    ``et`` is not guaranteed monotonic: clearing a unit back to factory defaults
+    zeroes it, and this sensor then follows that to ~0 and climbs again.  That is
+    deliberate - zeroing the counter is a real command with a real meaning
+    ("forget the total"), so the entity has to agree with the vendor app and with
+    the unit's own screen.  Banking the pre-reset energy to keep the line
+    monotonic was tried and rejected for that reason; the recorder still shows
+    the reset as a one-off drop, which is the honest record of what happened.
     """
 
     _attr_has_entity_name = True

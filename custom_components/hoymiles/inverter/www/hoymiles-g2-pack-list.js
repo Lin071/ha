@@ -80,6 +80,24 @@ function _hmPackListRegister() {
     return String(name).toLowerCase().replace(/[^a-z0-9]+/g, "");
   }
 
+  /**
+   * Drop the `_2` / `_3` … Home Assistant appends to a colliding entity id.
+   *
+   * HA does not fail a registration whose derived `entity_id` is taken; it
+   * numbers it.  A unit whose serial was registered once before therefore has
+   * every id one suffix away from the plain one this card derives
+   * (`sensor.<serial>_pack_1_soc_2`), and the scan below would find nothing.
+   * Only a trailing `_<digits>` is removed, so `pack_1_soc` keeps its `1`.
+   */
+  function stripAuditSuffix(value) {
+    const text = String(value == null ? "" : value);
+    const at = text.lastIndexOf("_");
+    if (at <= 0) return text;
+    const tail = text.slice(at + 1);
+    if (!/^[0-9]+$/.test(tail) || /^0+$/.test(tail)) return text;
+    return text.slice(0, at);
+  }
+
   function num(value) {
     if (typeof value === "number") return Number.isFinite(value) ? value : 0;
     const parsed = Number(value);
@@ -106,6 +124,9 @@ function _hmPackListRegister() {
       this._hass = null;
       this._config = null;
       this._cache = new Map();
+      /* Registry device ids owning this serial, filled lazily by `_deviceIds`
+         and only used by the name-matching fallback of `_resolve`. */
+      this._deviceIdsCache = null;
     }
 
     static getConfigElement() {
@@ -205,21 +226,71 @@ connectedCallback() {
       const prefix = `${domain}.${slug(this._dev())}`;
       const wanted = norm(key);
       let found = null;
+      // 1. normalized exact match on the tail after `<domain>.<slug>_`.
       for (const entityId of Object.keys(hass.states)) {
         if (!entityId.startsWith(prefix)) continue;
         if (norm(entityId.slice(prefix.length + 1)) !== wanted) continue;
         if (!found || entityId.length < found.length) found = entityId;
       }
 
+      // 2. the same, tolerating Home Assistant's `_2` disambiguation number.
+      //    Without this a serial registered once before - every id numbered -
+      //    resolved to nothing and the pack list stayed empty.
+      if (!found) {
+        for (const entityId of Object.keys(hass.states)) {
+          if (!entityId.startsWith(prefix)) continue;
+          if (norm(stripAuditSuffix(entityId.slice(prefix.length + 1))) !== wanted) continue;
+          if (!found || entityId.length < found.length) found = entityId;
+        }
+      }
+
       if (!found && hass.entities) {
-        const wantUid = new Set([`${this._dev()}_${key}`, `hoymiles_${this._dev()}_${key}`]);
+        // The unique_id check this replaced was dead code - `hass.entities`
+        // does not carry it - so the registry `name` / `translation_key` is
+        // matched instead, which is what the sensor descriptions set.  Scoped
+        // to this unit's devices where the serial can be traced: a name match
+        // across the whole registry would happily return another unit's sensor.
+        const deviceIds = this._deviceIds();
         for (const [entityId, entry] of Object.entries(hass.entities)) {
-          if (entry && wantUid.has(entry.unique_id)) { found = entityId; break; }
+          if (!entry || !entityId.startsWith(`${domain}.`)) continue;
+          if (deviceIds.size && !deviceIds.has(entry.device_id)) continue;
+          if (norm(stripAuditSuffix(entry.name)) !== wanted
+            && norm(stripAuditSuffix(entry.translation_key)) !== wanted) continue;
+          if (!hass.states[entityId]) continue;
+          if (!found || entityId.length < found.length) found = entityId;
         }
       }
 
       if (found) this._cache.set(cacheKey, found);
       return found;
+    }
+
+    /**
+     * The registry device ids that belong to this card's serial, resolved once.
+     *
+     * `hass.devices` holds an array of `[domain, identifier]` pairs per device
+     * and the integration registers the serial verbatim, so a surviving serial
+     * in an identifier is what ties a device record to this card.  An empty set
+     * means "could not tell" - the caller then skips the scoped fallback.
+     */
+    _deviceIds() {
+      if (this._deviceIdsCache) return this._deviceIdsCache;
+      const out = new Set();
+      const devices = (this._hass && this._hass.devices) || {};
+      const serial = String(this._dev() || "");
+      if (serial) {
+        for (const [deviceId, device] of Object.entries(devices)) {
+          if (!device) continue;
+          for (const pair of device.identifiers || []) {
+            if (Array.isArray(pair) && String(pair[1]) === serial) {
+              out.add(deviceId);
+              break;
+            }
+          }
+        }
+      }
+      this._deviceIdsCache = out;
+      return out;
     }
 
     _state(key, domain = "sensor") {
