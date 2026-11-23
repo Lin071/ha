@@ -565,6 +565,12 @@ function _hmControlRegister() {
            `_powerCtrl` because the slider is an input in flight, not a
            statement of what the device is doing. */
         _timerPower: { type: Number },
+        /* "on" / "off" while a command is awaiting its confirmation from the
+           retained state topic, `""` once the integration agrees.  Without it
+           the first snapshot read after `callService` - which still carries the
+           pre-command value - undid the optimistic state and made the row look
+           unresponsive. */
+        _timerPending: { type: String },
       };
     }
 
@@ -611,6 +617,8 @@ function _hmControlRegister() {
       this._timerError = "";
       this._timerBusy = false;
       this._timerPower = NaN;
+      this._timerPending = "";
+      this._timerPendingUntil = 0;
     }
 
     static getConfigElement() {
@@ -629,8 +637,22 @@ function _hmControlRegister() {
            instead of being boxed in a grey block.  The two cards therefore
            read as one system, whichever device the page belongs to. */
         :host { display: block; }
-        .grid { display: grid; gap: 14px; align-items: start;
-                grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        /* Card grid: one row when it fits, wrapped when it does not.
+           The three control families are wildly different heights - 电源与模式
+           is two rows, 功率设置 four, 计划与维护 five - and the old two-column
+           grid with "align-items: start" put the first two side by side and
+           pushed the third below whichever of them was taller.  That left a
+           tall void under the short card, which is what read as "these three
+           panels are far apart" on a desktop.
+
+           16rem is the narrowest a card can be before its segmented controls
+           crowd, so auto-fit lays all three out in one row on a wide screen
+           and falls back to two, then one, on its own - no breakpoint per size,
+           and it keeps working when show_* hides a family (a unit with two
+           families is simply two cards in one row).  "align-items: stretch"
+           then gives the row a common height, so no card floats above a gap. */
+        .grid { display: grid; gap: 14px; align-items: stretch;
+                grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); }
         @media (max-width: 760px) {
           .grid { grid-template-columns: minmax(0, 1fr); }
         }
@@ -882,6 +904,8 @@ function _hmControlRegister() {
         this._timerLastAt = 0;
         this._timerError = "";
         this._timerPower = NaN;
+        this._timerPendingUntil = 0;
+        this._timerPending = "";
         this._timerPeriod = String(TIMER_DEFAULT_S);
         /* The saved set is per device, so switching device must also drop the
            restored switch / EMS command - they belonged to the previous unit. */
@@ -1783,6 +1807,20 @@ function _hmControlRegister() {
       return Math.min(Math.max(n, TIMER_MIN_S), TIMER_MAX_S);
     }
 
+    /**
+     * How long an optimistic timer state may stand before it is abandoned.
+     *
+     * The integration publishes its retained state one beat after the command,
+     * so `period` is the natural wait - doubled, plus a margin for the publish
+     * round trip and a device that answers slowly.  Never shorter than the
+     * default period, so a user who picked 5 s is not left looking at an
+     * unconfirmed state a second later.
+     */
+    _pendingWindowMs() {
+      const period = Math.max(this._timerPeriodValue(), TIMER_DEFAULT_S);
+      return period * 2000 + 5000;
+    }
+
     _setTimer(on) {
       if (this._timerBusy) return;
       const want = on === true;
@@ -1816,6 +1854,20 @@ function _hmControlRegister() {
      */
     async _keepaliveStart(power) {
       this._timerBusy = true;
+      /* Show the beat as running straight away.
+         `callService` resolves as soon as the service handler returns, but the
+         entity this row mirrors is fed by the *retained* MQTT state topic, which
+         the integration publishes only after its first beat - one whole
+         `period` later.  Reading the entity back right here therefore returned
+         the pre-command snapshot (`enabled: false`) and `_applyKeepalive` undid
+         the optimistic state, so 定时下发 visibly flipped back to 「关闭」 and
+         read as a dead button.  The pending flag lets the mirror keep this
+         assumption until the integration itself reports either way.
+         See `_applyKeepalive` for how the flag is cleared. */
+      this._timerPending = "on";
+      this._timerPendingUntil = Date.now() + this._pendingWindowMs();
+      this._timerOn = true;
+      this._timerPower = power;
       this.requestUpdate();
       try {
         await this._hass.callService("hoymiles", "start_power_ctrl_keepalive", {
@@ -1823,10 +1875,15 @@ function _hmControlRegister() {
           power,
           period: this._timerPeriodValue(),
         });
-        // The state topic carries the authoritative count, so read it back
-        // instead of assuming the call did what was asked.
+        // The state topic carries the authoritative count. `_syncKeepalive`
+        // honours `_timerPending`, so an unchanged snapshot cannot undo the
+        // optimistic state above at the wrong moment.
         this._syncKeepalive();
       } catch (err) {
+        /* The call failed, so nothing is running: drop the assumption before
+           showing the reason, otherwise the row would keep claiming 「开启」. */
+        this._timerPending = "";
+        this._timerOn = false;
         this._showToast(this._t(
           `Could not start the timer: ${err.message || err}`,
           `无法开启定时下发：${err.message || err}`,
@@ -1839,6 +1896,9 @@ function _hmControlRegister() {
 
     async _keepaliveStop() {
       this._timerBusy = true;
+      this._timerPending = "off";
+      this._timerPendingUntil = Date.now() + this._pendingWindowMs();
+      this._timerOn = false;
       this.requestUpdate();
       try {
         await this._hass.callService("hoymiles", "stop_power_ctrl_keepalive", {
@@ -1846,6 +1906,7 @@ function _hmControlRegister() {
         });
         this._syncKeepalive();
       } catch (err) {
+        this._timerPending = "";
         this._showToast(this._t(
           `Could not stop the timer: ${err.message || err}`,
           `无法关闭定时下发：${err.message || err}`,
@@ -1879,7 +1940,34 @@ function _hmControlRegister() {
      */
     _applyKeepalive(payload) {
       if (!payload || typeof payload !== "object") return;
-      const on = payload.enabled === true;
+      const reported = payload.enabled === true;
+      /* A just-issued command outranks the snapshot until the snapshot agrees
+         with it.  The entity is fed by a retained MQTT topic that the
+         integration refreshes on its own beat - for `on` that is up to
+         `period` seconds after the service returns - so the first snapshot
+         read back is the pre-command one.  Trusting it made 定时下发 flip
+         straight back to 「关闭」; see `_keepaliveStart`.
+
+         The pending assumption is released as soon as the snapshot matches it,
+         and also once nothing has been heard either way for long enough that
+         the beat would have had to publish (the guard in `_setTimer` and the
+         service's own error surfacing both still apply afterwards). */
+      if (this._timerPending === "on" && reported) {
+        this._timerPending = "";
+      } else if (this._timerPending === "off" && !reported) {
+        this._timerPending = "";
+      } else if (this._timerPending !== "" && Date.now() > this._timerPendingUntil) {
+        /* Nothing arrived in time.  Give up on the assumption rather than let
+           the row insist on a state the integration never confirmed - if the
+           beat had really started, its retained snapshot would have been here
+           within `period` plus one publish interval. */
+        this._timerPending = "";
+      }
+      const on = this._timerPending === "on"
+        ? true
+        : this._timerPending === "off"
+          ? false
+          : reported;
       /* The sensor always reports the period of the *last* beat, even when no
          beat is running - and an idle sensor answers with the built-in default,
          which would silently undo a period the user had chosen earlier. The
@@ -1894,9 +1982,12 @@ function _hmControlRegister() {
          has already recovered by definition, and a stale message would sit
          there contradicting the "re-sending every N s" line right above it. */
       const error = !on && payload.error ? String(payload.error) : "";
-      if (on === this._timerOn && period === this._timerPeriod
-        && count === this._timerCount && lastAt === this._timerLastAt
-        && error === this._timerError && power === this._timerPower) {
+      /* A pending command still describes the *previous* beat, so a snapshot
+         that merely matches what is already on screen must not release it. */
+      if (this._timerPending === "" && on === this._timerOn
+        && period === this._timerPeriod && count === this._timerCount
+        && lastAt === this._timerLastAt && error === this._timerError
+        && power === this._timerPower) {
         return;
       }
       const previousPower = this._timerPower;
@@ -1906,16 +1997,19 @@ function _hmControlRegister() {
       this._timerCount = count;
       this._timerLastAt = lastAt;
       this._timerError = error;
-      this._timerPower = power;
+      /* While a command is pending the snapshot still describes the previous
+         beat, so its wattage must not be mirrored back into the slider - that
+         would snap a just-sent 500 W to the 0 W the old beat held. */
+      this._timerPower = this._timerPending === "" ? power : previousPower;
       /* A running beat holds a specific wattage in the integration, which is
          server-side truth and therefore outranks whatever this browser
-         remembered. Mirror it into the slider so a page opened while 200 W is
+         remembered.  Mirror it into the slider so a page opened while 200 W is
          being held shows 200 W - the value the user "sent" in the first place.
 
          Only on a *transition* of the held power, and only when the slider
          still shows the old held value: applying it on every push would fight
          the user, snapping a drag back before they could press 下发. */
-      if (on && powerMoved) {
+      if (on && powerMoved && this._timerPending === "") {
         const untouched = this._powerCtrl === "" || Number.isNaN(previousPower)
           || num(this._powerCtrl) === power || num(this._powerCtrl) === previousPower;
         if (untouched) this._powerCtrl = String(power);

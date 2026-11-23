@@ -544,6 +544,21 @@ def _registry_entity_map(hass: HomeAssistant, dev_id: str) -> dict[str, str]:
     return found
 
 
+def _state_exists(hass: HomeAssistant, entity_id: str) -> bool:
+    """True when ``entity_id`` currently holds a state.
+
+    Used to tell a *dead* reference - the id an old dashboard was generated with
+    and which this device no longer answers to - from a live one that merely
+    happens to end in the same word.  A registry lookup alone cannot make that
+    distinction, because a renamed sensor is still registered under its new id
+    while the card keeps the old spelling.
+    """
+    try:
+        return hass.states.get(entity_id) is not None
+    except Exception:  # noqa: BLE001 - a card is never worth breaking setup for
+        return True  # assume live, so an unreadable state never triggers a rewrite
+
+
 def _heal_entity_ids(
     config: dict[str, Any], hass: HomeAssistant, dev_id: str
 ) -> bool:
@@ -559,33 +574,61 @@ def _heal_entity_ids(
 
     This pass runs on every setup instead, and is safe to run repeatedly:
 
-    * only ``sensor.`` ids carrying *this* device's own slug are touched, so
+    * only ``sensor.`` ids encoding one of *this* device's keys are touched, so
       another unit's cards in the same dashboard are left alone;
     * an id is only rewritten when the registry knows the key it encodes, so a
       card the user pointed somewhere else - or a key this build does not
       create - is untouched;
     * a numeric suffix HA appended (``..._plant_pv_energy_today_2``) is looked
       past, so the *base* key decides the match and the registry decides the
-      spelling.
+      spelling;
+    * an id whose device prefix is not this device's slug is still matched when
+      its **tail** is one of this device's keys.  Renaming the unit in Home
+      Assistant rewrites every entity id, and the dashboard keeps the old
+      spelling - so a slug-only prefix test repaired nothing on exactly the
+      devices that needed it most.
     """
     mapping = _registry_entity_map(hass, dev_id)
     if not mapping:
         return False
 
     prefix = f"sensor.{_slug(dev_id)}_"
+    # Longest first, so `plant_pv_energy_total` is never shadowed by a key that
+    # happens to be its tail.
+    by_tail = sorted(mapping, key=len, reverse=True)
+
+    def keys_of(candidate: str) -> list[str]:
+        """The mapping keys this remainder could be, best guess first."""
+        out = [candidate]
+        base, sep, tail = candidate.rpartition("_")
+        if sep and tail.isdigit() and tail != "0":
+            out.insert(0, base)
+        return out
 
     def fix(value: Any) -> Any:
-        if not isinstance(value, str) or not value.startswith(prefix):
+        if not isinstance(value, str) or not value.startswith("sensor."):
             return value
-        key = value[len(prefix) :]
-        candidates = [key]
-        base, sep, tail = key.rpartition("_")
-        if sep and tail.isdigit() and tail != "0":
-            candidates.insert(0, base)
-        for candidate in candidates:
-            real = mapping.get(candidate)
-            if real:
-                return real
+        if value.startswith(prefix):
+            for candidate in keys_of(value[len(prefix) :]):
+                real = mapping.get(candidate)
+                if real:
+                    return real
+            return value
+        # Renamed device: the id no longer starts with this device's slug, so
+        # match on the key it ends with instead.  Requires an `_` boundary so
+        # `soc` cannot match `system_soc`.
+        #
+        # Only a *dead* id is repointed.  Without that test the tail match would
+        # also rewrite ids that resolve fine and merely belong to someone else -
+        # a card the user deliberately pointed at another integration's sensor
+        # would be silently dragged back.  A broken id is the only thing this
+        # pass claims to repair.
+        if _state_exists(hass, value):
+            return value
+        for key in by_tail:
+            for candidate in keys_of(value[len("sensor.") :]):
+                if candidate == key or candidate.endswith(f"_{key}"):
+                    return mapping[key]
         return value
 
     changed = False
@@ -1104,7 +1147,7 @@ async def async_ensure_dashboard(
         await store.async_save(
             {
                 "views": _build_views(
-                    dev_id, pv_count, model, _alarm_entity_id(hass, dev_id)
+                    dev_id, pv_count, model, _alarm_entity_id(hass, dev_id), hass=hass
                 ),
                 _LAYOUT_KEY: _LAYOUT_VERSION,
             }
@@ -1412,7 +1455,11 @@ async def _async_upgrade_layout(
             await store.async_save(
                 {
                     "views": _build_views(
-                        dev_id, pv_count, model, _alarm_entity_id(hass, dev_id)
+                        dev_id,
+                        pv_count,
+                        model,
+                        _alarm_entity_id(hass, dev_id),
+                        hass=hass,
                     ),
                     _LAYOUT_KEY: _LAYOUT_VERSION,
                 }
@@ -2997,6 +3044,7 @@ def _build_views(
     pv_count: int | None = None,
     model: str = "",
     alarm_entity: str | None = None,
+    hass: HomeAssistant | None = None,
 ) -> list[dict[str, Any]]:
     """Return the full view set for the device.
 
@@ -3017,9 +3065,16 @@ def _build_views(
     ``alarm_entity`` is the registry-resolved ``entity_id`` of the alarm sensor
     (see :func:`_alarm_entity_id`); ``None`` falls back to the conventional
     serial-based spelling, which is all a brand new device can offer.
+
+    ``hass`` is only needed by the inverter layout, where the energy tiles are
+    fed by :func:`_gauge` - and that card resolves nothing on its own, so a
+    guessed id renders an empty tile.  The storage layout builds its gauges
+    without it, exactly as before.
     """
     if _is_inverter(dev_id):
-        return _build_inverter_views(dev_id, pv_count, model, alarm_entity)
+        return _build_inverter_views(
+            dev_id, pv_count, model, alarm_entity, hass=hass
+        )
     return _build_storage_views(dev_id, model)
 
 
@@ -3529,6 +3584,7 @@ def _build_inverter_views(
     pv_count: int | None = None,
     model: str = "",
     alarm_entity: str | None = None,
+    hass: HomeAssistant | None = None,
 ) -> list[dict[str, Any]]:
     """System / device / control views for a grid-tied micro inverter.
 
@@ -3539,6 +3595,12 @@ def _build_inverter_views(
     Every per-port reference is generated from ``pv_count`` so a single-input
     unit does not get gauges and history series pointing at sensors that this
     integration never created for it.
+
+    ``hass`` is forwarded to :func:`_gauge` so every tile points at the id the
+    entity registry actually holds.  It matters because the gauge card resolves
+    nothing on its own: a stored dashboard whose ids were written from
+    :func:`_entity`'s guess rendered 「—」 beside a schematic that had no trouble
+    finding the same device's entities.
     """
     ports = pv_count if pv_count and pv_count >= 1 else 2
     slug = _slug(dev_id)
@@ -3658,8 +3720,11 @@ def _build_inverter_views(
                                     icon="panel",
                                     show_arc=False,
                                     compact=True,
+                                    hass=hass,
                                 ),
-                                _energy_total_gauge(dev_id, compact=True),
+                                _energy_total_gauge(
+                                    dev_id, compact=True, hass=hass
+                                ),
                             ]
                         ),
                         _SYSTEM_TILES_COLUMNS,
@@ -4057,6 +4122,7 @@ def _gauge(
     icon: str | None = None,
     show_arc: bool | None = None,
     compact: bool = False,
+    hass: HomeAssistant | None = None,
 ) -> dict[str, Any]:
     """Build a ``hoymiles-g2-gauge`` card for one energy/power/SOC entity.
 
@@ -4065,10 +4131,22 @@ def _gauge(
     for the System tab, where 「今日发电」 and 「总发电量」 are stacked in a narrow
     column beside the schematic: two full tiles there would be taller than the
     drawing next to them and leave a gap under it.
+
+    ``hass`` is optional and only used to resolve the entity id through the
+    registry.  This card is **much** less forgiving than ``power-flow``: it
+    reads ``hass.states[config.entity]`` verbatim and has no scan or renamed-id
+    fallback at all, so an id that merely differs from the convention renders
+    an empty tile next to a schematic that resolved fine.  That is exactly the
+    「今日发电 / 总发电量 不显示数值」 report.  Passing ``hass`` makes the
+    generated id authoritative; leave it out and the guess in :func:`_entity`
+    is used, as before.
     """
     card: dict[str, Any] = {
         "type": "custom:hoymiles-g2-gauge",
-        "entity": _entity(dev_id, key),
+        "entity": (
+            _resolve_entity(hass, dev_id, key) if hass is not None
+            else _entity(dev_id, key)
+        ),
         "name": name,
         "unit": unit,
     }
@@ -4092,7 +4170,12 @@ def _gauge(
     return card
 
 
-def _energy_total_gauge(dev_id: str, *, compact: bool = False) -> dict[str, Any]:
+def _energy_total_gauge(
+    dev_id: str,
+    *,
+    compact: bool = False,
+    hass: HomeAssistant | None = None,
+) -> dict[str, Any]:
     """The lifetime PV energy card that sits to the right of "today".
 
     Same card and the same visual format as the "today" gauge next to it - a
@@ -4127,6 +4210,7 @@ def _energy_total_gauge(dev_id: str, *, compact: bool = False) -> dict[str, Any]
         "plant_pv_energy_total",
         _t("PV Total", "总发电量"),
         "kWh",
+        hass=hass,
         scale=0.001,
         decimals=1,
         icon="all",

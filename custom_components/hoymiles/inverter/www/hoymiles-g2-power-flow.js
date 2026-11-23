@@ -2265,7 +2265,26 @@ function _hmPowerFlowRegister() {
          A body with several inputs is unaffected: `pv_total_power` is only
          consulted for the single-port layout, where `pv1_power` and `pv2_power`
          have no separate nodes to be drawn on. */
-      const pvTotal = this._read("pv_total_power", null);
+      /* `pv_total_power` is the integration's own sum over the ports, so it is
+         used whenever it resolves.  When it does not - the entity was removed
+         by the capability reconciliation, or this is an older dashboard whose
+         card config predates it - the ports are added up here instead, which is
+         the same arithmetic on the same readings.  Without the fallback the
+         split layout printed `pvPorts[0]` alone, i.e. **one** of the two strings
+         the body reports, which is the 「PV端口数值不对」 report: the number was
+         there, it just was not the sum.
+         `sumPorts` returns `null` when no port reported at all, so an absent
+         reading still prints `—` rather than a confident `0`. */
+      const sumPorts = (ports) => {
+        let total = null;
+        for (const port of ports) {
+          if (port === null || port === undefined) continue;
+          total = (total ?? 0) + port;
+        }
+        return total;
+      };
+      const pvTotal = this._read("pv_total_power", null)
+        ?? sumPorts(pvPorts);
       /* The household side of the meter, and the smart plug beside it.  Both are
          drawn on the system schematic no matter what §32 says about this unit's
          installation (see `_svgSystem`): the schematic shows the house the unit
