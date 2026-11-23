@@ -1,4 +1,9 @@
-# Hoymiles Official · Home Assistant 集成
+# Hoymiles Official · Home Assistant 集成 — **BETA（内部测试）**
+
+> [!WARNING]
+> **内部测试版 / 测试通道。** 本仓库仅供研发与测试组使用，**未**上架 HACS，
+> **不**面向终端用户。终端用户请通过 HACS 搜索 **Hoymiles Official** 安装已发布的正式版。
+> 此处的版本可能不稳定、与你的固件不兼容，且可能随时变更，恕不另行通知。
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz)
 [![Home Assistant](https://img.shields.io/badge/Home%20Assistant-2023.8%2B-41BDF5.svg)](https://www.home-assistant.io)
@@ -66,19 +71,20 @@
 
 ## 安装
 
-### 方式 A：HACS（推荐）
+> [!IMPORTANT]
+> 这是 **beta** 仓库，**不会**出现在 HACS 搜索里。
+> 必须用下面的地址作为**自定义存储库**手动添加。
+
+### 方式 A：HACS 自定义存储库（测试组使用）
 
 1. 打开 **HACS → 集成**
-2. 搜索 **Hoymiles Official** → **下载**
-3. **完整重启 Home Assistant Core**（不是「重载配置项」）
+2. 点右上角 **⋮ → 自定义存储库**
+3. 仓库地址填 `https://github.com/hoymiles-ha/ha_beta`，类别选 **Integration**
+4. 点 **添加**，然后搜索 **Hoymiles Official (Beta)** → **下载**
+5. **完整重启 Home Assistant Core**（不是「重载配置项」）
 
 > 为什么必须完整重启：新下载的 Python 模块需要重新 import，
 > 只 reload config entry 不会加载新代码。
-
-> 如果暂时搜不到（HACS 会缓存目录，最长 48 小时才刷新），先按自定义存储库
-> 添加一次：**HACS → 集成 → 右上角 ⋮ → 自定义存储库**，
-> 仓库地址填 `https://github.com/hoymiles-ha/ha`，类别选 **Integration**，
-> 然后搜索 **Hoymiles Official** → **下载**。
 
 ### 方式 B：手动安装
 
