@@ -164,6 +164,16 @@ function _hmControlRegister() {
    * and only falls back to this index, so treat this as a last resort. */
   const NUMBER_ORDER = ["power_ctrl", "output_power", "phase_output_power"];
 
+  /* The grid-tied micro inverter family, by SKU.  Mirrors ``INVERTER_PIDS`` in
+   * ``const.py`` and ``IV_PV_COUNT_BY_CODE`` in ``hoymiles-g2-power-flow.js``;
+   * keep all three in sync (see ``docs/hoymiles_g2-hiflow.md``).
+   *
+   * It is used to *remove* controls that belong to the other family, never to
+   * add one: presence of an entity is still what proves a feature exists, and
+   * this table only vetoes the rows a micro inverter provably cannot have (the
+   * multi phase output stage).  A model that is not listed here is treated as
+   * "unknown" and keeps whatever its own payloads proved. */
+  const INVERTER_PIDS = ["1650", "4160", "4161", "4162"];
   /* Domains where the firmware publishes exactly one entity, so "the only one on
    * this device" is a sound answer. The number domain is excluded on purpose:
    * it has several entities and a wrong pick would show - and send - the value
@@ -946,6 +956,35 @@ function _hmControlRegister() {
 
     _dev() {
       return this._config.dev_id;
+    }
+
+    /** The SKU of this unit: the four digits at the start of its serial body.
+     *
+     * ``RMI-4161A0209FF6`` -> ``"4161"``.  The prefix before the last ``-`` is
+     * a user setting (see the PID notes in ``const.py``), so only the final
+     * segment is examined - the same rule ``serial_pid`` uses.
+     * Returns ``""`` when the serial does not carry a numeric SKU.
+     */
+    _pid() {
+      const parts = String(this._dev() || "").split("-");
+      const body = parts[parts.length - 1].trim();
+      const match = body.match(/^(\d{4})/);
+      return match ? match[1] : "";
+    }
+
+    /** True for a grid-tied micro inverter (`1650` / `4160` / `4161` / `4162`).
+     *
+     * Mirrors ``INVERTER_PIDS`` in ``const.py`` - the same closed set the
+     * backend dispatches on, and the same one ``IV_PV_COUNT_BY_CODE`` mirrors in
+     * ``hoymiles-g2-power-flow.js``.  Keep all three in sync.
+     *
+     * A serial whose SKU is not listed returns ``false``, i.e. "not known to be
+     * a micro inverter", which leaves every entity-driven check in charge.  The
+     * conservative direction matters: this only ever *removes* a row, so an
+     * unknown model keeps whatever the discovery payload proved it has.
+     */
+    _isInverter() {
+      return INVERTER_PIDS.includes(this._pid());
     }
 
     /**
@@ -1755,8 +1794,10 @@ function _hmControlRegister() {
       if (this._timerOn === true) return;
       /* `power_ctrl` is only honoured in mqtt_ctrl mode, so arming the timer in
          any other mode would publish into the void. The row disables its
-         buttons there; this guard covers the programmatic paths too. */
-      if (this._emsMode() !== "mqtt_ctrl") return;
+         buttons there; this guard covers the programmatic paths too. It uses
+         the same rule as the row - a device with no EMS mode has nothing to
+         switch away from, so it is not blocked. */
+      if (!this._timerReady()) return;
       /* Same blank-is-not-zero rule as the sliders: arming the beat on an empty
          field used to start it holding 0 W, which stops the unit producing. */
       const value = this._draftNumber(this._powerCtrl);
@@ -2382,9 +2423,31 @@ function _hmControlRegister() {
       // role keeps every row, so a unit whose `event/state` has not arrived yet
       // is never stripped down to the power switch.
       const slave = this._role() === "slave";
-      const showPhase = !slave && (this._config.show_phase !== undefined
-        ? this._config.show_phase !== false
-        : this._hasEntity("phase_a_output_power", "number"));
+      /* 多相输出功率 is a **storage** feature.  No grid-tied micro inverter has a
+         multi phase output stage - a `1650` / `4160` / `4161` / `4162` never
+         publishes `number/<dev>/phase_output_power` and the firmware never
+         reports a per-phase limit back - so the row must not appear on that
+         family at all.
+
+         Presence of the entity was the only test here, which is not enough:
+         `_resolve()` has several fuzzy fallbacks (entity-id tail, published
+         name, and for `number` a duplicate-suffix index into
+         `NUMBER_ORDER`), so a `number.<dev>_3` left behind by an older build -
+         or simply the third number entity a model happens to expose - satisfies
+         `_hasEntity("phase_a_output_power")` without any per-phase hardware
+         behind it.  The PID is authoritative and needs no entity at all, so it
+         is checked first and the entity test only decides the rest.
+
+         Recognition is by the SKU in the serial, exactly as `const.py` does it
+         (`serial_pid` / `INVERTER_PIDS`): the first four digits of the serial
+         body, after any user-chosen client prefix.  A serial whose PID is not a
+         known inverter is left to the entity test, so a storage unit - and any
+         future model - keeps working without a code change. */
+      const showPhase = !slave
+        && !this._isInverter()
+        && (this._config.show_phase !== undefined
+          ? this._config.show_phase !== false
+          : this._hasEntity("phase_a_output_power", "number"));
       const showPowerCtrl = !slave && (this._config.show_power_ctrl !== undefined
         ? this._config.show_power_ctrl !== false
         : this._hasEntity("power_ctrl", "number"));
@@ -2449,7 +2512,13 @@ function _hmControlRegister() {
             showFactoryReset ? this._factoryResetItem() : "",
             showLog ? html`${this._logItem()}${this._logOpen ? this._logPanel() : ""}` : "",
           ],
-          "wide",
+          /* Every group takes the same, unstyled class.  This one used to be
+             passed `"wide"`, which made it span both grid tracks while the two
+             cards above it were half width - so the third card was structurally
+             a different thing from its siblings, not merely taller.  How tall a
+             card gets is decided by its row count, and the grid already
+             stretches every sibling in a row to the same height. */
+          "",
         ),
       ].filter((card) => card !== "");
 
@@ -2797,7 +2866,14 @@ function _hmControlRegister() {
     }
 
     _powerCtrlItem() {
-      const ready = this._emsMode() === "mqtt_ctrl";
+      /* Same rule as the re-send timer: only a *known* mode other than
+         `mqtt_ctrl` blocks the row.  A micro inverter has no `ems_mode` at all,
+         and `mqtt_ctrl` is not a mode it can be switched to, so requiring it
+         here left this slider permanently disabled on that whole family.  The
+         language of "switch EMS to mqtt_ctrl first" was doubly wrong there: the
+         row it points at is not even rendered (`showEms` is false when the
+         select is absent). */
+      const ready = this._timerReady();
       const { lo, hi } = this._powerRange();
       // The firmware declares the granularity itself and it differs per model
       // (0.1 W on a storage unit, 1 W on a micro inverter), so the slider must
@@ -2846,8 +2922,41 @@ function _hmControlRegister() {
      * is why it reads its state back from the entity instead of trusting a
      * local flag.
      */
+    /**
+     * Whether the re-send timer may be armed at all.
+     *
+     * `power_ctrl` is only honoured in the `mqtt_ctrl` EMS mode, so the row is
+     * disabled in every other *known* mode - that much has not changed.
+     *
+     * What changed is the "not known" case. This used to be
+     * `this._emsMode() === "mqtt_ctrl"`, which is False when the mode is
+     * unknown, so the row was permanently disabled on every unit that has no
+     * `ems_mode` select at all - the whole micro inverter family. Measured on a
+     * `1650` HiFlow: its retained `attributes` inventory carries no `ems_mode`
+     * and the firmware never publishes `event/state`, so no select entity is
+     * ever created, `_emsMode()` returns `""` forever, and 「定时下发」 could
+     * not be switched on no matter what the device was doing.
+     *
+     * `keepalive.py` already settles what "unknown" means: `_async_tick()`
+     * stops the beat on `mode is not None and mode != mqtt_ctrl`, i.e. it
+     * deliberately lets an unknown mode through rather than second-guessing it
+     * (see `HoymilesCoordinator.ems_mode`, which documents the same rule). The
+     * gate here has to agree with the code that actually sends the value,
+     * otherwise the UI forbids a state the backend happily maintains.
+     *
+     * So: a *known* mode that is not `mqtt_ctrl` disables the row; an unknown
+     * or absent one does not. A unit with no EMS concept at all gets a working
+     * timer, which is exactly right - it has no mode to switch away from.
+     */
+    _timerReady() {
+      const mode = this._emsMode();
+      // No `ems_mode` entity: the device has no EMS mode to gate on.
+      if (!this._hasEntity("ems_mode", "select")) return true;
+      return mode === "mqtt_ctrl";
+    }
+
     _timerItem() {
-      const ready = this._emsMode() === "mqtt_ctrl";
+      const ready = this._timerReady();
       const on = this._timerOn === true && ready;
       const period = this._timerPeriodValue();
       /* While the beat runs the row says nothing: the segment already shows On,

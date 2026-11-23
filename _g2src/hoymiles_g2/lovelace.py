@@ -503,6 +503,162 @@ def _resolve_entity(hass: HomeAssistant, dev_id: str, key: str) -> str:
     return _registry_entity(hass, dev_id, key) or _entity(dev_id, key)
 
 
+def _registry_entity_map(hass: HomeAssistant, dev_id: str) -> dict[str, str]:
+    """Every ``description key -> entity_id`` this device has registered.
+
+    Built from ``unique_id``, which is ``<domain>_<serial>_<key>`` and therefore
+    survives a rename and a ``_2`` suffix alike.  It is the authoritative map
+    the guess in :func:`_entity` is checked against.
+
+    ``{}`` when the registry cannot be read, which makes every caller a no-op
+    rather than a mis-rewrite.
+    """
+    try:
+        from homeassistant.helpers import entity_registry as er  # noqa: PLC0415
+
+        registry = er.async_get(hass)
+    except Exception:  # noqa: BLE001 - a card is never worth breaking setup for
+        return {}
+
+    if registry is None:
+        return {}
+
+    prefix = f"{DOMAIN}_{dev_id}_"
+    found: dict[str, str] = {}
+    try:
+        entries = list(registry.entities.values())
+    except Exception:  # noqa: BLE001
+        return {}
+
+    for entry in entries:
+        unique_id = getattr(entry, "unique_id", "") or ""
+        entity_id = getattr(entry, "entity_id", "") or ""
+        if not entity_id or not unique_id.startswith(prefix):
+            continue
+        # Only ``sensor.`` ids are healed: the generator writes nothing else
+        # through :func:`_entity`, and rewriting a number/select id here would
+        # silently retarget a control card.
+        if not entity_id.startswith("sensor."):
+            continue
+        found.setdefault(unique_id[len(prefix) :], entity_id)
+    return found
+
+
+def _heal_entity_ids(
+    config: dict[str, Any], hass: HomeAssistant, dev_id: str
+) -> bool:
+    """Re-point stored cards at the ids the registry really holds.
+
+    :func:`_migrate_stale_entities` does the same repair, but only once per
+    dashboard because it is gated on ``_LAYOUT_VERSION``.  That is enough for a
+    dashboard written by the release that introduced the repair, and not enough
+    for one written *after* the migration marker moved on: a unit whose entities
+    are re-registered under numbered ids later keeps pointing its 今日发电 /
+    总发电量 gauges at ids that no longer exist, and both tiles read 「—」
+    forever with no migration left to run.
+
+    This pass runs on every setup instead, and is safe to run repeatedly:
+
+    * only ``sensor.`` ids carrying *this* device's own slug are touched, so
+      another unit's cards in the same dashboard are left alone;
+    * an id is only rewritten when the registry knows the key it encodes, so a
+      card the user pointed somewhere else - or a key this build does not
+      create - is untouched;
+    * a numeric suffix HA appended (``..._plant_pv_energy_today_2``) is looked
+      past, so the *base* key decides the match and the registry decides the
+      spelling.
+    """
+    mapping = _registry_entity_map(hass, dev_id)
+    if not mapping:
+        return False
+
+    prefix = f"sensor.{_slug(dev_id)}_"
+
+    def fix(value: Any) -> Any:
+        if not isinstance(value, str) or not value.startswith(prefix):
+            return value
+        key = value[len(prefix) :]
+        candidates = [key]
+        base, sep, tail = key.rpartition("_")
+        if sep and tail.isdigit() and tail != "0":
+            candidates.insert(0, base)
+        for candidate in candidates:
+            real = mapping.get(candidate)
+            if real:
+                return real
+        return value
+
+    changed = False
+    for card in _walk_cards(config.get("views") or []):
+        if not isinstance(card, dict):
+            continue
+        for key in ("entity", "entity_id"):
+            current = card.get(key)
+            fixed = fix(current)
+            if fixed != current:
+                card[key] = fixed
+                changed = True
+        series = card.get("series")
+        if isinstance(series, list):
+            for item in series:
+                if not isinstance(item, dict):
+                    continue
+                current = item.get("entity")
+                fixed = fix(current)
+                if fixed != current:
+                    item["entity"] = fixed
+                    changed = True
+        entities = card.get("entities")
+        if isinstance(entities, list):
+            for index, item in enumerate(entities):
+                if isinstance(item, str):
+                    fixed = fix(item)
+                    if fixed != item:
+                        entities[index] = fixed
+                        changed = True
+                elif isinstance(item, dict):
+                    current = item.get("entity")
+                    fixed = fix(current)
+                    if fixed != current:
+                        item["entity"] = fixed
+                        changed = True
+    return changed
+
+
+async def _async_heal_entity_ids(
+    hass: HomeAssistant, store: Any, dev_id: str, url_path: str
+) -> None:
+    """Apply :func:`_heal_entity_ids` to a stored dashboard, every setup.
+
+    Deliberately *not* gated on ``_LAYOUT_KEY``: the marker records which
+    revisions have already been applied, whereas this is a repair against live
+    state that can go stale again after any re-registration.  A dashboard that
+    needs nothing is read and dropped without a write.
+    """
+    try:
+        config = await _async_read_storage(hass, store)
+    except Exception:  # noqa: BLE001
+        _LOGGER.debug("Could not read dashboard %s", url_path, exc_info=True)
+        return
+
+    if not isinstance(config, dict):
+        return
+    if not isinstance(config.get("views"), list):
+        return
+    if not _heal_entity_ids(config, hass, dev_id):
+        return
+
+    try:
+        await store.async_save(config)
+    except Exception:  # noqa: BLE001
+        _LOGGER.debug("Could not save dashboard %s", url_path, exc_info=True)
+        return
+
+    _LOGGER.info(
+        "Re-pointed dashboard %s at the registered entity ids", url_path
+    )
+
+
 def _t(en: str, zh: str) -> dict[str, str]:
     """A language map the cards resolve against the viewing user's UI."""
     return {"en": en, "zh": zh}
@@ -879,6 +1035,12 @@ async def async_ensure_dashboard(
         await _async_sync_role(
             hass, dashboards[url_path], dev_id, url_path, role
         )
+        # Last, and unconditionally: the revision marker only proves which
+        # migrations ran, not that the ids they wrote are still the ids the
+        # entities have.  See ``_heal_entity_ids``.
+        await _async_heal_entity_ids(
+            hass, dashboards[url_path], dev_id, url_path
+        )
         return
 
     # Nothing in the live registry under this slug, so ask the collection itself:
@@ -905,9 +1067,11 @@ async def async_ensure_dashboard(
             await _async_reicon(hass, existing, url_path)
         # The view set is the user's, but the role gate is not a preference: a
         # follower has no System data to draw.  Applied to whatever is stored.
+        store = _dashboard_store(hass, existing)
         await _async_sync_role(
-            hass, _dashboard_store(hass, existing), dev_id, url_path, role
+            hass, store, dev_id, url_path, role
         )
+        await _async_heal_entity_ids(hass, store, dev_id, url_path)
         return
 
     # Create the dashboard entry through the live collection, which persists it
