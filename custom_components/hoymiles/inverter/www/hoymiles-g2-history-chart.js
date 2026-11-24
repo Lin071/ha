@@ -193,6 +193,17 @@ function _hmHistoryRegister() {
   /** Nominal length of one bar slot when no neighbour can supply it. */
   const DAY_MS = 24 * 60 * 60 * 1000;
 
+  /* When a series is sparse enough to be marked with a dot per reading.
+     A day chart of a gateway that was powered up an hour ago holds three or
+     four buckets: drawn as a bare line they are a few pixels wide at the right
+     edge of a 24-hour axis, which reads as "nothing loaded". Up to this many
+     readings every vertex gets a marker; past it the line itself is legible and
+     only the two ends keep one, so a full day of 288 buckets does not turn into
+     a chain of beads. */
+  const DOTS_LIMIT = 12;
+  /** Fewer readings than this and the markers go hollow and larger. */
+  const SPARSE_DOTS = 4;
+
   /* How long one statistics bucket lasts, per `period` name. Used to decide
      whether a bucket is entirely older than an opt-in card's `since`: a row is
      stamped with the instant its bucket *starts*, so the bucket containing the
@@ -2227,6 +2238,9 @@ function _hmHistoryRegister() {
              arrives at the axis having honestly fallen to zero rather than
              needing a decorative drop tacked onto its end. */
           const baseAt = (i) => toY(base[i]);
+          /* How many synthetic points were put in front of the first reading.
+             They carry no measurement, so they must not get a marker below. */
+          let headPts = 0;
           if (topPts.length) {
             const slot = times.length > 1
               ? Math.abs(toX(1) - toX(0))
@@ -2235,6 +2249,7 @@ function _hmHistoryRegister() {
             const firstX = topPts[0][0];
             if (firstX > x0 + 0.5) {
               topPts.unshift([Math.max(x0, firstX - lead), baseAt(0)]);
+              headPts = 1;
             }
           }
           const basePts = [];
@@ -2250,9 +2265,51 @@ function _hmHistoryRegister() {
             areas += `<path d="${d}" fill="${esc(color)}" fill-opacity="${fillOp}" stroke="none"/>`;
           }
           // the visible edge of the band
+          /* A series with a handful of readings is stroked a little heavier:
+             three dots on a hairline still read as an artefact, while three
+             dots on a visible curve read as "this is what has been measured so
+             far". Dense series keep the thin edge that lets two curves sit close
+             together without fighting. */
+          const realCount = Math.max(0, topPts.length - headPts);
+          const dense = realCount > DOTS_LIMIT;
+          const edgeW = dense ? strokeW : Math.max(strokeW, 2.2);
           areas += `<path d="${smoothPath(topPts)}" fill="none" stroke="${esc(color)}"`
-            + ` stroke-width="${strokeW}" stroke-opacity="${strokeOp}"`
+            + ` stroke-width="${edgeW}" stroke-opacity="${strokeOp}"`
             + " stroke-linejoin=\"round\" stroke-linecap=\"round\"/>";
+          /* Mark the readings themselves once they are too few to read as a
+             line. A day that has only just started - the device was powered up
+             at 09:19, so the recorder holds three 5-minute buckets - used to
+             draw a curve 14 px wide in a 654 px plot, which is a thin tick at
+             the right edge of an otherwise empty axis: indistinguishable from
+             "the card failed to load". The values *are* there (`_filledTimes()`
+             gives every drawn slot a value, and the axis scales to them), so
+             the honest fix is to show the vertices rather than to widen the
+             window. A dot per reading says "measured at these three instants"
+             without pretending anything about the hours in between.
+             Only for sparse series: past DOTS_LIMIT readings the line itself
+             reads as a curve and a dot on every bucket would turn into a chain
+             of beads. The first and last reading keep a marker regardless, so
+             the extent of a dense series is still visible at a glance. */
+          if (realCount > 0) {
+            const everyPoint = !dense;
+            const dotFor = (x, y, r, hollow) => (hollow
+              ? `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r}"`
+                + ` fill="none" stroke="${esc(color)}"`
+                + ` stroke-width="1.6" stroke-opacity="${strokeOp}"/>`
+              : `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r}"`
+                + ` fill="${esc(color)}" fill-opacity="${strokeOp}" stroke="none"/>`);
+            for (let i = headPts; i < topPts.length; i += 1) {
+              const isEnd = i === headPts || i === topPts.length - 1;
+              if (!everyPoint && !isEnd) continue;
+              /* A handful of points are drawn hollow and larger: three filled
+                 dots on a long flat line are easy to miss, and a ring around
+                 the actual reading is the shape a scatter-plot style is read
+                 in. Dense series keep small solid dots. */
+              const sparse = realCount <= SPARSE_DOTS;
+              areas += dotFor(topPts[i][0], topPts[i][1],
+                sparse ? 3.4 : 2.6, sparse);
+            }
+          }
         }
       });
 
@@ -2411,8 +2468,9 @@ function _hmHistoryRegister() {
         picks.push({ ms, text: label });
       };
 
-      /* The first tick is the window's own start (00:00 for a day, the 1st for
-         a month, January for a year), then every round step up to the end. */
+      /* The first tick is the domain's own start (00:00 for a whole day, or the
+         moment a young series was given room to be read), then every round step
+         up to the end. */
       pushAt(first);
       for (let t = align(first) + step; t <= last; t += step) {
         if (t - first < step * 0.5) continue;
@@ -2451,10 +2509,18 @@ function _hmHistoryRegister() {
     /**
      * The visible stretch of the window, in milliseconds.
      *
-     * The plot always spans the *window* (midnight to midnight, the 1st to the
-     * last of the month, January to December) and the wheel zoom narrows a
-     * sub-range of it. Deriving both from the same source is what keeps the
-     * guide line, the tick labels and the inverse pointer mapping in step.
+     * For a completed window this is the *window* itself (midnight to midnight,
+     * the 1st to the last of the month, January to December) and the wheel zoom
+     * narrows a sub-range of it. Deriving both from the same source is what
+     * keeps the guide line, the tick labels and the inverse pointer mapping in
+     * step.
+     *
+     * A day *in progress* is the exception: it ends at the present rather than
+     * at midnight, and while it holds under two hours of readings it also begins
+     * a fixed margin before the first one. Both cut-offs are derived from round
+     * boundaries rather than from the data, so two cards sharing a `sync_group`
+     * land on the same domain even when their first buckets differ. A day that
+     * has not started yet, or one already over, is untouched.
      */
     _visibleDomain() {
       const { start, end } = this._window();
@@ -2476,6 +2542,52 @@ function _hmHistoryRegister() {
         const lastStart = num(times[n - 1]);
         const lastEnd = lastStart + barSlot(times, n - 1, DAY_MS);
         if (lastEnd > t0) t1 = lastEnd;
+      } else if (data && data.times && data.times.length) {
+        const minute = 60 * 1000;
+        const hour = 60 * minute;
+        /* End of the plot: "now", rounded up to the next five minutes, so a day
+           in progress stops at the present instead of reserving two thirds of
+           the card for hours that have not happened yet. A constant step - not
+           the card's own resolved period, which can be `hour` on one card and
+           `5minute` on its neighbour - keeps the right edge identical across a
+           `sync_group`. A day already over ends before now, and a day navigated
+           forward to starts after it, so neither is touched. */
+        const step = 5 * minute;
+        const horizon = Math.ceil(Date.now() / step) * step;
+        const inProgress = horizon > t0 && horizon < t1;
+        if (inProgress) t1 = horizon;
+
+        /* Start of the plot. A device powered up ten minutes ago holds ten
+           minutes of readings, and on a midnight-to-midnight axis those draw as a
+           14 px tick in the right-hand corner - indistinguishable from a card
+           that failed to load. Dots alone cannot fix that: the readings need a
+           share of the width to be a curve at all.
+
+           So while the day is in progress the axis starts at the hour in which
+           the *first* reading fell, rather than at midnight. Ten minutes of
+           readings on a half-hour axis is a curve; ten minutes on a 24-hour axis
+           is a tick.
+
+           The hour floor is what keeps a `sync_group` in step. Sibling cards read
+           the same device but their first buckets can differ by a few minutes
+           (one metric was recorded from 09:15, another from 09:20); flooring both
+           to the hour gives them one shared left edge, so the vertical guide line
+           still lands on the same instant in every card of the group. Starting at
+           the reading itself would leave each card with its own left edge.
+
+           No margin is added before the hour: the data already ends at `horizon`,
+           so the plot is filled from the left by construction, and an extra hour
+           of empty axis would undo most of the gain. A reading that fell in the
+           midnight hour leaves t0 at midnight, so a day viewed whole is the plain
+           calendar, exactly as before. */
+        const obs = [];
+        for (let i = 0; i < data.times.length; i += 1) {
+          if (!data.holes || !data.holes[i]) obs.push(num(data.times[i]));
+        }
+        if (inProgress && obs.length) {
+          const hourStart = Math.floor(obs[0] / hour) * hour;
+          if (hourStart > t0) t0 = hourStart;
+        }
       }
       const zoom = zoomWindow(this._zoom);
       const span = Math.max(t1 - t0, 1);
