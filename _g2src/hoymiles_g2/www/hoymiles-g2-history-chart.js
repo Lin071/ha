@@ -193,16 +193,13 @@ function _hmHistoryRegister() {
   /** Nominal length of one bar slot when no neighbour can supply it. */
   const DAY_MS = 24 * 60 * 60 * 1000;
 
-  /* When a series is sparse enough to be marked with a dot per reading.
+  /* When a series is sparse enough to be stroked a little heavier.
      A day chart of a gateway that was powered up an hour ago holds three or
-     four buckets: drawn as a bare line they are a few pixels wide at the right
-     edge of a 24-hour axis, which reads as "nothing loaded". Up to this many
-     readings every vertex gets a marker; past it the line itself is legible and
-     only the two ends keep one, so a full day of 288 buckets does not turn into
-     a chain of beads. */
+     four buckets: drawn on a hairline the curve reads as an artefact, so up to
+     this many readings the edge is thickened until it reads as "this is what
+     has been measured so far". Past it the line is legible on its own and the
+     thin edge lets two curves sit close together without fighting. */
   const DOTS_LIMIT = 12;
-  /** Fewer readings than this and the markers go hollow and larger. */
-  const SPARSE_DOTS = 4;
 
   /* How long one statistics bucket lasts, per `period` name. Used to decide
      whether a bucket is entirely older than an opt-in card's `since`: a row is
@@ -1638,8 +1635,18 @@ function _hmHistoryRegister() {
          claim a reading there - see `_hoverPosition()`.  A bucket only counts
          as a hole when *every* series is missing from it; one series dropping
          out while another still reports is a gap in that series, not an outage,
-         and the axis as a whole still has a measurement behind it. */
-      const holes = bars ? null : times.map((t) => {
+         and the axis as a whole still has a measurement behind it.
+
+         The bar modes need this just as much as the curves do, and for the same
+         reason: a day the recorder holds no statistics row for is not the same
+         claim as a day of no production. The old code forced `holes` to null
+         whenever `bars` was set, so a month chart printed "0.0 kWh" under a
+         device that had reported nothing since it lost its connection - the
+         number is a fabrication, and it makes a gap look like a measured zero.
+         Both grids already know the difference: `bucketOf` only has an entry
+         for a slot the recorder answered for, so a slot with no bucket is a
+         hole. */
+      const holes = times.map((t) => {
         const at = bucketOf.has(t) ? bucketOf.get(t) : t;
         for (const map of bySeries) if (map.has(at)) return false;
         return true;
@@ -2239,7 +2246,8 @@ function _hmHistoryRegister() {
              needing a decorative drop tacked onto its end. */
           const baseAt = (i) => toY(base[i]);
           /* How many synthetic points were put in front of the first reading.
-             They carry no measurement, so they must not get a marker below. */
+             They carry no measurement, so they must not count towards how many
+             real readings the series has. */
           let headPts = 0;
           if (topPts.length) {
             const slot = times.length > 1
@@ -2265,53 +2273,59 @@ function _hmHistoryRegister() {
             areas += `<path d="${d}" fill="${esc(color)}" fill-opacity="${fillOp}" stroke="none"/>`;
           }
           // the visible edge of the band
-          /* A series with a handful of readings is stroked a little heavier:
-             three dots on a hairline still read as an artefact, while three
-             dots on a visible curve read as "this is what has been measured so
-             far". Dense series keep the thin edge that lets two curves sit close
-             together without fighting. */
+          /* A series with a handful of readings is stroked a little heavier, so
+             that a curve a few pixels long still reads as "this is what has
+             been measured so far" rather than as an artefact. Dense series keep
+             the thin edge that lets two curves sit close together without
+             fighting. */
           const realCount = Math.max(0, topPts.length - headPts);
           const dense = realCount > DOTS_LIMIT;
           const edgeW = dense ? strokeW : Math.max(strokeW, 2.2);
           areas += `<path d="${smoothPath(topPts)}" fill="none" stroke="${esc(color)}"`
             + ` stroke-width="${edgeW}" stroke-opacity="${strokeOp}"`
             + " stroke-linejoin=\"round\" stroke-linecap=\"round\"/>";
-          /* Mark the readings themselves once they are too few to read as a
-             line. A day that has only just started - the device was powered up
-             at 09:19, so the recorder holds three 5-minute buckets - used to
-             draw a curve 14 px wide in a 654 px plot, which is a thin tick at
-             the right edge of an otherwise empty axis: indistinguishable from
-             "the card failed to load". The values *are* there (`_filledTimes()`
-             gives every drawn slot a value, and the axis scales to them), so
-             the honest fix is to show the vertices rather than to widen the
-             window. A dot per reading says "measured at these three instants"
-             without pretending anything about the hours in between.
-             Only for sparse series: past DOTS_LIMIT readings the line itself
-             reads as a curve and a dot on every bucket would turn into a chain
-             of beads. The first and last reading keep a marker regardless, so
-             the extent of a dense series is still visible at a glance. */
-          if (realCount > 0) {
-            const everyPoint = !dense;
-            const dotFor = (x, y, r, hollow) => (hollow
-              ? `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r}"`
-                + ` fill="none" stroke="${esc(color)}"`
-                + ` stroke-width="1.6" stroke-opacity="${strokeOp}"/>`
-              : `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r}"`
-                + ` fill="${esc(color)}" fill-opacity="${strokeOp}" stroke="none"/>`);
-            for (let i = headPts; i < topPts.length; i += 1) {
-              const isEnd = i === headPts || i === topPts.length - 1;
-              if (!everyPoint && !isEnd) continue;
-              /* A handful of points are drawn hollow and larger: three filled
-                 dots on a long flat line are easy to miss, and a ring around
-                 the actual reading is the shape a scatter-plot style is read
-                 in. Dense series keep small solid dots. */
-              const sparse = realCount <= SPARSE_DOTS;
-              areas += dotFor(topPts[i][0], topPts[i][1],
-                sparse ? 3.4 : 2.6, sparse);
-            }
-          }
+          /* No vertex markers: a dot on every reading turns a curve into a
+             string of beads and reads as decoration, not as data. A short
+             series is made legible by the heavier edge above and by the domain
+             narrowing in `_visibleDomain()`, which is where the "three buckets
+             squeezed into 14 px" problem is actually solved. */
         }
       });
+
+      /* A slot the recorder holds no row for draws no bar, which makes a day of
+         no production and a day with no measurement look identical. A small
+         open marker on the zero line says "this day was not reported", and it
+         is what lets the reader tell a silent device from a cloudy one.
+         Only an *interior* gap is marked: the days before the device was first
+         heard from are simply outside the series, and dotting the empty front
+         of a month would bury the one gap being looked for under twenty
+         decorative marks.
+         This is drawn once for the axes, not per series, because a gap in the
+         statistics belongs to the day rather than to any one measurement. */
+      if (isBar && data.holes) {
+        let firstSeen = -1;
+        let lastSeen = -1;
+        for (let i = 0; i < times.length; i += 1) {
+          if (data.holes[i]) continue;
+          if (firstSeen < 0) firstSeen = i;
+          lastSeen = i;
+        }
+        const holeColor = sel >= 0
+          ? this._config.series[sel].color
+          : this._config.series[0].color;
+        const holeOp = sel >= 0 ? 0.55 : 0.45;
+        if (firstSeen >= 0) {
+          for (let i = firstSeen + 1; i < lastSeen; i += 1) {
+            if (!data.holes[i]) continue;
+            const t = num(times[i]);
+            const slot = barSlot(times, i, tSpan / 24);
+            const cx = (toXTime(t) + toXTime(t + slot)) / 2;
+            areas += `<circle cx="${cx.toFixed(1)}" cy="${yBase.toFixed(1)}" r="2.2"`
+              + ` fill="none" stroke="${esc(holeColor)}" stroke-width="1.3"`
+              + ` stroke-opacity="${holeOp}" stroke-dasharray="2 2"/>`;
+          }
+        }
+      }
 
       const xLabels = this._xLabels(toXTime, H, domain, isBar ? { times, centreOf } : null);
 
@@ -2869,10 +2883,16 @@ function _hmHistoryRegister() {
 
       const display = pickUnit(this._config.unit, data.max);
       const dec = Math.min((axDecimals || 0) + 1, 2);
+      /* A column the recorder holds no row for is not a reading of zero.  The
+         bar itself is missing, so the tooltip has to say so instead of printing
+         "0.0 kWh" under a device that simply never reported that day. */
+      const unreported = !!(data.holes && data.holes[i]);
+      const noData = this._t("no data", "无数据");
       const rows = data.values.map((vals, k) => ({
         color: this._config.series[k].color,
         name: this._sName(this._config.series[k]),
         value: vals[i],
+        missing: unreported,
         faded: this._selected >= 0 && this._selected !== k,
       }));
 
@@ -2889,7 +2909,7 @@ function _hmHistoryRegister() {
       rows.forEach((row, k) => {
         const y = boxY + 15 + (k + 1) * lineH;
         const v = row.value / div;
-        const text = v.toFixed(dec);
+        const text = row.missing ? noData : v.toFixed(dec);
         // Keep the faded rows in the tooltip (the numbers stay comparable) but
         // send them to the back visually.
         const groupOp = row.faded ? " opacity=\"0.4\"" : "";
@@ -2899,8 +2919,11 @@ function _hmHistoryRegister() {
         box += `<text class="tiptext" x="${(boxX + 26).toFixed(1)}" y="${y.toFixed(1)}">${esc(
           String(row.name).slice(0, 12),
         )}</text>`;
+        const shown = row.missing
+          ? noData
+          : `${text}${display.unit ? ` ${display.unit}` : ""}`;
         box += `<text class="tiptext" x="${(boxX + boxW - 10).toFixed(1)}" y="${y.toFixed(1)}"
-            text-anchor="end" style="font-weight:600">${text}${esc(display.unit ? ` ${display.unit}` : "")}</text>`;
+            text-anchor="end" style="font-weight:600">${esc(shown)}</text>`;
         box += "</g>";
       });
 
@@ -2926,11 +2949,15 @@ function _hmHistoryRegister() {
          outage is *visible*, but letting the guide line settle on one of those
          buckets would print "0 W at 10:45" for an instant the device never
          measured - a number that looks as trustworthy as any other on the
-         card.  The pointer simply has nothing to say there. */
+         card.  The pointer simply has nothing to say there.
+         A bar is the exception: its column is a day of the calendar that always
+         exists, and refusing to hover it would leave a reader unable to ask why
+         the column is missing. The tooltip names it as unreported instead. */
+      const isBar = !!(data && data.bars);
       const hole = (index) => !!(data.holes && data.holes[index]);
       if (this._remoteTime == null) {
         if (this._hover < 0 || this._hover >= n) return null;
-        if (hole(this._hover)) return null;
+        if (!isBar && hole(this._hover)) return null;
         return this._hover;
       }
 
@@ -2954,7 +2981,7 @@ function _hmHistoryRegister() {
         && Math.abs(num(times[lo - 1]) - target) <= Math.abs(num(times[lo]) - target)) {
         lo -= 1;
       }
-      return hole(lo) ? null : lo;
+      return (!isBar && hole(lo)) ? null : lo;
     }
 
     /** Select a series by legend index; `-1` clears the highlight. */
@@ -3015,7 +3042,7 @@ function _hmHistoryRegister() {
          it.  That is the difference between "0 W" and "no data": the curve
          falls to 0 so the outage is visible, but a tooltip would dress that 0
          up as a measurement. */
-      if (data.holes && data.holes[index]) {
+      if (data.holes && data.holes[index] && !data.bars) {
         this._setHover(-1);
         return;
       }
