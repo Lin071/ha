@@ -16,7 +16,14 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, MANUFACTURER, SRC_DEVICE, SRC_QUICK
+from .const import (
+    CONF_DEV_ID,
+    DOMAIN,
+    MANUFACTURER,
+    SRC_DEVICE,
+    SRC_QUICK,
+    device_family,
+)
 from .coordinator import HoymilesCoordinator
 
 
@@ -88,9 +95,23 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the binary sensors from a config entry."""
+    """Set up the binary sensors from a config entry.
+
+    Forwarded platforms resolve against the integration root package, so an
+    inverter entry arrives here too; ``inverter/binary_sensor.py`` is never
+    imported by Home Assistant itself.
+    """
+    dev_id: str = entry.data.get(CONF_DEV_ID, "")
+    if device_family(dev_id) == "inverter":
+        from .inverter import binary_sensor as _inverter_binary_sensor  # noqa: PLC0415
+
+        await _inverter_binary_sensor.async_setup_entry(
+            hass, entry, async_add_entities
+        )
+        return
+
     coordinator: HoymilesCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
-    dev_id: str = hass.data[DOMAIN][entry.entry_id]["dev_id"]
+    dev_id = hass.data[DOMAIN][entry.entry_id]["dev_id"]
 
     async_add_entities(
         HoymilesBinarySensor(coordinator, dev_id, description)

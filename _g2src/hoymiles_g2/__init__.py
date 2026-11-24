@@ -29,6 +29,7 @@ from .const import (
     FRONTEND_URL,
     PAYLOAD_AVAILABLE,
     PLATFORMS,
+    ROLE_MASTER,
     T_HA_STATUS,
 )
 from .coordinator import HoymilesCoordinator
@@ -184,6 +185,22 @@ def _async_track_role(
     adds no traffic.  The listener is removed with the config entry, and the last
     applied role is remembered in ``lovelace`` - so this is normally a no-op.
 
+    The other job here is the online notice.  A unit that has just been promoted
+    to master is the one that has to publish the system-wide topics (the meter
+    readings, the combined port totals), and it only rebuilds them after it
+    reads ``online`` on ``homeassistant/status`` - see
+    ``_async_announce_ha_online``.  Home Assistant's own birth message fires when
+    the MQTT integration connects, which is precisely *not* when a master is
+    promoted: the promotion happens mid-run, when the old master drops out.  So
+    the promotion itself is the trigger, and the notice is sent once per
+    transition into ``master``.
+
+    Exactly once, not once per message: ``event/state`` is republished on the
+    device's own schedule, so the role is compared against the last one that
+    actually changed (``last``), and the announce is additionally gated on the
+    new role being ``master`` - a slave or a stand-alone unit is never told to
+    announce again, and a master that keeps repeating ``master`` announces once.
+
     The whole body is guarded: a Lovelace internals change must never be able to
     raise inside a coordinator callback, which would be logged against the
     integration on every single MQTT message.
@@ -197,6 +214,8 @@ def _async_track_role(
             if role == last[0]:
                 return
             last[0] = role
+            if role == ROLE_MASTER:
+                hass.async_create_task(_async_announce_ha_online(hass, dev_id))
             hass.async_create_task(lovelace.async_sync_role(hass, dev_id, role))
         except Exception:  # noqa: BLE001 - never break the state update
             _LOGGER.debug("Role listener failed for %s", dev_id, exc_info=True)

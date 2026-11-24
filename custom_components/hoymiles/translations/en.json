@@ -96,6 +96,24 @@
         "data": {
           "overwrite": "Overwrite the existing dashboard"
         }
+      },
+      "region": {
+        "title": "Region",
+        "description": "The time zone this device's day is measured in. Today's yield resets at this zone's midnight and every displayed time follows it. Choose the first entry to follow Home Assistant, or type any IANA zone name such as Europe/Berlin.",
+        "data": {
+          "region": "Region"
+        }
+      },
+      "charts": {
+        "title": "Optional device charts",
+        "description": "Tick a reading to add its curve card to this device's Device view. A card starts recording the moment it is ticked and only ever draws the data recorded after that, so an unticked-then-ticked card begins a fresh curve.",
+        "data": {
+          "grid_current": "Grid current (A)",
+          "grid_frequency": "Grid frequency (Hz)",
+          "active_power": "Active power (W)",
+          "reactive_power": "Reactive power (var)",
+          "rssi": "Signal strength (dBm)"
+        }
       }
     },
     "abort": {
@@ -112,58 +130,158 @@
       "name": "Set TOU day plan",
       "description": "Publish one TOU day plan (day1..day8) to the device.",
       "fields": {
-        "dev_id": { "name": "Device ID", "description": "Device id (client_prefix-SN)." },
-        "day_idx": { "name": "Day plan index", "description": "1..8" },
-        "day_plan": { "name": "Day plan", "description": "List of segments (max 12)." }
+        "dev_id": {
+          "name": "Device ID",
+          "description": "Device id (client_prefix-SN)."
+        },
+        "day_idx": {
+          "name": "Day plan index",
+          "description": "1..8"
+        },
+        "day_plan": {
+          "name": "Day plan",
+          "description": "List of segments (max 12)."
+        }
       }
     },
     "set_tou_week_plan": {
       "name": "Set TOU week plan",
       "description": "Publish the weekday to day-plan mapping.",
       "fields": {
-        "dev_id": { "name": "Device ID", "description": "Device id (client_prefix-SN)." },
-        "week_plan": { "name": "Week plan", "description": "List of {week:[...], day_idx:N}." }
+        "dev_id": {
+          "name": "Device ID",
+          "description": "Device id (client_prefix-SN)."
+        },
+        "week_plan": {
+          "name": "Week plan",
+          "description": "List of {week:[...], day_idx:N}."
+        }
       }
     },
     "get_tou_plan": {
       "name": "Get TOU plan",
       "description": "Query the plan configured for one weekday.",
       "fields": {
-        "dev_id": { "name": "Device ID", "description": "Device id (client_prefix-SN)." },
-        "week": { "name": "Weekday", "description": "Mon..Sun" }
+        "dev_id": {
+          "name": "Device ID",
+          "description": "Device id (client_prefix-SN)."
+        },
+        "week": {
+          "name": "Weekday",
+          "description": "Mon..Sun"
+        }
       }
     },
     "set_ems_mode": {
       "name": "Set EMS mode",
       "description": "Switch the EMS mode (general / mqtt_ctrl / tou_plan).",
       "fields": {
-        "dev_id": { "name": "Device ID", "description": "Device id (client_prefix-SN)." },
-        "mode": { "name": "Mode", "description": "general, mqtt_ctrl or tou_plan" }
+        "dev_id": {
+          "name": "Device ID",
+          "description": "Device id (client_prefix-SN)."
+        },
+        "mode": {
+          "name": "Mode",
+          "description": "general, mqtt_ctrl or tou_plan"
+        }
       }
     },
     "reboot": {
       "name": "Reboot device",
       "description": "Send the RESTART command to the device.",
       "fields": {
-        "dev_id": { "name": "Device ID", "description": "Device id (client_prefix-SN)." }
+        "dev_id": {
+          "name": "Device ID",
+          "description": "Device id (client_prefix-SN)."
+        }
       }
     },
     "set_phase_output_power": {
       "name": "Set multi phase output power",
       "description": "Set the output power limit of all three phases at once.",
       "fields": {
-        "dev_id": { "name": "Device ID", "description": "Device id (client_prefix-SN)." },
-        "phase_a": { "name": "Phase A limit", "description": "Output power limit in watt (100..2500)." },
-        "phase_b": { "name": "Phase B limit", "description": "Output power limit in watt (100..2500)." },
-        "phase_c": { "name": "Phase C limit", "description": "Output power limit in watt (100..2500)." }
+        "dev_id": {
+          "name": "Device ID",
+          "description": "Device id (client_prefix-SN)."
+        },
+        "phase_a": {
+          "name": "Phase A limit",
+          "description": "Output power limit in watt (100..2500)."
+        },
+        "phase_b": {
+          "name": "Phase B limit",
+          "description": "Output power limit in watt (100..2500)."
+        },
+        "phase_c": {
+          "name": "Phase C limit",
+          "description": "Output power limit in watt (100..2500)."
+        }
       }
     },
     "create_dashboard": {
       "name": "Create device dashboard",
       "description": "Build the bundled Lovelace dashboard (System / Device / Control) for one device.",
       "fields": {
-        "dev_id": { "name": "Device ID", "description": "Device id (client_prefix-SN)." },
-        "overwrite": { "name": "Overwrite", "description": "Rebuild the layout even when the dashboard already exists." }
+        "dev_id": {
+          "name": "Device ID",
+          "description": "Device id (client_prefix-SN)."
+        },
+        "overwrite": {
+          "name": "Overwrite",
+          "description": "Rebuild the layout even when the dashboard already exists."
+        }
+      }
+    },
+    "start_power_ctrl_keepalive": {
+      "name": "Start power control keep-alive",
+      "description": "Re-publish one power_ctrl value on a period. The firmware treats it as a lease and falls back after about 60 seconds. Runs inside Home Assistant, so it keeps working with no dashboard open. Requires mqtt_ctrl mode.",
+      "fields": {
+        "dev_id": {
+          "name": "Device ID",
+          "description": "Device id (client_prefix-SN)."
+        },
+        "power": {
+          "name": "Power",
+          "description": "Power limit in watt to hold."
+        },
+        "period": {
+          "name": "Period",
+          "description": "Seconds between two sends (5..3600, default 30)."
+        }
+      }
+    },
+    "stop_power_ctrl_keepalive": {
+      "name": "Stop power control keep-alive",
+      "description": "Stop re-publishing power_ctrl for a device.",
+      "fields": {
+        "dev_id": {
+          "name": "Device ID",
+          "description": "Device id (client_prefix-SN)."
+        }
+      }
+    },
+    "get_optional_charts": {
+      "name": "Get optional device charts",
+      "description": "Return which opt-in Device-view curves are enabled, and when each of them started recording.",
+      "fields": {
+        "dev_id": {
+          "name": "Device ID",
+          "description": "Device id (client_prefix-SN)."
+        }
+      }
+    },
+    "set_optional_charts": {
+      "name": "Set optional device charts",
+      "description": "Enable or disable the opt-in Device-view curves. A key that is left out is disabled, so send the complete set.",
+      "fields": {
+        "dev_id": {
+          "name": "Device ID",
+          "description": "Device id (client_prefix-SN)."
+        },
+        "charts": {
+          "name": "Charts",
+          "description": "Object of chart key to boolean: grid_current, grid_frequency, active_power, reactive_power, rssi."
+        }
       }
     }
   }

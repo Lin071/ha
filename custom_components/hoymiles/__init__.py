@@ -1,4 +1,19 @@
-"""The Hoymiles Micro Storage integration."""
+"""The Hoymiles integration.
+
+Two product families are served from this one integration, dispatched on the
+PID embedded in the device serial (see ``const.device_family``):
+
+* ``2800`` / ``2804`` / ``2805`` / ``2806`` - battery storage units.  Everything
+  in this module's own imports below is theirs; ``inverter/`` is never touched.
+* ``1650`` / ``4160`` / ``4161`` / ``4162`` - grid-tied HiFlow micro inverters.
+  ``async_setup_entry`` hands them straight to
+  ``inverter.async_setup_inverter_entry``, which builds its own coordinator,
+  entities, dashboard and cards.
+
+The dispatch happens before any storage-side object is created, so an inverter
+entry can never inherit storage behaviour and a storage entry can never inherit
+inverter behaviour.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +31,7 @@ from .const import (
     FRONTEND_ASSETS,
     FRONTEND_URL,
     PLATFORMS,
+    device_family,
 )
 from .coordinator import HoymilesCoordinator
 from .dashboard import (
@@ -33,8 +49,16 @@ _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up Hoymiles Micro Storage from a config entry."""
+    """Set up a Hoymiles device from a config entry."""
     dev_id: str = entry.data[CONF_DEV_ID]
+
+    # A micro inverter is a different product with a different protocol surface,
+    # so it is served by its own module.  Doing this first keeps every storage
+    # code path below reachable only for storage serials.
+    if device_family(dev_id) == "inverter":
+        from .inverter import async_setup_inverter_entry  # noqa: PLC0415
+
+        return await async_setup_inverter_entry(hass, entry)
 
     coordinator = HoymilesCoordinator(hass, dev_id)
     await coordinator.async_setup()
@@ -112,6 +136,11 @@ async def _async_maybe_create_dashboard(
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    if device_family(entry.data.get(CONF_DEV_ID, "")) == "inverter":
+        from .inverter import async_unload_inverter_entry  # noqa: PLC0415
+
+        return await async_unload_inverter_entry(hass, entry)
+
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
         entry_data = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
