@@ -157,9 +157,11 @@ function _hmTouRegister(litElement) {
    * on any card switches every card on the page at once, and the choice
    * survives a reload.
    *
-   * English is the default.  It deliberately does NOT follow the Home
-   * Assistant UI language any more: a dashboard is often shared, and the point
-   * of the dropdown is that the reader decides.
+   * The order is: the reader's own pick, then `language:` on the card, then the
+   * Home Assistant UI language, then English.  Following the UI language is
+   * what makes an unconfigured card match the page it sits on - the earlier
+   * "English unless picked" rule left the cards as the only English thing on a
+   * Chinese dashboard.
    * ------------------------------------------------------------------ */
   const LANG_KEY = "hoymiles.language";
   const LANG_EVENT = "hoymiles-language";
@@ -186,7 +188,12 @@ function _hmTouRegister(litElement) {
   }
 
   function hmLang(hass, config) {
-    return hmStored() || hmNormalise(config && config.language) || "en";
+    const locale = hass && hass.locale;
+    const ui = (locale && locale.language) || (hass && hass.language);
+    return hmStored()
+      || hmNormalise(config && config.language)
+      || hmNormalise(ui)
+      || "en";
   }
 
   /**
@@ -1154,6 +1161,23 @@ function _hmTouRegister(litElement) {
         || this._resolveEntity({ domain: "sensor", idSuffix: "tou_week_plan_ack" });
     }
 
+    /**
+     * The role the device reports (§32 `role`).
+     *
+     * §15 - §20 (TOU day / week plan, plan get, plan status) are 角色: 主机和单机.
+     * A slave has no such topics and cannot even select `tou_plan` (the EMS mode
+     * picker is 主机和单机 as well), so the editor renders nothing there.
+     */
+    _roleEntity() {
+      return this._config.role_entity
+        || this._resolveEntity({ domain: "sensor", idSuffix: "device_role" });
+    }
+
+    _isSlave() {
+      const state = this._hass && this._hass.states[this._roleEntity()];
+      return !!state && state.state === "slave";
+    }
+
     _emsMode() {
       const state = this._hass && this._hass.states[this._emsEntity()];
       return state ? state.state : null;
@@ -2082,6 +2106,9 @@ function _hmTouRegister(litElement) {
 
     render() {
       if (!this._draft) this._resetDraft();
+      /* §15 - §20 are 角色: 主机和单机.  Nothing on this card can work on a
+         slave, and the control card does not host the editor there either. */
+      if (this._isSlave()) return html``;
       const mode = this._emsMode();
       /* `embedded: true` means `<hoymiles-control>` hosts this editor inside its
          own EMS card: no <ha-card>, no second title, no second Read/Send bar.
