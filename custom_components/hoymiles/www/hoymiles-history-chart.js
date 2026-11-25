@@ -67,6 +67,19 @@
  *     - entity: sensor.x_system_battery_power
  *       name: 放电[+]/充电[-]
  *       color: "#4a90d9"
+ *
+ * A curve can be made conditional on the device's capabilities, which is how
+ * one template serves a unit with a grid meter and one without:
+ *
+ *     - entity: sensor.x_system_grid_power
+ *       while:  { entity: sensor.x_energy_flow_today, attribute: has_meter }
+ *     - entity: sensor.x_grid_on_power
+ *       unless: { entity: sensor.x_energy_flow_today, attribute: has_meter }
+ *
+ * `while` keeps the curve only while the condition is **true**; `unless` keeps
+ * it unless the condition is true, so an unknown attribute (before the first
+ * snapshot after a restart) falls back to the `unless` curve - the combined one
+ * - instead of leaving the chart with neither.
  * ========================================================================== */
 
 /**
@@ -125,6 +138,12 @@ function _hmHistoryRegister(litElement) {
     "Reset": "Zurücksetzen",
     "Click to show this curve": "Klicken, um diese Kurve einzublenden",
     "Click to hide this curve": "Klicken, um diese Kurve auszublenden",
+    "Pick a day": "Tag wählen",
+    "This day has not happened yet": "Dieser Tag liegt noch in der Zukunft",
+    "No statistics recorded": "Keine Statistiken aufgezeichnet",
+    "Statistics recorded": "Statistiken aufgezeichnet",
+    "has data": "mit Daten",
+    "no data": "ohne Daten",
   };
 
   /** Map any Home Assistant language tag to one of the three card languages. */
@@ -144,9 +163,11 @@ function _hmHistoryRegister(litElement) {
    * on any card switches every card on the page at once, and the choice
    * survives a reload.
    *
-   * English is the default.  It deliberately does NOT follow the Home
-   * Assistant UI language any more: a dashboard is often shared, and the point
-   * of the dropdown is that the reader decides.
+   * The order is: the reader's own pick, then `language:` on the card, then the
+   * Home Assistant UI language, then English.  Following the UI language is
+   * what makes an unconfigured card match the page it sits on - the earlier
+   * "English unless picked" rule left the cards as the only English thing on a
+   * Chinese dashboard.
    * ------------------------------------------------------------------ */
   const LANG_KEY = "hoymiles.language";
   const LANG_EVENT = "hoymiles-language";
@@ -173,7 +194,12 @@ function _hmHistoryRegister(litElement) {
   }
 
   function hmLang(hass, config) {
-    return hmStored() || hmNormalise(config && config.language) || "en";
+    const locale = hass && hass.locale;
+    const ui = (locale && locale.language) || (hass && hass.language);
+    return hmStored()
+      || hmNormalise(config && config.language)
+      || hmNormalise(ui)
+      || "en";
   }
 
   /**
@@ -258,6 +284,38 @@ function _hmHistoryRegister(litElement) {
   ];
 
   const DEFAULT_COLORS = ["#22c55e", "#4a90d9", "#22d3ee", "#f5a623", "#a78bfa"];
+
+  /* ------------------------------------------------------------------ *
+   * Entity id aliases
+   *
+   * Home Assistant names a firmware discovery entity after the payload's
+   * `name`, not after the protocol key: §36 `bat_p` is called "Battery Power",
+   * so its entity id is `..._battery_power` while the protocol key - and the
+   * dashboard template written from it - says `..._bat_power`.  Pointing the
+   * chart at an entity that does not exist made `skip_empty` drop the battery
+   * curve, so the power chart showed PV and grid only.
+   *
+   * Both spellings are accepted, in both directions: a unit whose firmware
+   * publishes the config keeps `battery_power`, while older installations still
+   * carry the `bat_power` entity an earlier integration release created.  A
+   * dashboard generated with either name therefore draws the same curve.
+   * ------------------------------------------------------------------ */
+  const ENTITY_ALIASES = [
+    [/_bat_power$/, "_battery_power"],
+    [/_battery_power$/, "_bat_power"],
+  ];
+
+  /** The entity id to read for a configured series, following the aliases. */
+  function resolveEntity(hass, entityId) {
+    const states = (hass && hass.states) || {};
+    if (!entityId || states[entityId]) return entityId;
+    for (const [pattern, replacement] of ENTITY_ALIASES) {
+      if (!pattern.test(entityId)) continue;
+      const candidate = entityId.replace(pattern, replacement);
+      if (states[candidate]) return candidate;
+    }
+    return entityId;
+  }
 
   /* ------------------------------------------------------------------ *
    * Time-window sharing.
@@ -566,6 +624,12 @@ function _hmHistoryRegister(litElement) {
   /** Two clicks closer than this on the same plot count as a double click. */
   const DOUBLE_CLICK_MS = 350;
 
+  /* A per-pack curve name as the dashboard template writes it: "Battery 1",
+     "Batterie 1", "电池 1".  Matched whole, so a label that merely happens to
+     end in a digit ("PV1") is left alone; the index is dropped only when the
+     device actually has a single pack. */
+  const SERIES_INDEX_NAME = /^(Battery|Batterie|电池包?)\s*\d+$/i;
+
   /** Resolve a zoom state against a bucket count, in fractional indices. */
   function zoomWindow(zoom, count) {    const last = Math.max(count - 1, 0);
     if (!zoom || last <= 0) {
@@ -656,6 +720,17 @@ function _hmHistoryRegister(litElement) {
       this._vbW = VB_W;
       this._ro = null;
       this._syncJoined = null;
+      /* Day picker (see `_calendar`): whether it is open, which month it shows,
+         and which days of that month actually have statistics.  Plain fields
+         plus `requestUpdate()` - none of it belongs to the card's state.
+
+         `_availDays === null` means "we do not know" (the recorder query has not
+         run, or failed), which must NOT be rendered as "every day is empty". */
+      this._calOpen = false;
+      this._calMonth = null;
+      this._availKey = null;
+      this._availDays = null;
+      this._availPending = null;
     }
 
     connectedCallback() {
@@ -671,6 +746,16 @@ function _hmHistoryRegister(litElement) {
       };
       window.addEventListener("pointerup", this._onWindowUp);
       window.addEventListener("blur", this._onWindowUp);
+      /* The day picker closes on any press outside the card.  `pointerdown`
+         rather than `click`: the opening click happens first, so this listener
+         can never close the picker it just opened. */
+      this._onWindowDown = (event) => {
+        if (this._calOpen && !event.composedPath().includes(this)) {
+          this._calOpen = false;
+          this.requestUpdate();
+        }
+      };
+      window.addEventListener("pointerdown", this._onWindowDown);
     }
 
     disconnectedCallback() {
@@ -684,6 +769,10 @@ function _hmHistoryRegister(litElement) {
         window.removeEventListener("pointerup", this._onWindowUp);
         window.removeEventListener("blur", this._onWindowUp);
         this._onWindowUp = null;
+      }
+      if (this._onWindowDown) {
+        window.removeEventListener("pointerdown", this._onWindowDown);
+        this._onWindowDown = null;
       }
     }
 
@@ -779,6 +868,68 @@ function _hmHistoryRegister(litElement) {
           display: inline-flex; align-items: center; justify-content: center;
         }
         .navbtn:hover { background: var(--secondary-background-color, rgba(127,127,127,0.1)); }
+        .navbtn:disabled { opacity: .35; cursor: default; background: none; }
+        /* The day field: a button that looks like the date input it replaced,
+           plus the calendar hanging under it.  position: relative on the host
+           is what anchors the popover to the field instead of the card. */
+        .dayhost { position: relative; display: inline-flex; }
+        .daybtn {
+          font: inherit; font-size: 13px; font-weight: 600;
+          color: var(--primary-text-color); background: none;
+          border: none; outline: none; padding: 5px 6px;
+          text-align: center; cursor: pointer; border-radius: 7px;
+          min-width: 96px; font-variant-numeric: tabular-nums;
+        }
+        .daybtn:hover { background: var(--secondary-background-color, rgba(127,127,127,0.1)); }
+        .cal {
+          position: absolute; top: calc(100% + 6px); left: 50%;
+          transform: translateX(-50%); z-index: 60;
+          width: 238px; padding: 8px 9px 7px; box-sizing: border-box;
+          border-radius: 12px; background: var(--card-background-color, #fff);
+          border: 1px solid var(--divider-color);
+          box-shadow: 0 10px 26px rgba(0,0,0,.18);
+        }
+        .cal-head { display: flex; align-items: center; gap: 4px; margin-bottom: 4px; }
+        .cal-month { flex: 1 1 auto; text-align: center; font-size: 12.5px;
+                     font-weight: 600; color: var(--primary-text-color); }
+        .cal-nav { width: 24px; height: 24px; border: none; background: none;
+                   cursor: pointer; border-radius: 50%; font: inherit;
+                   font-size: 14px; line-height: 1; color: var(--primary-text-color);
+                   display: inline-flex; align-items: center; justify-content: center; }
+        .cal-nav:hover:not(:disabled) {
+          background: var(--secondary-background-color, rgba(127,127,127,.1)); }
+        .cal-nav:disabled { opacity: .3; cursor: default; }
+        /* Seven equal columns; the weekday row uses the same grid so the
+           columns line up without any width guessing. */
+        .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 1px; }
+        .cal-wd { text-align: center; font-size: 10.5px; padding: 2px 0 3px;
+                  color: var(--secondary-text-color); }
+        .cal-blank { height: 26px; }
+        /* A day cell has THREE looks, and telling them apart is the point:
+             - data recorded  -> normal text colour (--primary-text-color)
+             - nothing recorded -> muted grey, still clickable (the chart then
+               says so, which is honest and lets the user go back)
+             - future -> muted grey and disabled, because there is nothing there
+           The selected day is filled, the current day is outlined. */
+        .cal-day {
+          height: 26px; border: none; background: none; cursor: pointer;
+          font: inherit; font-size: 12px; border-radius: 7px; padding: 0;
+          color: var(--primary-text-color); font-variant-numeric: tabular-nums;
+        }
+        .cal-day:hover:not(:disabled) {
+          background: var(--secondary-background-color, rgba(127,127,127,.14)); }
+        .cal-day.empty { color: var(--secondary-text-color); opacity: .55; }
+        .cal-day.future { opacity: .28; cursor: default; }
+        .cal-day.today { box-shadow: inset 0 0 0 1px var(--primary-color); }
+        .cal-day.sel { background: var(--primary-color);
+                       color: var(--text-primary-color, #fff); font-weight: 600;
+                       box-shadow: none; }
+        .cal-legend { display: flex; align-items: center; gap: 5px; margin-top: 6px;
+                      font-size: 10.5px; color: var(--secondary-text-color); }
+        .cal-legend .lg { width: 8px; height: 8px; border-radius: 2px;
+                          background: var(--primary-text-color); }
+        .cal-legend .lg.empty { background: var(--secondary-text-color); opacity: .55; }
+        .cal-legend .lg + .lg { margin-left: 6px; }
         .chart { margin-top: 8px; position: relative;
                  user-select: none; -webkit-user-select: none;
                  touch-action: none; }
@@ -861,7 +1012,10 @@ function _hmHistoryRegister(litElement) {
       this._countSig = null;
       this._joinSync();
       // `hass` may already be set when the dashboard is edited in place.
-      if (this._hass) this._fetch();
+      if (this._hass) {
+        this._resolveEntities();
+        this._fetch();
+      }
     }
 
     /**
@@ -906,6 +1060,9 @@ function _hmHistoryRegister(litElement) {
     set hass(hass) {
       const first = !this._hass;
       this._hass = hass;
+      /* Follow the entity aliases before anything reads `series.entity`: the
+         statistic query, `count_entity` and `skip_empty` all work on the id. */
+      const renamed = this._resolveEntities();
       if (first && this._config) {
         this._countSig = this._countSignature();
         this._fetch();
@@ -914,7 +1071,7 @@ function _hmHistoryRegister(litElement) {
            (a device that just woke up, a fresh install).  Without this the
            chart kept whatever series count the first fetch decided on. */
         const signature = this._countSignature();
-        if (signature !== this._countSig) {
+        if (renamed || signature !== this._countSig) {
           this._countSig = signature;
           this._fetch();
         }
@@ -922,10 +1079,42 @@ function _hmHistoryRegister(litElement) {
       this.requestUpdate();
     }
 
+    /**
+     * Point every series at the entity id that actually exists.
+     *
+     * A dashboard generated before the `bat_power` / `battery_power` mismatch
+     * was known still carries the wrong id, and regenerating it would throw
+     * away the user's own edits.  Renaming in place fixes the existing page and
+     * is a no-op once the ids agree.
+     */
+    _resolveEntities() {
+      if (!this._hass || !this._panes) return false;
+      let changed = false;
+      for (const pane of this._panes) {
+        if (pane.count_entity) {
+          const resolved = resolveEntity(this._hass, pane.count_entity);
+          if (resolved !== pane.count_entity) {
+            pane.count_entity = resolved;
+            changed = true;
+          }
+        }
+        for (const series of pane.series) {
+          const resolved = resolveEntity(this._hass, series.entity);
+          if (resolved !== series.entity) {
+            series.entity = resolved;
+            changed = true;
+          }
+        }
+      }
+      return changed;
+    }
+
     /** Cheap fingerprint of every pane's series limit. */
     _countSignature() {
       if (!this._panes) return "";
-      return this._panes.map((pane) => String(this._countLimit(pane))).join(",");
+      return this._panes
+        .map((pane) => String(this._countLimit(pane)) + "/" + this._gateSignature(pane))
+        .join(",");
     }
 
     /** Re-measure after every render: the svg appears only once data arrived. */
@@ -947,29 +1136,112 @@ function _hmHistoryRegister(litElement) {
       return hmText(value, hmLang(this._hass, this._config));
     }
 
-    /** A series' display name, resolved for the current language. */
-    _sName(s) {
+    /**
+     * A series' display name, resolved for the current language.
+     *
+     * The dashboard template names the pack curves "Battery 1" .. "Battery 4"
+     * because it is written for the largest unit and cannot know how many packs
+     * a given device has.  On a one-pack unit that number is noise - and worse,
+     * it implies a second pack - so it is dropped here, where `count_entity`
+     * has already told us the real count.  Only the exact "word + number" form
+     * is touched: a name like "PV1" keeps its digit, and two packs or more keep
+     * their numbers, which is where they start being useful.
+     */
+    _sName(s, pane) {
       if (!s) return "";
-      return this._text(s.name != null ? s.name : s.entity) || "";
+      const name = this._text(s.name != null ? s.name : s.entity) || "";
+      if (!name) return "";
+      if (pane && this._countLimit(pane) === 1
+          && SERIES_INDEX_NAME.test(name.trim())) {
+        return name.trim().replace(/\s*\d+$/, "");
+      }
+      return name;
     }
 
     /* --------------------------- time windows --------------------------- */
 
     _window() {
       const a = this._anchor;
+      /* The window never reaches into the future.  Asking the recorder for
+         "tomorrow" answered with an empty chart, which looks like a bug rather
+         than like "there is nothing there yet"; clamping the end to now also
+         makes the partial last bucket of the current day/month/year correct. */
+      const now = new Date();
+      const clampEnd = (end) => (end.getTime() > now.getTime() ? now : end);
       if (this._range === "month") {
         return {
           start: startOfDay(new Date(a.getFullYear(), a.getMonth(), 1)),
-          end: endOfDay(new Date(a.getFullYear(), a.getMonth() + 1, 0)),
+          end: clampEnd(endOfDay(new Date(a.getFullYear(), a.getMonth() + 1, 0))),
         };
       }
       if (this._range === "year") {
         return {
           start: startOfDay(new Date(a.getFullYear(), 0, 1)),
-          end: endOfDay(new Date(a.getFullYear(), 11, 31)),
+          end: clampEnd(endOfDay(new Date(a.getFullYear(), 11, 31))),
         };
       }
-      return { start: startOfDay(a), end: endOfDay(a) };
+      return { start: startOfDay(a), end: clampEnd(endOfDay(a)) };
+    }
+
+    /* ---------------------------- date limits ---------------------------- */
+
+    /** Local midnight of today. */
+    _today() {
+      const now = new Date();
+      return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    }
+
+    /** The newest period the card may show, in the current range. */
+    _maxAnchor() {
+      const t = this._today();
+      if (this._range === "month") return new Date(t.getFullYear(), t.getMonth(), 1);
+      if (this._range === "year") return new Date(t.getFullYear(), 0, 1);
+      return t;
+    }
+
+    /**
+     * True when `anchor` is **after** the newest period.
+     *
+     * Kept apart from `_atMax` on purpose: moving *onto* today is allowed (it is
+     * the most interesting day there is), while moving *past* it is not. Using
+     * the "at or past" test as the navigation guard silently refused to step from
+     * yesterday to today.
+     */
+    _past(anchor) {
+      const a = anchor || this._anchor;
+      const max = this._maxAnchor();
+      if (this._range === "year") return a.getFullYear() > max.getFullYear();
+      if (this._range === "month") {
+        return a.getFullYear() > max.getFullYear()
+          || (a.getFullYear() === max.getFullYear() && a.getMonth() > max.getMonth());
+      }
+      return startOfDay(a).getTime() > max.getTime();
+    }
+
+    /** True when `anchor` is at (or past) the newest period - nowhere to go. */
+    _atMax(anchor) {
+      if (this._past(anchor)) return true;
+      const a = anchor || this._anchor;
+      const max = this._maxAnchor();
+      if (this._range === "year") return a.getFullYear() === max.getFullYear();
+      if (this._range === "month") {
+        return a.getFullYear() === max.getFullYear() && a.getMonth() === max.getMonth();
+      }
+      return startOfDay(a).getTime() === max.getTime();
+    }
+
+    /** Pull an anchor back into the past, so no navigation can leave the range. */
+    _clampAnchor(anchor) {
+      if (this._past(anchor)) return this._maxAnchor();
+      return anchor;
+    }
+
+    /** The `max` attribute for a native picker. */
+    _maxAttr() {
+      const a = this._maxAnchor();
+      if (this._range === "year") return String(a.getFullYear());
+      if (this._range === "month") return `${a.getFullYear()}-${pad2(a.getMonth() + 1)}`;
+      return `${a.getFullYear()}-${pad2(a.getMonth() + 1)}-${pad2(a.getDate())}`;
     }
 
     /** Statistics granularity: finer for short windows, coarser for long ones. */
@@ -987,12 +1259,22 @@ function _hmHistoryRegister(litElement) {
       if (this._range === "month") a.setMonth(a.getMonth() + step);
       else if (this._range === "year") a.setFullYear(a.getFullYear() + step);
       else a.setDate(a.getDate() + step);
-      this._anchor = a;
+      /* Forward stops at the current period.  The recorder holds nothing in the
+         future, so a step past today could only ever produce "no statistics". */
+      if (step > 0 && this._past(a)) return;
+      this._anchor = this._clampAnchor(a);
+      this._calOpen = false;
       this._reload();
     }
 
     _onRangeChange(event) {
       this._range = event.target.value;
+      /* Switching to a coarser range keeps the anchor, but the anchor may now be
+         past the end of that range (a day in the future month is impossible, yet
+         a stale anchor from a shared `sync_group` is not). */
+      this._anchor = this._clampAnchor(this._anchor);
+      this._calMonth = null;
+      this._calOpen = false;
       this._reload();
     }
 
@@ -1010,7 +1292,13 @@ function _hmHistoryRegister(litElement) {
         a = new Date(y, m - 1, d);
       }
       if (!a || Number.isNaN(a.getTime())) return;
-      this._anchor = a;
+      const clamped = this._clampAnchor(a);
+      this._anchor = clamped;
+      /* A typed or pasted future date is silently corrected rather than
+         rejected: the field must always show the period actually on screen. */
+      if (clamped.getTime() !== a.getTime() && event.target) {
+        event.target.value = this._anchorValue();
+      }
       this._reload();
     }
 
@@ -1083,7 +1371,12 @@ function _hmHistoryRegister(litElement) {
         && this._anchor.getTime() === state.anchor;
       if (same) return;
       this._range = state.range;
-      this._anchor = new Date(state.anchor);
+      /* A sibling card cannot send a future window any more (`_shiftRange`
+         refuses to leave the past), but an older cached group state could, and
+         the clamp here is what keeps that from drawing an empty chart. */
+      this._anchor = this._clampAnchor(new Date(state.anchor));
+      this._calMonth = null;
+      this._calOpen = false;
       this._data = null;
       this._hoverTime = null;
       this._remoteTime = null;
@@ -1214,13 +1507,104 @@ function _hmHistoryRegister(litElement) {
       if (declared != null && declared > 0) return Math.floor(declared);
 
       /* Undeclared: count the series that are reporting right now.  0 means
-         "nothing is known yet", which is answered as "no limit" below. */
+         "nothing is known yet", which is answered as "no limit" below.
+         `always` series (context lines) do not occupy a slot. */
       let reporting = 0;
-      pane.series.forEach((s, i) => {
+      let slot = 0;
+      for (const s of pane.series) {
+        if (s.always) continue;
         const live = this._hass.states[s.entity];
-        if (live && numOrNull(live.state) != null) reporting = i + 1;
-      });
+        if (live && numOrNull(live.state) != null) reporting = slot + 1;
+        slot += 1;
+      }
       return reporting > 0 ? reporting : null;
+    }
+
+    /**
+     * Is a `{entity, attribute}` condition true right now?
+     *
+     * `true` / `"true"` / `"on"` / `1` count as true; anything else - including
+     * a missing entity and a `null` attribute - is false.  The attribute is
+     * read when one is named, the state otherwise, so the same helper covers
+     * both "this flag is set" and "this entity says X".
+     */
+    _condition(cond) {
+      if (!cond || !this._hass) return false;
+      const entity = typeof cond === "string" ? cond : cond.entity;
+      if (!entity) return false;
+      const state = this._entityState(entity);
+      if (!state) return false;
+      const raw = !cond.attribute || typeof cond === "string"
+        ? state.state
+        : (state.attributes || {})[cond.attribute];
+      if (raw === true) return true;
+      if (typeof raw === "number") return raw === 1;
+      if (typeof raw === "string") {
+        const text = raw.trim().toLowerCase();
+        return text === "true" || text === "on" || text === "1";
+      }
+      return false;
+    }
+
+    /**
+     * The state of `id`, tolerant of a renamed device.
+     *
+     * Renaming a device in Home Assistant renames its entities too
+     * (`sensor.msa_…_energy_flow_today` becomes
+     * `sensor.g3_msa_…_energy_flow_today`), and the dashboard template can only
+     * guess the id from the serial.  The gate must not read that rename as "the
+     * device has no meter", so a missing id falls back to the longest unique
+     * object-id suffix - the same tolerance the battery card applies.  Only the
+     * gate pays this cost; the statistics query keeps the configured ids.
+     */
+    _entityState(id) {
+      if (!id || !this._hass) return null;
+      const states = this._hass.states;
+      const direct = states[id];
+      if (direct) return direct;
+      if (!this._alias) this._alias = new Map();
+      const cached = this._alias.get(id);
+      if (cached && states[cached]) return states[cached];
+      const wanted = String(id).split(".").pop();
+      let found = null;
+      for (const key of Object.keys(states)) {
+        const objectId = key.split(".").pop();
+        if (objectId === wanted || objectId.endsWith("_" + wanted)) {
+          found = key;
+          break;
+        }
+      }
+      if (found) {
+        this._alias.set(id, found);
+        return states[found];
+      }
+      this._alias.delete(id);
+      return null;
+    }
+
+    /**
+     * Whether a configured series belongs on this device.
+     *
+     * `while` / `unless` exist so the bundled template can carry both the
+     * combined grid-and-load curve and the split grid / load pair: a unit
+     * without a grid meter has no separate load measurement, a unit with one
+     * has, and the template is written once for both.  Unknown conditions
+     * resolve to "false", so `unless` wins before the first snapshot arrives -
+     * the combined curve is what a device that has not said anything yet used
+     * to show.
+     */
+    _seriesShown(series) {
+      if (!series) return true;
+      if (series.while && !this._condition(series.while)) return false;
+      if (series.unless && this._condition(series.unless)) return false;
+      return true;
+    }
+
+    /** Fingerprint of every series gate, so a capability change refetches. */
+    _gateSignature(pane) {
+      return (pane.series || [])
+        .map((s) => (this._seriesShown(s) ? "1" : "0"))
+        .join("");
     }
 
     /** Align every series on one time grid and compute the stacked layers. */
@@ -1246,13 +1630,31 @@ function _hmHistoryRegister(litElement) {
          `_hidden` stores the latter (it must survive a reload that drops a
          pack). */
       const skipEmpty = pane.skip_empty !== false;
+      /* Series gated by `while` / `unless` are dropped before anything else.
+         Each one is carried with its **config** index, because `_hidden` and the
+         legend store that index - re-numbering the surviving curves would make
+         a legend click hide its neighbour. */
+      const indexed = all
+        .map((s, i) => ({ s, i }))
+        .filter((entry) => this._seriesShown(entry.s));
+      /* `always` series are context, not one of the n pieces of hardware (the
+         device SOC line above the per-pack curves, for instance).  They neither
+         take up a slot for `count_entity` nor get dropped by it - counting them
+         made a one-pack unit lose its pack. */
+      const absent = new Set();
+      let slot = 0;
+      for (const entry of indexed) {
+        if (entry.s.always) continue;
+        if (limit != null && slot >= limit) absent.add(entry.i);
+        slot += 1;
+      }
       const kept = [];
       const srcIndex = [];
-      all.forEach((s, i) => {
+      indexed.forEach(({ s, i }) => {
         /* Positions past the real hardware count are not "empty", they are
            absent - the entity may well carry values from before the device was
            re-configured. */
-        if (limit != null && i >= limit) return;
+        if (absent.has(i)) return;
         const rows = result[s.entity];
         const hasData = Array.isArray(rows)
           && rows.some((row) => numOrNull(row.mean) != null);
@@ -1263,13 +1665,13 @@ function _hmHistoryRegister(litElement) {
       /* The series the device really has, before the "recorded nothing" filter.
          Used as the fallback below, so a quiet device still shows the curves of
          its actual hardware instead of every slot the template lists. */
-      const present = limit == null ? all : all.slice(0, limit);
+      const present = indexed.filter((entry) => !absent.has(entry.i));
       /* Never silently draw nothing: if every series is silent, keep the ones
          that exist so the "no statistics" path below can say so. */
-      const series = kept.length ? kept : present;
+      const series = kept.length ? kept : present.map((entry) => entry.s);
       const indexMap = kept.length
         ? srcIndex
-        : present.map((_, i) => i);
+        : present.map((entry) => entry.i);
 
       const timeSet = new Set();
       const bySeries = series.map((s) => {
@@ -1342,22 +1744,235 @@ function _hmHistoryRegister(litElement) {
     _toolbar() {
       const rangeOptions = RANGES.map((r) =>
         `<option value="${r.id}" ${r.id === this._range ? "selected" : ""}>${esc(this._t(r.en, r.zh))}</option>`).join("");
-      const inputType = this._range === "day" ? "date"
-        : this._range === "month" ? "month" : "number";
 
       return html`
         <div class="toolbar">
           <div class="nav">
             <button class="navbtn" title=${this._t("Previous", "上一个")}
               @click=${() => this._shiftRange(-1)}>‹</button>
-            <input type=${inputType} .value=${this._anchorValue()}
-              @change=${(e) => this._onAnchorChange(e)} />
+            ${this._range === "day" ? this._dayField() : html`
+              <input type=${this._range === "month" ? "month" : "number"}
+                .value=${this._anchorValue()} max=${this._maxAttr()}
+                @change=${(e) => this._onAnchorChange(e)} />`}
             <button class="navbtn" title=${this._t("Next", "下一个")}
-              @click=${() => this._shiftRange(1)}>›</button>
+              ?disabled=${this._atMax()} @click=${() => this._shiftRange(1)}>›</button>
           </div>
           <select @change=${(e) => this._onRangeChange(e)}>${this._untrusted(rangeOptions)}</select>
         </div>`;
     }
+
+    /* ---------------------------- day picker ---------------------------- */
+
+    /**
+     * The day field: a button showing the date, plus the calendar under it.
+     *
+     * The native `<input type="date">` was replaced for the *day* range only,
+     * because it cannot say which days actually have data: its calendar greys
+     * out nothing but the future, and every past day looks equally valid - so
+     * clicking a day the recorder purged opened a chart that only said "no
+     * statistics for this period". The card's own calendar knows the answer
+     * (see `_loadAvailability`) and draws those days grey, while days with real
+     * statistics keep the normal text colour.
+     *
+     * Month and year keep the native picker: they are typed more often than
+     * clicked, and there is no per-period data question worth showing there.
+     */
+    _dayField() {
+      return html`
+        <div class="dayhost">
+          <button class="daybtn" title=${this._t("Pick a day", "选择日期")}
+            @click=${() => this._toggleCalendar()}>${this._anchorValue()}</button>
+          ${this._calOpen ? this._calendar() : ""}
+        </div>`;
+    }
+
+    _toggleCalendar() {
+      this._calOpen = !this._calOpen;
+      if (this._calOpen) {
+        const a = this._anchor;
+        this._calMonth = new Date(a.getFullYear(), a.getMonth(), 1);
+        this._loadAvailability();
+      }
+      this.requestUpdate();
+    }
+
+    /** Locale used for the calendar's own labels (month name, weekdays). */
+    _locale() {
+      const lang = hmLang(this._hass, this._config);
+      if (lang === "zh") return "zh-CN";
+      if (lang === "de") return "de-DE";
+      return "en-GB";
+    }
+
+    _monthLabel(month) {
+      try {
+        return new Intl.DateTimeFormat(this._locale(), {
+          year: "numeric", month: "long",
+        }).format(month);
+      } catch (err) {
+        return `${month.getFullYear()}-${pad2(month.getMonth() + 1)}`;
+      }
+    }
+
+    /** Monday-first weekday initials, taken from the browser's own locale data. */
+    _weekdayLabels() {
+      const out = [];
+      /* 2024-01-01 was a Monday, so it is a stable base for a Monday-first row. */
+      for (let i = 0; i < 7; i += 1) {
+        const d = new Date(2024, 0, 1 + i);
+        try {
+          out.push(new Intl.DateTimeFormat(this._locale(), { weekday: "short" }).format(d));
+        } catch (err) {
+          out.push("MTWTFSS".charAt(i));
+        }
+      }
+      return out;
+    }
+
+    _shiftCalendar(step) {
+      const month = this._calMonth || this._anchor;
+      const next = new Date(month.getFullYear(), month.getMonth() + step, 1);
+      const today = this._today();
+      if (step > 0 && (next.getFullYear() > today.getFullYear()
+        || (next.getFullYear() === today.getFullYear() && next.getMonth() > today.getMonth()))) {
+        return;
+      }
+      this._calMonth = next;
+      this._loadAvailability();
+      this.requestUpdate();
+    }
+
+    _pickDay(date) {
+      if (date.getTime() > this._today().getTime()) return;
+      const same = this._anchor.getTime() === date.getTime();
+      this._calOpen = false;
+      if (same) {
+        this.requestUpdate();
+        return;
+      }
+      this._anchor = date;
+      this._reload();
+    }
+
+    /**
+     * Which days of the shown month have statistics.
+     *
+     * One `period: "day"` query for the whole month, cached per month: a bucket
+     * exists for every day the recorder had anything for, so a bucket with a
+     * `mean` is exactly "this day has data". Any failure (no recorder, a series
+     * that is not long-term statistics at all) leaves `_availDays` at `null`,
+     * which the calendar renders as "no opinion" - greying every day there would
+     * be a lie the integration cannot back up.
+     */
+    async _loadAvailability() {
+      const month = this._calMonth;
+      if (!month || !this._hass || typeof this._hass.callWS !== "function") return;
+      const key = `${month.getFullYear()}-${pad2(month.getMonth() + 1)}`;
+      if (this._availKey === key || this._availPending === key) return;
+
+      const ids = [...new Set(
+        (this._panes || []).flatMap((pane) => pane.series.map((s) => s.entity)).filter(Boolean),
+      )];
+      if (!ids.length) {
+        this._availKey = key;
+        this._availDays = null;
+        this.requestUpdate();
+        return;
+      }
+
+      this._availPending = key;
+      const start = new Date(month.getFullYear(), month.getMonth(), 1);
+      const end = new Date(month.getFullYear(), month.getMonth() + 1, 1);
+      try {
+        const rows = await this._hass.callWS({
+          type: "recorder/statistics_during_period",
+          start_time: start.toISOString(),
+          end_time: end.toISOString(),
+          statistic_ids: ids,
+          period: "day",
+          types: ["mean"],
+        });
+        const days = new Set();
+        for (const id of Object.keys(rows || {})) {
+          const list = rows[id];
+          if (!Array.isArray(list)) continue;
+          for (const row of list) {
+            if (!row || row.mean == null || row.start == null) continue;
+            const d = new Date(row.start);
+            days.add(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`);
+          }
+        }
+        this._availKey = key;
+        this._availDays = days;
+      } catch (err) {
+        this._availKey = key;
+        this._availDays = null;
+      } finally {
+        this._availPending = null;
+        this.requestUpdate();
+      }
+    }
+
+    _calendar() {
+      const today = this._today();
+      const month = this._calMonth
+        || new Date(this._anchor.getFullYear(), this._anchor.getMonth(), 1);
+      const year = month.getFullYear();
+      const mon = month.getMonth();
+      const lead = (new Date(year, mon, 1).getDay() + 6) % 7; // Monday-first
+      const count = new Date(year, mon + 1, 0).getDate();
+      const selKey = this._anchorValue();
+
+      const cells = [];
+      for (let i = 0; i < lead; i += 1) {
+        cells.push(html`<span class="cal-blank"></span>`);
+      }
+      for (let d = 1; d <= count; d += 1) {
+        const date = new Date(year, mon, d);
+        const key = `${year}-${pad2(mon + 1)}-${pad2(d)}`;
+        const future = date.getTime() > today.getTime();
+        /* `null` availability (unknown) marks nothing either way. */
+        const hasData = future || !this._availDays ? null : this._availDays.has(key);
+        const cls = [
+          "cal-day",
+          future ? "future" : "",
+          hasData === false ? "empty" : "",
+          hasData === true ? "has" : "",
+          date.getTime() === today.getTime() ? "today" : "",
+          key === selKey ? "sel" : "",
+        ].filter(Boolean).join(" ");
+        const title = future
+          ? this._t("This day has not happened yet", "这一天还没到")
+          : hasData === false
+            ? this._t("No statistics recorded", "该日没有统计数据")
+            : this._t("Statistics recorded", "该日有统计数据");
+        cells.push(html`
+          <button class=${cls} ?disabled=${future} title=${title}
+            @click=${() => this._pickDay(date)}>${d}</button>`);
+      }
+
+      const atNowMonth = year > today.getFullYear()
+        || (year === today.getFullYear() && mon >= today.getMonth());
+
+      return html`
+        <div class="cal" role="dialog">
+          <div class="cal-head">
+            <button class="cal-nav" @click=${(e) => { e.stopPropagation(); this._shiftCalendar(-1); }}>‹</button>
+            <span class="cal-month">${this._monthLabel(month)}</span>
+            <button class="cal-nav" ?disabled=${atNowMonth}
+              @click=${(e) => { e.stopPropagation(); this._shiftCalendar(1); }}>›</button>
+          </div>
+          <div class="cal-grid cal-week">
+            ${this._weekdayLabels().map((w) => html`<span class="cal-wd">${w}</span>`)}
+          </div>
+          <div class="cal-grid">${cells}</div>
+          <div class="cal-legend">
+            <span class="lg has"></span>${this._t("has data", "有数据")}
+            <span class="lg empty"></span>${this._t("no data", "无数据")}
+          </div>
+        </div>`;
+    }
+
 
     _paneBody(index) {
       if (this._error) return html`<div class="msg err">${this._error}</div>`;
@@ -1426,7 +2041,7 @@ function _hmHistoryRegister(litElement) {
               @click=${(e) => { e.stopPropagation(); this._toggleSeries(index, src); }}>
               <i class="dot" style="background:${off ? "transparent" : s.color};
                 border-color:${off ? s.color : "var(--card-background-color, #fff)"}"
-              ></i>${this._sName(s)}
+              ></i>${this._sName(s, pane)}
             </span>`;
           })}
         </div>`;
@@ -1801,7 +2416,7 @@ function _hmHistoryRegister(litElement) {
       const rows = data.values
         .map((vals, k) => ({
           color: data.series[k].color,
-          name: this._sName(data.series[k]),
+          name: this._sName(data.series[k], pane),
           value: vals[i],
           src: data.srcIndex && data.srcIndex[k] != null ? data.srcIndex[k] : k,
         }))
