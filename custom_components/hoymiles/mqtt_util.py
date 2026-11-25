@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -65,7 +66,35 @@ async def async_publish(
     """Publish a payload through the Home Assistant MQTT integration."""
     if mqtt is None:  # pragma: no cover
         raise RuntimeError("The MQTT integration is not available")
-    await mqtt.async_publish(hass, topic_str, dumps(payload), qos, retain)
+    text = dumps(payload)
+    _remember_own(topic_str, text)
+    await mqtt.async_publish(hass, topic_str, text, qos, retain)
+
+
+# ---------------------------------------------------------------------------
+# Echo detection
+# ---------------------------------------------------------------------------
+# Every publish this integration makes comes back to its own subscribers - the
+# broker echoes the message to whoever is listening, including us.  That is
+# fine for the device, but it makes "count the messages on this topic" wrong:
+# the virtual meter's own repeat would then drive the card's counter like a
+# clock.  Every publish therefore leaves a (topic, text, monotonic) mark here,
+# and a subscriber can tell an echo apart from someone else's message.
+_OWN_TTL_S: float = 5.0
+_own: dict[str, tuple[str, float]] = {}
+
+
+def _remember_own(topic_str: str, text: str) -> None:
+    _own[topic_str] = (text, time.monotonic())
+
+
+def is_own_publish(topic_str: str, text: str, ttl: float = _OWN_TTL_S) -> bool:
+    """Was ``text`` on ``topic_str`` published by this integration just now?"""
+    record = _own.get(topic_str)
+    if record is None:
+        return False
+    seen_text, seen_at = record
+    return seen_text == text and (time.monotonic() - seen_at) < ttl
 
 
 async def async_wait_for_message(

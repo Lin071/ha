@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ from .const import (
     CONF_DEV_ID,
     DOMAIN,
     FRONTEND_ASSETS,
+    FRONTEND_IMAGES,
     FRONTEND_URL,
     PLATFORMS,
 )
@@ -23,11 +25,15 @@ from .dashboard import (
     RESULT_EXISTS,
     RESULT_UPDATED,
     async_create_device_dashboard,
+    async_set_system_view,
     async_upgrade_dashboard_template,
 )
 from .discovery_override import FirmwareDiscoveryPatcher
 from .power_repeat import get_manager as get_repeat_manager
+from .power_repeat import get_topic_manager
+from .http_api import async_register as async_register_http_api
 from .services import async_setup_services
+from .ws_api import async_register as async_register_ws_api
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +63,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await _async_register_frontend(hass)
     await async_setup_services(hass)
+    # The sankey card asks for the archived past days over WebSocket rather than
+    # from an entity attribute - see ws_api.py.
+    async_register_ws_api(hass)
+    # The virtual meter is written by an external controller over plain HTTP,
+    # which cannot use either the WebSocket API or the MQTT broker - see
+    # http_api.py.
+    await async_register_http_api(hass)
     await _async_maybe_create_dashboard(hass, entry, dev_id)
     return True
 
@@ -69,11 +82,12 @@ async def _async_maybe_create_dashboard(
     Runs after ``async_forward_entry_setups`` because the dashboard references
     entity ids, which only exist once the platforms have been set up.
 
-    A dashboard that already exists is normally left alone, so user edits are
-    never overwritten on a restart.  The one exception is a dashboard that still
-    matches the exact content this integration generated for it: when the
-    bundled template has moved on it is rebuilt, which is what keeps every device
-    looking the same.  Editing the dashboard by hand opts it out for good.
+    The dashboard is a **template**: a dashboard that still has the layout the
+    bundled template draws is rebuilt when ``TEMPLATE_VERSION`` moves on, so a
+    release that adds a card reaches devices that already have a dashboard.
+    Only a dashboard carrying a view or a card type the template never generates
+    (a hand-added card, an extra tab) is treated as the user's own and left
+    alone - see ``dashboard.async_upgrade_dashboard_template``.
 
     Entries created before the config flow asked the question have no
     ``create_dashboard`` key at all.  They used to be skipped, which is why a
@@ -94,6 +108,33 @@ async def _async_maybe_create_dashboard(
             "Unable to create the dashboard for %s", dev_id, exc_info=True
         )
         return
+
+    # The System view is only for a unit that measures the system itself; a
+    # **slave** (§32 ``role``) has none of those readings, so the view is removed
+    # and put back when the unit is promoted.  This call also strips the
+    # always-false ``visible`` condition template v14/v15 left behind, which is
+    # why it runs on every setup rather than only on a template change - see
+    # ``dashboard.async_set_system_view``.
+    #
+    # ⚠️ The decision comes from the coordinator, **not** a hard-coded ``True``.
+    # The bundled template always contains the System view, and the block above
+    # may just have rewritten it (a template bump rebuilds the dashboard), so a
+    # hard-coded ``True`` put the tab straight back on a slave - and because the
+    # coordinator had already recorded the role, it never fired again.
+    keep = True
+    try:
+        coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get(
+            "coordinator"
+        )
+        if coordinator is not None:
+            keep = coordinator.system_view_keep
+    except Exception:  # noqa: BLE001 - never break the setup over a tab
+        _LOGGER.debug("Unable to read the role for %s", dev_id, exc_info=True)
+
+    try:
+        await async_set_system_view(hass, dev_id, keep)
+    except Exception:  # noqa: BLE001 - never break the setup over a tab
+        _LOGGER.debug("Unable to sync the System view for %s", dev_id, exc_info=True)
 
     if result in (RESULT_CREATED, RESULT_UPDATED):
         _LOGGER.info("Dashboard for %s: %s", dev_id, result)
@@ -119,6 +160,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # A running re-publish job for a device that is being removed would
             # keep talking to the broker forever, so it stops with the entry.
             await get_repeat_manager(hass).async_stop(entry_data["dev_id"])
+            await get_topic_manager(hass).async_stop(entry_data["dev_id"])
             entry_data["patcher"].async_shutdown()
             await entry_data["coordinator"].async_shutdown()
     return unloaded
@@ -152,28 +194,34 @@ async def _async_register_frontend(hass: HomeAssistant) -> None:
     assets: list[tuple[str, str, int]] = await hass.async_add_executor_job(
         _collect_assets, www_dir
     )
+    # Images live under the same URL but must never be injected as modules.
+    images: list[tuple[str, str, int]] = await hass.async_add_executor_job(
+        _collect_assets, www_dir, FRONTEND_IMAGES
+    )
 
     if not assets:
         _LOGGER.warning("No frontend assets found in %s, skipping frontend setup", www_dir)
         return
+
+    routes = assets + images
 
     http = getattr(hass, "http", None)
     if http is None:
         _LOGGER.debug("No HTTP component available, skipping static path registration")
         return
 
-    if not _register_asset_routes(http, assets):
+    if not _register_asset_routes(http, routes):
         # No aiohttp application to attach to (very old or unusual setup); fall
         # back to the helper, which at least serves the files.
         try:
             from homeassistant.components.http import StaticPathConfig  # noqa: PLC0415
 
             await http.async_register_static_paths(
-                [StaticPathConfig(url, path, cache_headers=False) for url, path, _v in assets]
+                [StaticPathConfig(url, path, cache_headers=False) for url, path, _v in routes]
             )
         except ImportError:
             # Home Assistant < 2024.7
-            for url, path, _v in assets:
+            for url, path, _v in routes:
                 http.register_static_path(url, path, False)
         except Exception:  # noqa: BLE001 - never break setup because of the cards
             _LOGGER.warning("Unable to serve the Hoymiles frontend cards", exc_info=True)
@@ -220,14 +268,16 @@ def _register_asset_routes(http: Any, assets: list[tuple[str, str, int]]) -> boo
     return True
 
 
-def _collect_assets(www_dir: Path) -> list[tuple[str, str, int]]:
+def _collect_assets(
+    www_dir: Path, filenames: Sequence[str] = FRONTEND_ASSETS
+) -> list[tuple[str, str, int]]:
     """Return ``(url, path, version)`` for every bundled asset that exists.
 
     Touches the file system, so it must be called through
     ``hass.async_add_executor_job`` rather than from the event loop.
     """
     assets: list[tuple[str, str, int]] = []
-    for filename in FRONTEND_ASSETS:
+    for filename in filenames:
         asset_path = www_dir / filename
         if not asset_path.is_file():
             _LOGGER.warning("Bundled frontend asset %s is missing, skipping", asset_path)

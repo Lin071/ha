@@ -61,6 +61,14 @@ All patched payloads
       ``payload_not_available``.  ``coordinator.py`` keeps that topic in sync
       with the data it receives, so the firmware entities turn ``unavailable``
       when the device stops pushing data instead of showing a stale value.
+    * **role gated objects** (``FIRMWARE_ROLE_GATED``) get a second availability
+      entry pointing at a role topic instead: §7-§12, §15-§26 and §39 are
+      主机和单机 (or, for the per-phase ceiling, 仅多相主机).  ``coordinator.py``
+      publishes ``offline`` on that topic when the unit reports ``role: slave``,
+      which turns the entity unavailable - the only way to disable a discovery
+      entity this integration does not own.  Both entries use the list form with
+      ``availability_mode: all``, because a scalar ``availability_topic`` cannot
+      be combined with the list.
 """
 
 from __future__ import annotations
@@ -78,12 +86,20 @@ from .const import (
     DISCOVERY_PREFIX,
     DOMAIN,
     FIRMWARE_DISCOVERY_TOPICS,
+    FIRMWARE_ROLE_GATED,
     LEGACY_DISCOVERY_OBJECTS,
     PAYLOAD_AVAILABLE,
     PAYLOAD_NOT_AVAILABLE,
+    ROLE_MASTER_ONLY,
+    ROLE_MASTER_SINGLE,
+    ROLE_MULTIPHASE_MASTER,
     T_AVAILABILITY,
     T_EMS_MODE_STATE,
+    T_MASTER_AVAILABILITY,
+    T_PHASE_AVAILABILITY,
+    T_ROLE_AVAILABILITY,
     T_SWITCH_SET,
+    ems_modes_for_role,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -96,6 +112,55 @@ PHASE_COMMAND_TEMPLATE = (
 
 # A patch returns True when it modified the payload.
 PatchFn = Callable[[str, dict[str, Any]], bool]
+
+# ---------------------------------------------------------------------------
+# Capability discovery
+# ---------------------------------------------------------------------------
+# V0.6.2 does not describe the device's feature set anywhere except in the
+# discovery configs it publishes: a unit with no battery fan simply never
+# publishes ``fan_mode/config``, and one without a PV limit never publishes
+# ``pv_power/config``.  Treating the set of config topics that arrived as the
+# capability list is therefore exact, and it keeps working for models that do
+# not exist yet - unlike a hard-coded model table.
+#
+# Keys are the discovery object name, e.g. ``fan_mode``.
+CapabilityListener = Callable[[frozenset[str]], None]
+
+# Discovery objects whose firmware entity is replaced by integration entities.
+#
+# V0.6.2 published one config per control, whose command topic took an object:
+#   soc_limit/set  -> {"soc_h": 100, "soc_l": 10}
+#   fan_speed/set  -> {"pcs": 5, "bat": 5}
+# A Home Assistant ``number`` entity can only publish one scalar, so the
+# firmware's own entity sent ``100`` / ``5`` and the firmware's JSON parser then
+# found no ``soc_h`` / ``pcs`` key and dropped the command.
+#
+# V0.6.4 removed those topics: the cut-offs are two scalar numbers (§33 - §36),
+# and the fan / heater / fine block are described by a ``meta`` topic with one
+# ``set`` topic taking an object (§37 - §42).  Any retained config still on the
+# broker for the old objects is therefore deleted, and their entities are
+# created by number.py / select.py / switch.py instead.
+SUPERSEDED_DISCOVERY_OBJECTS: tuple[str, ...] = (
+    "number/{dev_id}/soc_limit",
+    "number/{dev_id}/fan_speed",
+    "select/{dev_id}/fan_mode",
+    "number/{dev_id}/heat_power",
+    "number/{dev_id}/pv_power",
+    # V0.6.5 §11: the virtual meter stopped being a firmware entity.  The unit
+    # now describes it with ``homeassistant/<dev_id>/meter_ctrl/meta`` and the
+    # integration creates the three numbers itself (``number.py``), because one
+    # ``number`` entity could never carry ``power`` *and* the two cumulative
+    # energy readings behind one object-taking ``set`` topic.  The retained
+    # ``number/<dev_id>/meter_ctrl/config`` from older firmware is deleted, or
+    # Home Assistant keeps a dead fifth entity next to the three real ones.
+    "number/{dev_id}/meter_ctrl",
+    # V0.6.7 §29/§30: the feed-in ceiling stopped being a scalar firmware entity.
+    # It is now a ``meta`` group with an ``enable`` switch and a limit behind one
+    # object-taking ``set`` topic, so the entities are created by number.py /
+    # switch.py.  The old ``number/<dev_id>/feed_power/config`` (whose scalar
+    # command the new firmware would parse as a broken object) is deleted.
+    "number/{dev_id}/feed_power",
+)
 
 
 def _patch_switch(dev_id: str, payload: dict[str, Any]) -> bool:
@@ -121,6 +186,27 @@ def _patch_ems_mode(dev_id: str, payload: dict[str, Any]) -> bool:
         return False
 
     payload["state_topic"] = T_EMS_MODE_STATE.format(dev_id=dev_id)
+    return True
+
+
+def _filter_ems_options(payload: dict[str, Any], allowed: tuple[str, ...],
+                        full: list[str]) -> bool:
+    """Narrow the EMS picker to the modes this role may select.
+
+    ``full`` is the option list the firmware published before any filtering, so
+    leaving ``slave`` restores every mode instead of only re-adding the ones the
+    previous pass kept.
+    """
+    options = payload.get("options")
+    if not isinstance(options, list) or not options:
+        return False
+
+    source = full or [str(option) for option in options]
+    wanted = [option for option in source if option in allowed]
+    if not wanted or wanted == options:
+        return False
+
+    payload["options"] = wanted
     return True
 
 
@@ -159,6 +245,141 @@ def _patch_availability(dev_id: str, payload: dict[str, Any]) -> bool:
     payload["payload_available"] = PAYLOAD_AVAILABLE
     payload["payload_not_available"] = PAYLOAD_NOT_AVAILABLE
     return True
+
+
+# Availability entries are matched by topic, so a stale entry with the wrong
+# payload strings is still treated as "already there".
+def _entry_topic(entry: Any) -> str | None:
+    if isinstance(entry, dict):
+        topic = entry.get("topic") or entry.get("availability_topic")
+        return topic if isinstance(topic, str) else None
+    return None
+
+
+def _role_availability_topics(dev_id: str, scope: str) -> list[tuple[str, str]]:
+    """Topics that must be online for a role gated discovery object.
+
+    Each scope has its own topic, published by the coordinator: ``master_only``
+    (V0.6.6 §29/§30) is the strictest and excludes a stand-alone unit too, so it
+    cannot use the ``role_availability`` topic that means "master or single".
+    """
+    if scope == ROLE_MULTIPHASE_MASTER:
+        return [(T_PHASE_AVAILABILITY.format(dev_id=dev_id), ROLE_MULTIPHASE_MASTER)]
+    if scope == ROLE_MASTER_ONLY:
+        return [(T_MASTER_AVAILABILITY.format(dev_id=dev_id), ROLE_MASTER_ONLY)]
+    return [(T_ROLE_AVAILABILITY.format(dev_id=dev_id), ROLE_MASTER_SINGLE)]
+
+
+def _patch_role_availability(
+    dev_id: str, path: str, payload: dict[str, Any]
+) -> bool:
+    """Gate a firmware entity on the role the unit reports.
+
+    §7-§12, §15-§26 and §39 are 主机和单机 (or 仅多相主机): a **slave** must not
+    be offered them.  The entities live in the firmware's own MQTT discovery
+    payloads, which this integration cannot make `available` from Python, but it
+    can extend the payload - ``availability`` accepts a list, and the entity is
+    unavailable unless **every** entry (``availability_mode: all``) says online.
+
+    The list form cannot be combined with ``availability_topic``, so the scalar
+    form ``_patch_availability`` just added is folded into the first entry.
+    """
+    scope = None
+    for template, template_scope in FIRMWARE_ROLE_GATED.items():
+        if template.format(dev_id=dev_id) == path:
+            scope = template_scope
+            break
+    if scope is None:
+        # Not gated any more (``ems_mode`` moved to option filtering): drop a
+        # role entry an earlier build appended, or the entity would stay
+        # ``unavailable`` on a slave for ever.
+        return _strip_role_availability(dev_id, payload)
+
+    wanted = _role_availability_topics(dev_id, scope)
+    offline = PAYLOAD_NOT_AVAILABLE
+
+    entries: list[dict[str, Any]] = []
+    entries.extend(
+        {
+            "topic": topic,
+            "payload_available": PAYLOAD_AVAILABLE,
+            "payload_not_available": offline,
+        }
+        for topic, _scope in wanted
+    )
+
+    existing = payload.get("availability")
+    if isinstance(existing, list) and existing:
+        present = {_entry_topic(entry) for entry in existing}
+        if all(topic in present for topic, _scope in wanted) and \
+                payload.get("availability_mode") == "all":
+            return False
+        merged = [entry for entry in existing if isinstance(entry, dict)]
+        for topic, _scope in wanted:
+            if topic not in present:
+                merged.append({
+                    "topic": topic,
+                    "payload_available": PAYLOAD_AVAILABLE,
+                    "payload_not_available": offline,
+                })
+        payload["availability"] = merged
+        payload["availability_mode"] = "all"
+        payload.pop("availability_topic", None)
+        payload.pop("payload_available", None)
+        payload.pop("payload_not_available", None)
+        return True
+
+    # Scalar form: move it into the list so the role topic can be appended.
+    base_topic = payload.get("availability_topic") or T_AVAILABILITY.format(
+        dev_id=dev_id
+    )
+    entries.insert(0, {
+        "topic": base_topic,
+        "payload_available": payload.get("payload_available") or PAYLOAD_AVAILABLE,
+        "payload_not_available": payload.get("payload_not_available") or offline,
+    })
+
+    payload["availability"] = entries
+    payload["availability_mode"] = "all"
+    payload.pop("availability_topic", None)
+    payload.pop("payload_available", None)
+    payload.pop("payload_not_available", None)
+    return True
+
+def _strip_role_availability(dev_id: str, payload: dict[str, Any]) -> bool:
+    """Remove the role topics from an ``availability`` list.
+
+    Used when an object stops being role gated (the EMS mode select is now
+    filtered by *options* instead of being switched off), so a payload written by
+    an earlier build does not keep the entity unavailable on a slave.
+    """
+    existing = payload.get("availability")
+    if not isinstance(existing, list) or not existing:
+        return False
+
+    role_topics = {
+        T_ROLE_AVAILABILITY.format(dev_id=dev_id),
+        T_PHASE_AVAILABILITY.format(dev_id=dev_id),
+        T_MASTER_AVAILABILITY.format(dev_id=dev_id),
+    }
+    kept = [entry for entry in existing if _entry_topic(entry) not in role_topics]
+    if len(kept) == len(existing):
+        return False
+
+    if kept:
+        payload["availability"] = kept
+        payload["availability_mode"] = "all"
+    else:
+        # Everything was ours: fall back to the plain device availability.
+        payload["availability"] = [{
+            "topic": T_AVAILABILITY.format(dev_id=dev_id),
+            "payload_available": PAYLOAD_AVAILABLE,
+            "payload_not_available": PAYLOAD_NOT_AVAILABLE,
+        }]
+        payload["availability_mode"] = "all"
+    return True
+
+
 def _managed_patches(dev_id: str) -> dict[str, PatchFn]:
     """Discovery object paths (``<component>/<node>/<object>``) we manage."""
     return {
@@ -170,12 +391,19 @@ def _managed_patches(dev_id: str) -> dict[str, PatchFn]:
         f"number/{dev_id}/power_ctrl": _patch_plain,
         f"number/{dev_id}/output_power": _patch_plain,
         f"button/{dev_id}/reboot": _patch_plain,
+        # V0.6.4 scalar controls.  Their payloads are already correct (scalar,
+        # or a state template pointing at the state event), so they only need
+        # the availability topic that makes them go unavailable with the device.
+        f"number/{dev_id}/soc_h_limit": _patch_plain,
+        f"number/{dev_id}/soc_l_limit": _patch_plain,
+        f"number/{dev_id}/input_power": _patch_plain,
     }
 
 
 def _removed_objects(dev_id: str) -> frozenset[str]:
     """Discovery object paths that are stale and must be deleted."""
-    return frozenset(obj.format(dev_id=dev_id) for obj in LEGACY_DISCOVERY_OBJECTS)
+    stale = list(LEGACY_DISCOVERY_OBJECTS) + list(SUPERSEDED_DISCOVERY_OBJECTS)
+    return frozenset(obj.format(dev_id=dev_id) for obj in stale)
 
 
 def _object_path(topic: str) -> str | None:
@@ -210,6 +438,66 @@ class FirmwareDiscoveryPatcher:
         # "claim" while it is being applied).  Used to avoid re-applying the
         # same value on every single discovery message.
         self._model: str | None = None
+        # Optional discovery objects this device announced, see the note above
+        # ``SUPERSEDED_DISCOVERY_OBJECTS``.
+        self._capabilities: set[str] = set()
+        self._capability_listeners: list[CapabilityListener] = []
+        # The role the device reports (§32 ``role``), set by the coordinator.
+        # ``None`` leaves every role dependent choice wide open, which is the safe
+        # direction right after a restart.
+        self._role: str | None = None
+        # The last payload this class published for each managed topic, so a role
+        # change can re-run the role filters without waiting for the firmware to
+        # republish its config.
+        self._payloads: dict[str, dict[str, Any]] = {}
+        # The EMS option list **before** any role filtering.  Filtering is
+        # lossy, so it has to be applied to the original list every time - a
+        # slave that is promoted again must get all five modes back.
+        self._ems_options_full: list[str] = []
+
+    # ------------------------------------------------------------------
+    # capabilities
+    # ------------------------------------------------------------------
+    @property
+    def capabilities(self) -> frozenset[str]:
+        """Discovery objects this device announced (``fan_mode``, ...)."""
+        return frozenset(self._capabilities)
+
+    @callback
+    def async_add_capability_listener(self, listener: CapabilityListener) -> Callable[[], None]:
+        """Call ``listener`` with the full set whenever a new object appears.
+
+        The listener is invoked immediately with what is known so far, so a
+        platform that starts after the retained configs have already arrived
+        still sees them.
+        """
+        self._capability_listeners.append(listener)
+        listener(frozenset(self._capabilities))
+
+        @callback
+        def _remove() -> None:
+            if listener in self._capability_listeners:
+                self._capability_listeners.remove(listener)
+
+        return _remove
+
+    @callback
+    def _record_capability(self, path: str) -> None:
+        """Remember one announced discovery object and notify the listeners.
+
+        Deleted (superseded / legacy) objects never reach here, because they are
+        handled before the capability bookkeeping.
+        """
+        parts = path.split("/")
+        if len(parts) < 3:
+            return
+        name = parts[-1]
+        if name in self._capabilities:
+            return
+        self._capabilities.add(name)
+        snapshot = frozenset(self._capabilities)
+        for listener in list(self._capability_listeners):
+            listener(snapshot)
 
     async def async_setup(self) -> None:
         """Subscribe to the discovery topics of this device.
@@ -252,8 +540,17 @@ class FirmwareDiscoveryPatcher:
             return
 
         if path in self._removed:
+            # Still recorded: a superseded object (``soc_limit``, ``fan_speed``)
+            # proves the device *has* that feature, it just cannot express it
+            # through a scalar.  The integration entities are gated on it.
+            self._record_capability(path)
             self.hass.async_create_task(self._async_remove(msg.topic))
             return
+
+        # Every config that describes something this device really has is
+        # recorded before the payload is parsed - a config we cannot parse is
+        # still proof that the feature exists.
+        self._record_capability(path)
 
         patch = self._patches.get(path)
         if patch is None:
@@ -277,12 +574,66 @@ class FirmwareDiscoveryPatcher:
         # Both patches must run - no short circuit, they touch different keys.
         changed = patch(self.dev_id, payload)
         changed = _patch_availability(self.dev_id, payload) or changed
+        # §7-§26: some of these entities only exist for a master or a
+        # stand-alone unit.  Adding the role topic as a second availability
+        # entry is what turns them off on a slave.
+        changed = _patch_role_availability(self.dev_id, path, payload) or changed
+        # The EMS picker stays available on a slave; its *options* are narrowed
+        # to the modes that role may actually select.
+        changed = self._apply_role_filters(path, payload) or changed
+
+        # Remember what this build would publish, so a later role change can
+        # rewrite the payload without waiting for the firmware to repeat it.
+        self._payloads[msg.topic] = dict(payload)
+
         if not changed:
             # Already compliant, or this is the echo of our own correction.
             return
 
         rendered = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
         self.hass.async_create_task(self._async_republish(msg.topic, rendered))
+
+    # ------------------------------------------------------------------
+    # role dependent filtering
+    # ------------------------------------------------------------------
+    @callback
+    def set_role(self, role: str | None) -> None:
+        """Re-apply the role filters to every payload we already know.
+
+        Called by the coordinator when ``event/state`` reports a new ``role``.
+        Without it the EMS option list would keep whatever it was when the config
+        payload first arrived - a unit promoted from ``slave`` to ``master``
+        would stay locked to two modes until the firmware republished.
+        """
+        if self._role == role:
+            return
+        self._role = role
+
+        for topic, stored in list(self._payloads.items()):
+            path = _object_path(topic)
+            if path is None:
+                continue
+            payload = dict(stored)
+            if not self._apply_role_filters(path, payload):
+                continue
+            self._payloads[topic] = payload
+            rendered = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+            self.hass.async_create_task(self._async_republish(topic, rendered))
+
+    def _apply_role_filters(self, path: str, payload: dict[str, Any]) -> bool:
+        """Apply the role rules that are not expressed as availability."""
+        if path != f"select/{self.dev_id}/ems_mode":
+            return False
+
+        options = payload.get("options")
+        if isinstance(options, list):
+            # Keep the widest list ever seen: filtering is lossy, and a promoted
+            # unit has to get the modes back.
+            if len(options) > len(self._ems_options_full):
+                self._ems_options_full = [str(option) for option in options]
+
+        allowed = ems_modes_for_role(self._role)
+        return _filter_ems_options(payload, allowed, self._ems_options_full)
 
     @callback
     def _maybe_backfill_model(self, payload: dict[str, Any]) -> None:
@@ -327,6 +678,19 @@ class FirmwareDiscoveryPatcher:
                 if entry.model != model:
                     registry.async_update_device(entry.id, model=model)
                     _LOGGER.info("Set model %r for device %s", model, self.dev_id)
+                # The model decides what the dashboard may draw - an AC coupled
+                # unit has no PV branch at all - so the generated layout has to
+                # be re-checked now that the model is known.  The call is a no-op
+                # when the dashboard already matches what the template draws.
+                try:
+                    from .dashboard import async_upgrade_dashboard_template  # noqa: PLC0415
+
+                    await async_upgrade_dashboard_template(self.hass, self.dev_id)
+                except Exception:  # noqa: BLE001 - never break the setup path
+                    _LOGGER.debug(
+                        "Unable to refresh the dashboard after learning the model",
+                        exc_info=True,
+                    )
                 return
             await asyncio.sleep(1.0)
 
@@ -365,5 +729,6 @@ class FirmwareDiscoveryPatcher:
 
 __all__ = [
     "PHASE_COMMAND_TEMPLATE",
+    "SUPERSEDED_DISCOVERY_OBJECTS",
     "FirmwareDiscoveryPatcher",
 ]
