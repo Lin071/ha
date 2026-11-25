@@ -14,9 +14,6 @@
  *   - the unit itself is drawn like the product photos: one body with a
  *     single light-to-dark gradient, thin seams between the modules, and a
  *     dark head carrying the status display (signal, battery, SOC);
- *   - the dark head module (the BMS / PCS "host" unit) is the host
- *     temperature — the average of the installed packs, because the head has
- *     no temperature sensor of its own;
  *   - PV / grid-on / battery / grid-off powers frame the picture;
  *   - an optional history section plots the pack SOC and the charged /
  *     discharged energy for 日 / 月 / 年 / 总 (from long term statistics).
@@ -30,9 +27,8 @@
  *   show_title: false            # optional, hide the header title
  *   language: en                 # optional (en|zh|de); omit to follow Home Assistant
  *   show_history: true           # optional (default true)
- *   show_host_temp: false        # optional, hide the head unit temperature
  *   max_width: 560               # optional px for the illustration
- *   alarm_entity: binary_sensor.x # optional, shows a bell when "on"
+ *   alarm_entity: binary_sensor.x # optional, overrides the alarm badge source
  *   entities:                    # optional entity id overrides
  *     pack_count: sensor.my_pack_count
  *     pv: sensor.my_pv_power
@@ -75,6 +71,14 @@ function _hmBatteryRegister() {
   const T_DE = {
     "Battery": "Batterie",
     "Battery ": "Batterie ",
+    "Active alarms": "Aktive Alarme",
+    "No active alarms": "Keine aktiven Alarme",
+    "Wi-Fi signal": "WLAN-Signal",
+    "Excellent": "Sehr gut",
+    "Good": "Gut",
+    "Fair": "Mäßig",
+    "Weak": "Schwach",
+    "No signal": "Kein Signal",
     "Host": "Hauptgerät",
     "PV": "PV",
     "Grid port": "Netzanschluss",
@@ -106,9 +110,11 @@ function _hmBatteryRegister() {
    * on any card switches every card on the page at once, and the choice
    * survives a reload.
    *
-   * English is the default.  It deliberately does NOT follow the Home
-   * Assistant UI language any more: a dashboard is often shared, and the point
-   * of the dropdown is that the reader decides.
+   * The order is: the reader's own pick, then `language:` on the card, then the
+   * Home Assistant UI language, then English.  Following the UI language is
+   * what makes an unconfigured card match the page it sits on - the earlier
+   * "English unless picked" rule left the cards as the only English thing on a
+   * Chinese dashboard.
    * ------------------------------------------------------------------ */
   const LANG_KEY = "hoymiles.language";
   const LANG_EVENT = "hoymiles-language";
@@ -135,7 +141,12 @@ function _hmBatteryRegister() {
   }
 
   function hmLang(hass, config) {
-    return hmStored() || hmNormalise(config && config.language) || "en";
+    const locale = hass && hass.locale;
+    const ui = (locale && locale.language) || (hass && hass.language);
+    return hmStored()
+      || hmNormalise(config && config.language)
+      || hmNormalise(ui)
+      || "en";
   }
 
   /**
@@ -193,6 +204,27 @@ function _hmBatteryRegister() {
   const VB_W = 620;
   const PACK_MAX = 4;
 
+  /* Entity ids the firmware names differently from the protocol field.
+   *
+   * `bat_p` (§43) is published with the name "Battery Power" by the newer
+   * firmware and with "Bat Power" by the older one, so the entity id that comes
+   * out of MQTT discovery is `…_battery_power` on one unit and `…_bat_power` on
+   * another - the same value under two ids.  The dashboards' chart series
+   * already carry this alias (`dashboard._ENTITY_SUFFIX_ALIASES`); the card
+   * needs it as well, or the head readout of a unit that chose the long name
+   * silently falls back to 0 W.
+   */
+  const SUFFIX_ALIASES = {
+    bat_power: ["battery_power"],
+    battery_power: ["bat_power"],
+  };
+
+  /* Models built as one wide box rather than a head plus battery modules.
+     Matched case-insensitively, the same way ``const.MODELS_WITHOUT_PV`` does
+     on the Python side.  The 1920 AC is the second generation of the AC
+     coupled unit and the only one of these so far. */
+  const FLAT_CHASSIS = ["hibattery 1920 ac"];
+
   const TOP_H = 66;      // dark head module (BMS / PCS)
   const MOD_H = 158;     // one battery module
   const HEAD_TOP = 96;   // y of the top of the stack
@@ -200,6 +232,135 @@ function _hmBatteryRegister() {
   const FRONT_X = 130;   // x of the left edge of the front face
   const CALLOUT_W = 140;
   const CALLOUT_H = 54;
+  /* A pack that is heating (or waiting to) grows its callout by one row: the
+     pill has to sit somewhere, and widening the callout instead would push it
+     over the module it points at.  MOD_H is 158, so a 72 px callout still leaves
+     clear space between two neighbours. */
+  const CALLOUT_H_HEAT = 72;
+
+  /* Amber, the colour every heater in this integration uses (see the control
+     card's flame). Kept as constants so the pill, its dot and its text cannot
+     drift apart.  The requests share one colour - they describe the same thing
+     ("this pack is cold"), and it is the arrow that says which way the energy
+     wants to go; a second colour only made the diagram louder. */
+  const HEAT_INK = "#FBBF24";
+  const HEAT_FILL = "rgba(245,158,11,0.26)";
+  const HEAT_LINE = "rgba(245,158,11,0.62)";
+  /* Ice, not sky blue: the requests are about a pack that is too cold, and a
+     pale frozen cyan reads as "cold" where the saturated blue read as "link".
+     Light enough to glow on the dark callout, and it keeps the snowflake and
+     the label on the same ink, so the pill reads as one object. */
+  const COLD_INK = "#BAE6FD";        // charge and discharge requests alike
+  const COLD_LINE = "rgba(186,230,253,0.5)";
+
+  /**
+   * The three *active* heating states of §32 `packs[].heat`.
+   *
+   * `idle` is deliberately absent: a pack with nothing to do keeps the plain
+   * callout, which is what "空闲保持默认" means.
+   *
+   * `heating` keeps the heater glyph - the heater really is running.  The two
+   * requests do not show a heater at all: what they report is **a pack that is
+   * too cold**, so they show a snowflake in the ice colour.  One glyph, one
+   * colour, two labels: an arrow on top of that said the same thing twice and
+   * cluttered a pill this small - which direction the energy waits for is what
+   * the words "charge" / "discharge" already say.  The fill still separates the
+   * two situations: filled = running now, outline = still waiting.
+   */
+  const HEAT_KINDS = {
+    heating: {
+      en: "Heating", zh: "加热中", lit: true, req: false, icon: "heat",
+      ink: HEAT_INK, line: HEAT_LINE,
+      whyEn: "The heater is on now; nothing is waiting for it.",
+      whyZh: "正在加热，没有等待中的动作。",
+    },
+    chg_req: {
+      en: "Charge heat", zh: "充电加热请求", lit: false, req: true,
+      icon: "snow", ink: COLD_INK, line: COLD_LINE,
+      whyEn: "Too cold to charge - heat the pack up first.",
+      whyZh: "温度偏低，需要先加热才能充电。",
+    },
+    dchg_req: {
+      en: "Discharge heat", zh: "放电加热请求", lit: false, req: true,
+      icon: "snow", ink: COLD_INK, line: COLD_LINE,
+      whyEn: "Too cold to discharge - heat the pack up first.",
+      whyZh: "温度偏低，需要先加热才能放电。",
+    },
+  };
+
+  /**
+   * The classic six fold snowflake, as the inside of a 15 x 15 box.
+   *
+   * Six spokes, each carrying a V of two branches in its outer third - the
+   * crystal everyone draws.  One arm is written out and rotated every 60
+   * degrees, which is also why it stays symmetric to the sub-pixel.
+   *
+   * Strokes, not a filled silhouette: the two earlier attempts (a hand drawn
+   * asterisk, then `mdi:snowflake`) both filled a six pointed star, and at
+   * roughly 14 px on screen a filled star is read as `*`, not as snow.  Thin
+   * branched lines are what the eye recognises, even this small.
+   */
+  const SNOW_ARM = "M7.5 7.5V1.3M7.5 3.3 8.85 1.69M7.5 3.3 6.15 1.69";
+  function snowflakeArms() {
+    let out = "";
+    for (let a = 0; a < 360; a += 60) {
+      out += `<g transform="rotate(${a} 7.5 7.5)"><path d="${SNOW_ARM}"/></g>`;
+    }
+    return out;
+  }
+
+  /**
+   * One heating pill inside a pack callout, at `x` (left) and `y` (top).
+   *
+   * `label` is the already-localised state name and `hint` the one-line reason
+   * (shown as an SVG title); both are resolved by the caller because this runs
+   * outside the element and has no `_t`.
+   */
+  function heatPill(x, y, kind, label, hint) {
+    const text = label || kind.zh;
+    /* The glyph slot is 15 units wide plus a 4 unit gap, and the width follows.
+       The estimate is per script (a CJK glyph is about 11.9 units wide at 12 px,
+       a Latin one about 6.4), and the result is clamped to the callout: an
+       English label is long enough to overflow a 140 px callout otherwise, and a
+       pill sticking out of its own callout is worse than a slightly compressed
+       word. */
+    const gap = 25;
+    const per = /[\u3000-\u9fff\uff00-\uffef]/.test(text) ? 11.9 : 6.4;
+    const maxW = CALLOUT_W - 24;
+    let w = gap + text.length * per + 6;
+    let fit = "";
+    if (w > maxW) {
+      w = maxW;
+      fit = ` textLength="${(w - gap - 4).toFixed(1)}"`
+        + " lengthAdjust=\"spacingAndGlyphs\"";
+    }
+    const h = 22;
+    /* The heater glyph: a base line with three vertical wave lines rising off
+       it - heat leaving a radiator, the way every appliance UI draws it.  Drawn
+       as strokes rather than an emoji so it looks the same on every platform;
+       the `q`/`t` pairs make each line a proper sine, not a zig-zag. */
+    const waves = `<g stroke="${kind.ink}" stroke-width="1.5" fill="none"
+        stroke-linecap="round" stroke-linejoin="round">
+        <path d="M0.8 11.8H10.2"/>
+        <path d="M2.4 8.9q-1.15-1.15 0-2.3t0-2.3t0-2.3"/>
+        <path d="M5.6 8.9q-1.15-1.15 0-2.3t0-2.3t0-2.3"/>
+        <path d="M8.8 8.9q-1.15-1.15 0-2.3t0-2.3t0-2.3"/>
+      </g>`;
+    /* The snowflake: one shared drawing, stroked in the ice colour, in a 15 unit
+       box - the label sits right after it. */
+    const snow = `<g stroke="${kind.ink}" stroke-width="1.2" fill="none"
+        stroke-linecap="round" stroke-linejoin="round">${snowflakeArms()}</g>`;
+    const glyph = kind.icon === "snow" ? snow : waves;
+    const why = hint ? `<title>${esc(hint)}</title>` : "";
+    return `<g class="bat-heat">${why}
+      <rect x="${x}" y="${y}" width="${w}" height="${h}" rx="9"
+        fill="${kind.lit ? HEAT_FILL : "none"}"
+        stroke="${kind.line}" stroke-width="1"/>
+      <g transform="translate(${x + 6} ${y + 3.5})">${glyph}</g>
+      <text x="${x + gap}" y="${y + 15.6}" font-size="12" font-weight="600"${fit}
+        fill="${kind.ink}">${esc(text)}</text>
+    </g>`;
+  }
   const LEFT_BOX_X = 2;
   /* Right edge of a right hand callout.  Inset from the viewBox edge so the
      off-grid connector's vertical (at VB_W - 30) can run past the labels
@@ -209,6 +370,46 @@ function _hmBatteryRegister() {
   const LEFT_DOT_X = FRONT_X + FRONT_W * 0.40;
   const RIGHT_DOT_X = FRONT_X + FRONT_W * 0.62;
   const DOT_COLOR = "#22c55e";
+
+  /* ------------------------------------------------------------------ *
+   * Fan speed indicators
+   *
+   * Two fans, each bolted to the part it cools: the PCS fan against the head's
+   * right face (the PCS lives there), the battery fan at the lower-left corner
+   * of the first module.  They are not captioned - sitting on the part IS the
+   * label, and a caption in the margin read as a corner readout instead of as
+   * hardware.  The name survives in the `title` tooltip.
+   *
+   * The rotor is five swept blades, the same shape the control card's fan card
+   * uses: at this size three blades read as a pinwheel and six blur into a
+   * disc.  Black on a light card, with the rounded-square frame the vendor app
+   * puts around it.
+   *
+   * Levels come from `fan_actual` (§32): 0..10, and **255** means "this fan is
+   * not fitted / not enabled".  Anything outside the range means the indicator
+   * is left out entirely - printing 255 would claim a fan running at 25x full
+   * speed.  The speed is linear in the level (`FAN_DPS_PER_LEVEL` degrees per
+   * second), so a higher level visibly spins faster; level 0 is a still rotor.
+   * ------------------------------------------------------------------ */
+  const FAN_LEVEL_MAX = 10;
+  const FAN_DPS_PER_LEVEL = 70;           // degrees per second at level 1
+  const FAN_SIZE = 30;                    // frame size, user units
+  const FAN_BLADE =
+    "M-0.53-2.14C-1.5-4.6-2.4-6.6-2.84-7.8C-0.53-8.64 2.03-8.42 4.15-7.19"
+    + "C3.5-5.4 2-2.9 0.96-1.98Z";
+  /* Where each indicator sits: `cx` is its column, `cy` its rotor centre, and
+     the frame is 23.75 units square centred on that point.
+
+     Both fans are bolted to the part they cool rather than parked in the
+     margin, so the position is the label and no caption is needed.  The PCS fan
+     sits against the head's right face, just below the output connector (the
+     off-grid line leaves the head at y 120); the battery fan sits at the
+     lower-left corner of module 1, flush with both the left edge and that
+     module's bottom seam (worked out from `bodyTop` + `MOD_H` in
+     `stackMarkup`, so it follows the head height). */
+  const PCS_FAN_SPOT = { cx: FRONT_X + FRONT_W + 14, cy: 137 };
+  const BAT_FAN_SPOT = { cx: FRONT_X - 14, cy: 0 };   // cy is per module, see below
+
 
   /* Energy flow on the branch connectors.  The battery is drawn inside the
    * unit, so only PV, the on-grid port and the off-grid port get a line.
@@ -369,6 +570,31 @@ function _hmBatteryRegister() {
     if (typeof value === "number") return Number.isFinite(value) ? value : 0;
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  /**
+   * Wi-Fi strength, drawn the way a phone draws it: four bars, one per 10 dBm.
+   *
+   * dBm is logarithmic and each 10 dBm is a factor of ten in power, so an even
+   * ladder is the only mapping that puts equal visual weight on equal steps. A
+   * handset uses the same rule (full bars down to about -50, then one bar per
+   * further -10); below -80 the link is unusable in practice and nothing is lit.
+   *
+   * | bars | reading (dBm) | stands for |
+   * |------|---------------|------------|
+   * | 4    | >= -50        | excellent  |
+   * | 3    | -50 .. -60    | good       |
+   * | 2    | -60 .. -70    | fair       |
+   * | 1    | -70 .. -80    | weak       |
+   * | 0    | < -80         | no usable signal |
+   */
+  function rssiBars(rssi) {
+    if (rssi === null || !Number.isFinite(rssi)) return 0;
+    if (rssi >= -50) return 4;
+    if (rssi >= -60) return 3;
+    if (rssi >= -70) return 2;
+    if (rssi >= -80) return 1;
+    return 0;
   }
 
   function clampNum(value, lo, hi) {
@@ -577,7 +803,7 @@ function _hmBatteryRegister() {
    * All of it is derived from the panel centre, so changing a font size or the
    * number of digits only means re-checking the few widths above.
    */
-  function headDisplay(pv, battery, soc) {
+  function headDisplay(pv, battery, soc, hasPv = true) {
     const ink = PANEL_INK;
     const dim = PANEL_DIM;
     // The head band is HEAD_TOP..HEAD_TOP+TOP_H (96..162), so 129 is its middle.
@@ -610,10 +836,13 @@ function _hmBatteryRegister() {
     const pvValueRight = mid - inner;               // 231.1
     const pvUnit = pvValueRight + unitGap;          // 233.1 - its own bottom right
     const pvCaption = pvValueRight - pvText.length * digitW / 2;
-    // The battery group is the *mirror* of the PV group, so that reading keeps
-    // its W at its bottom right too - which, on this side, is the outer edge.
-    // (Putting the W on the inner edge there would have parked it left of the
-    // number.)
+    // The battery group ALWAYS occupies the right hand slot, exactly where the
+    // hardware puts it and where it has always been on this card.  A unit with
+    // no PV input does not shuffle the remaining reading into the empty left
+    // slot: it simply has nothing on the left, so the panel reads
+    // "power symbol ... SOC ... BATTERY", which is the 4020 X panel minus the
+    // solar figure.  Moving the battery left was tried and looked wrong - the
+    // BATTERY caption ended up where SOLAR belongs.
     const batGroupRight = mid + inner + maxValueW;  // 368.4
     const batUnit = batGroupRight - unitW;          // 360.4
     const batValueRight = batUnit - unitGap;        // 358.4
@@ -635,13 +864,15 @@ function _hmBatteryRegister() {
         stroke="${ink}" stroke-width="1.5" stroke-linecap="round"/>`);
 
     // PV reading (right aligned so the "W" never moves) + its caption
-    parts.push(`<text x="${pvValueRight.toFixed(1)}" y="${valueY}" text-anchor="end" font-size="13"
+    if (hasPv) {
+      parts.push(`<text x="${pvValueRight.toFixed(1)}" y="${valueY}" text-anchor="end" font-size="13"
         font-weight="600" letter-spacing="0.3" font-family="${PANEL_MONO}"
         fill="${ink}">${pvText}</text>
       <text x="${pvUnit.toFixed(1)}" y="${unitY}" font-size="8" font-weight="600"
         fill="${dim}">W</text>
       <text x="${pvCaption.toFixed(1)}" y="${capY}" text-anchor="middle" font-size="6.5"
         letter-spacing="1" fill="${dim}">SOLAR</text>`);
+    }
 
     // SOC dead centre, flanked by whichever direction arrow applies
     const socText = soc == null
@@ -674,6 +905,41 @@ function _hmBatteryRegister() {
     return parts.join("");
   }
 
+  /**
+   * One fan speed indicator: the framed rotor plus its level and caption.
+   *
+   * The rotor is a `<g>` carrying `data-hm-fan` / `data-cx` / `data-cy` /
+   * `data-dps`; the card's rAF loop rotates it.  It is driven by script rather
+   * than a CSS animation because the whole drawing is rebuilt whenever a
+   * reading changes - a CSS animation would restart from zero every second,
+   * which reads as a stutter.  The loop keeps one angle per fan in `_fanDeg`,
+   * so a rebuild resumes where the previous rotor was.
+   */
+  function fanIndicator(key, spot, level, caption) {
+    const s = FAN_SIZE / 24;
+    const blades = [0, 72, 144, 216, 288]
+      .map((angle) => `<path d="${FAN_BLADE}" transform="rotate(${angle})"/>`)
+      .join("");
+    const title = esc(`${caption} · ${level}/${FAN_LEVEL_MAX}`);
+    return `<g class="bat-fan">
+        <title>${title}</title>
+        <g transform="translate(${spot.cx} ${spot.cy}) scale(${s.toFixed(4)}) translate(-12 -12)">
+          <rect x="2.5" y="2.5" width="19" height="19" rx="5"
+                fill="rgba(255,255,255,0.92)" stroke="#1f2933" stroke-width="1.5"/>
+          <g data-hm-fan="${key}" data-cx="12" data-cy="12"
+             data-dps="${level * FAN_DPS_PER_LEVEL}"
+             transform="rotate(0 12 12)" fill="#1f2933">
+            <g transform="translate(12 12)">${blades}</g>
+          </g>
+          <circle cx="12" cy="12" r="2.4" fill="#ffffff"
+                  stroke="#1f2933" stroke-width="1.15"/>
+          <circle cx="12" cy="12" r="0.6" fill="#1f2933"/>
+        </g>
+        <text class="bat-fan-l" x="${spot.cx}" y="${spot.cy + 28}"
+              text-anchor="middle">${level}</text>
+      </g>`;
+  }
+
   /* ------------------------------------------------------------------ *
    * The stack itself
    *
@@ -683,7 +949,7 @@ function _hmBatteryRegister() {
    * connector tab on the head's right shoulder.  There is deliberately no
    * full-height side panel: the real unit is a flat front face.
    * ------------------------------------------------------------------ */
-  function stackMarkup(packs, active, hostTemp, hostLabel, soc, pv, battery) {
+  function stackMarkup(packs, active, soc, pv, battery, fans, hasPv = true) {
     const count = Math.max(packs, 1);
     const stackH = TOP_H + count * MOD_H;
     const bottom = HEAD_TOP + stackH;
@@ -732,68 +998,304 @@ function _hmBatteryRegister() {
     // A faint highlight along the top edge keeps the panel reading as glass.
     parts.push(`<line x1="137" y1="96.7" x2="423" y2="96.7"
         stroke="rgba(255,255,255,0.10)" stroke-width="1.4"/>`);
-    parts.push(headDisplay(pv, battery, soc));
+    parts.push(headDisplay(pv, battery, soc, hasPv));
     parts.push(`<rect x="${FRONT_X}" y="${bodyTop - 3}" width="${FRONT_W}"
         height="3" fill="rgba(0,0,0,0.35)"/>`);
 
     // Module callouts: strictly alternating left / right down the stack, like
-    // the vendor app.  The alternation has to *start on the side opposite the
-    // host callout*: the host is pinned to the left, so starting the packs on
-    // the left too gave "left, left, right, left" with three packs - which is
-    // exactly what the user saw.
-    const hostOnLeft = hostTemp != null;
+    // the vendor app.  The first pack starts on the left now that the head unit
+    // readout is gone - it used to start on the right so it would not sit in the
+    // same column as that readout.
     for (let i = 0; i < count; i += 1) {
       const cy = bodyTop + i * MOD_H + MOD_H / 2;
-      const onLeft = hostOnLeft ? i % 2 === 1 : i % 2 === 0;
+      const onLeft = i % 2 === 0;
       const dotX = onLeft ? LEFT_DOT_X : RIGHT_DOT_X;
       const boxX = onLeft ? LEFT_BOX_X : RIGHT_BOX_X - CALLOUT_W;
       const edgeX = onLeft ? LEFT_BOX_X + CALLOUT_W : RIGHT_BOX_X - CALLOUT_W;
 
       const soc = i < active.length ? active[i].soc : null;
       const temp = i < active.length ? active[i].temp : null;
+      /* §32 `packs[].heat` is a four state flag, not a boolean: `idle` (nothing
+         to do), `heating`, and the two requests that come before it.  Only the
+         three active states add anything to the callout - an idle pack keeps the
+         callout it has always had, so a unit that never heats looks unchanged. */
+      const heat = i < active.length ? HEAT_KINDS[active[i].heat] : null;
+      const calloutH = heat ? CALLOUT_H_HEAT : CALLOUT_H;
+      const top = cy - calloutH / 2;
+      const titleY = heat ? top + 17 : cy - 6;
+      const valueY = heat ? top + 38 : cy + 15;
 
       parts.push(`<line x1="${edgeX}" y1="${cy}" x2="${dotX}" y2="${cy}"
         stroke="${DOT_COLOR}" stroke-width="1.8"/>`);
       parts.push(`<circle cx="${dotX}" cy="${cy}" r="5" fill="${DOT_COLOR}"
         stroke="#fff" stroke-width="1.6"/>`);
       parts.push(`<g class="bat-call">
-        <rect x="${boxX}" y="${cy - CALLOUT_H / 2}" width="${CALLOUT_W}"
-          height="${CALLOUT_H}" rx="11" fill="rgba(56,61,70,0.88)"/>
-        <text x="${boxX + 14}" y="${cy - 6}" class="bat-call-t">${esc(active[i].label)}</text>
-        <text x="${boxX + 14}" y="${cy + 15}" class="bat-call-v">${soc == null ? "--" : `${soc.toFixed(2)}%`}<tspan
+        <rect x="${boxX}" y="${top}" width="${CALLOUT_W}"
+          height="${calloutH}" rx="11" fill="rgba(56,61,70,0.88)"/>
+        <text x="${boxX + 14}" y="${titleY}" class="bat-call-t">${esc(active[i].label)}</text>
+        <text x="${boxX + 14}" y="${valueY}" class="bat-call-v">${soc == null ? "--" : `${soc.toFixed(2)}%`}<tspan
           class="bat-call-temp" dx="9">${temp == null ? "--" : `${temp.toFixed(1)}°C`}</tspan></text>
+        ${heat ? heatPill(boxX + 14, top + 46, heat,
+          active[i].heatText, active[i].heatHint) : ""}
       </g>`);
     }
 
-    // Head-unit temperature, drawn as one more callout so it looks exactly like
-    // the pack callouts above it (same box, same connector dot and line).  The
-    // head module on top of the stack is the BMS / PCS unit and has no
-    // temperature sensor of its own, so the reading is the average of the
-    // installed packs (see `_hostTemp`).
-    //
-    // It sits on the LEFT: the right hand side belongs to the off-grid
-    // connector, which comes straight out of the body just under the on-grid
-    // line and runs down the outer edge.  Its dot shares x with the first
-    // pack's, so the two left hand callouts line up in one column.
-    if (hostTemp != null) {
-      const cy = HEAD_TOP + TOP_H - 5;
-      const boxX = LEFT_BOX_X;
-      const edgeX = boxX + CALLOUT_W;
-      const dotX = LEFT_DOT_X;
+    /* Fan speeds, bolted to the part each one cools.  A fan whose level is
+       outside 0..10 (255 = not fitted / not enabled, §32) is left out       entirely: drawing it would claim a speed the device never reported.
 
-      parts.push(`<line x1="${edgeX}" y1="${cy}" x2="${dotX}" y2="${cy}"
-        stroke="${DOT_COLOR}" stroke-width="1.8"/>`);
-      parts.push(`<circle cx="${dotX}" cy="${cy}" r="5" fill="${DOT_COLOR}"
-        stroke="#fff" stroke-width="1.6"/>`);
-      parts.push(`<g class="bat-call">
-        <rect x="${boxX}" y="${cy - CALLOUT_H / 2}" width="${CALLOUT_W}"
-          height="${CALLOUT_H}" rx="11" fill="rgba(56,61,70,0.88)"/>
-        <text x="${boxX + 14}" y="${cy - 6}" class="bat-call-t">${esc(hostLabel)}</text>
-        <text x="${boxX + 14}" y="${cy + 15}" class="bat-call-v">${hostTemp.toFixed(1)}°C</text>
-      </g>`);
+       The battery fan's row is derived from the stack, not hard coded: it sits
+       in module 1's lower-left corner, its frame flush with the left face and
+       with that module's bottom seam.  That corner is free whatever the pack
+       count and whether or not the host callout is drawn - the per-pack
+       callouts on the left are all at y <= 268 for module 1, and any later left
+       hand one is a full module lower down. */
+    if (fans) {
+      if (fans.pcs != null) {
+        parts.push(fanIndicator("pcs", PCS_FAN_SPOT, fans.pcs, fans.pcsCaption));
+      }
+      if (fans.bat != null) {
+        const batSpot = {
+          cx: BAT_FAN_SPOT.cx,
+          cy: bodyTop + MOD_H - 12,          // flush with module 1's foot
+        };
+        parts.push(fanIndicator("bat", batSpot, fans.bat, fans.batCaption));
+      }
     }
 
     return { markup: parts.join(""), bodyTop, bottom };
+  }
+
+  /* ------------------------------------------------------------------ *
+   * The flat chassis (HiBattery 1920 AC)
+   *
+   * A different product rather than a 4020 with parts missing.  Drawn art was
+   * tried twice and never survived the shrink to ~190 px, so the case here is
+   * the **product photo** itself (`hibattery-1920ac.png`, transparent outside
+   * the moulding), and only the display is drawn on top of it: the real unit
+   * shows its state of charge on that panel, so the card paints the green level
+   * bar and the percentage over the photo's own black screen.
+   *
+   * The photo is measured once (860 x 420) and the panel box is expressed as
+   * fractions, so the overlay follows if the artwork is ever replaced:
+   *
+   *   display   x 268..590   y 144..218   ->  FLAT_DISP below
+   *
+   * The photo's studio backdrop has been keyed out, so nothing may be painted
+   * underneath it: a fallback box would simply show through the transparent
+   * corners as the grey shadow the photo was cleared of.  The asset is part of
+   * `FRONTEND_IMAGES`, so it is always deployed next to these scripts.
+   *
+   * The image starts on the stack's left edge (`FRONT_X`) and its connectors
+   * attach at the same heights, so the branch lines, the corner readouts and
+   * the pack callout keep their geometry - only the chassis itself differs.
+   * ------------------------------------------------------------------ */
+  const FLAT_W = 380;          // drawn width; 380 x 190 matches the photo
+  const FLAT_H = 190;
+  const FLAT_IMAGE = "/hoymiles_static/hibattery-1920ac.png";
+  // The black screen, as a fraction of the photo.  Measured, not guessed.
+  const FLAT_DISP = { x0: 0.3116, x1: 0.6860, y0: 0.3429, y1: 0.5190 };
+  // Where the front face starts (lid + black band, from the photo).  Only used
+  // to place the pack callout and the optional fan, whose positions were tuned
+  // against the earlier drawing and still line up with the artwork.
+  const FLAT_FACE_TOP = 43;
+
+  /* ------------------------------------------------------------------ *
+   * The MS-A2 cabinet
+   *
+   * A **portrait** cabinet photographed at a slight angle, so it cannot reuse
+   * the 1920 AC artwork: the body is drawn as the photo (`hibattery-msa2.png`,
+   * already keyed out by the vendor) and only the level is painted on it.
+   *
+   * The unit shows its state of charge in the black strip on the front face,
+   * and unlike the 1920 AC that strip fills **upward** - so the overlay is a
+   * vertical bar, not a horizontal one.  No number is painted on the body: the
+   * pack callout on the left already carries the state of charge, and a second,
+   * much larger figure two centimetres away only competes with it.
+   *
+   * Measured from the 634 x 652 source:
+   *   strip    x 200..273   y  92..319   (the whole dark panel)
+   *   socket   x 511..616   y 110..240   (on the angled side face)
+   *
+   * The level fills the **whole** dark panel, not just the part of it below the
+   * two buttons: on this unit the entire black strip is the gauge, so a bar that
+   * stopped under the buttons left two thirds of it unused and the reading read
+   * far too low.
+   * ------------------------------------------------------------------ */
+  const MSA2_W = 224;          // 634 x 652 scaled to the stack's height
+  const MSA2_H = 230;
+  const MSA2_IMAGE = "/hoymiles_static/hibattery-msa2.png";
+  // The level bar, as fractions of the photo.  Measured, not guessed.
+  const MSA2_BAR = { x0: 0.3155, x1: 0.4306, y0: 0.1411, y1: 0.4893 };
+  // Where the two right-hand connectors plug into the side face.  The AC socket
+  // spans y 135..181 in this box, so both lines land inside it, 12 apart.
+  const MSA2_AC_Y = 148;
+  const MSA2_OFF_Y = 160;
+
+  /* The card rebuilds its whole drawing whenever a reading changes, and the
+     device pushes one every second, so the <image> carrying the case is
+     re-created constantly.  Warming the browser's image cache once here means
+     those rebuilds reuse the already decoded bitmap instead of paying for it
+     again, which is what made a page refresh feel slow. */
+  if (typeof Image === "function") {
+    for (const src of [FLAT_IMAGE, MSA2_IMAGE]) {
+      const warm = new Image();
+      warm.src = src;
+      if (typeof warm.decode === "function") warm.decode().catch(() => {});
+    }
+  }
+
+  function flatMarkup(active, soc, fans) {
+    const x = FRONT_X;
+    const top = HEAD_TOP;
+    const bottom = top + FLAT_H;
+    const parts = [];
+
+    const faceTop = top + FLAT_FACE_TOP;
+
+    // ---- the case: the photo alone, its backdrop already transparent ----
+    parts.push(`<image href="${FLAT_IMAGE}" x="${x}" y="${top}"
+        width="${FLAT_W}" height="${FLAT_H}"
+        preserveAspectRatio="none"/>`);
+
+    // The display. `soc` is the unit's own state of charge; a missing reading
+    // draws the empty track and "--" rather than a bar at zero, because those
+    // two mean different things.  Everything below sits inside the screen the
+    // photo already has, so no frame is drawn - only what the panel would show.
+    const dispX = x + FLAT_W * FLAT_DISP.x0;
+    const dispY = top + FLAT_H * FLAT_DISP.y0;
+    const dispW = FLAT_W * (FLAT_DISP.x1 - FLAT_DISP.x0);
+    const dispH = FLAT_H * (FLAT_DISP.y1 - FLAT_DISP.y0);
+    const pct = soc == null ? null : Math.max(0, Math.min(100, num(soc)));
+    const barX = dispX + 7;
+    const barY = dispY + 4.5;
+    const barW = dispW - 14;
+    const barH = 10;
+    // Clipped to the track so the fill's right end stays square - a rounded
+    // end on both sides reads as a slider, not as a level.  The empty part of
+    // the track is a very dark green, not grey: that is how the panel itself
+    // shows it, and the two tones then read as one bar instead of a bar on a
+    // separate background.
+    parts.push(`<clipPath id="hm-flat-bar"><rect x="${barX}" y="${barY}"
+        width="${barW}" height="${barH}" rx="2.5"/></clipPath>`);
+    parts.push(`<rect x="${barX}" y="${barY}" width="${barW}" height="${barH}"
+        rx="2.5" fill="#0e2a1c"/>`);
+    if (pct) {
+      parts.push(`<g clip-path="url(#hm-flat-bar)">
+        <rect x="${barX}" y="${barY}" width="${(barW * pct / 100).toFixed(1)}"
+          height="${barH}" fill="url(#hm-flat-bar-fill)"/>
+      </g>`);
+    }
+    parts.push(`<text x="${dispX + dispW / 2}" y="${dispY + dispH - 4.5}"
+        text-anchor="middle" font-size="13.5" font-weight="600"
+        font-family="${PANEL_MONO}" fill="#f2f6fa">${pct == null ? "--" : `${pct.toFixed(1)}%`}</text>`);
+
+    /* The single pack callout, on the left.  The dot is placed 60 units in from
+       the left face: far enough that the leader line reads as a leader rather
+       than a stub through the cap, still well clear of the display. */
+    const pack = active && active[0];
+    if (pack) {
+      const cy = faceTop + (bottom - faceTop) * 0.44;
+      const dotX = x + 62;
+      const edgeX = LEFT_BOX_X + CALLOUT_W;
+      const heat = HEAT_KINDS[pack.heat] || null;
+      const calloutH = heat ? CALLOUT_H_HEAT : CALLOUT_H;
+      const boxY = cy - calloutH / 2;
+      const titleY = heat ? boxY + 17 : cy - 6;
+      const valueY = heat ? boxY + 38 : cy + 15;
+      parts.push(`<line x1="${edgeX}" y1="${cy}" x2="${dotX}" y2="${cy}"
+        stroke="${DOT_COLOR}" stroke-width="1.8"/>`);
+      parts.push(`<circle cx="${dotX}" cy="${cy}" r="5" fill="${DOT_COLOR}"
+        stroke="#fff" stroke-width="1.6"/>`);
+      parts.push(`<g class="bat-call">
+        <rect x="${LEFT_BOX_X}" y="${boxY}" width="${CALLOUT_W}"
+          height="${calloutH}" rx="11" fill="rgba(56,61,70,0.88)"/>
+        <text x="${LEFT_BOX_X + 14}" y="${titleY}" class="bat-call-t">${esc(pack.label)}</text>
+        <text x="${LEFT_BOX_X + 14}" y="${valueY}" class="bat-call-v">${pack.soc == null ? "--" : `${pack.soc.toFixed(2)}%`}<tspan
+          class="bat-call-temp" dx="9">${pack.temp == null ? "--" : `${pack.temp.toFixed(1)}°C`}</tspan></text>
+        ${heat ? heatPill(LEFT_BOX_X + 14, boxY + 46, heat,
+          pack.heatText, pack.heatHint) : ""}
+      </g>`);
+    }
+
+    /* A fan, if this unit ever reports one: against the right face, below the
+       two connectors.  The model drawn here has none (its `fan_actual` is 255),
+       so this is only to keep the drawing honest if that changes. */
+    if (fans && fans.pcs != null) {
+      parts.push(fanIndicator("pcs", { cx: x + FLAT_W + 10, cy: top + 58 },
+        fans.pcs, fans.pcsCaption));
+    }
+
+    return { markup: parts.join(""), bodyTop: faceTop, bottom };
+  }
+
+  function msa2Markup(active, soc, fans) {
+    const x = FRONT_X;
+    const top = HEAD_TOP;
+    const bottom = top + MSA2_H;
+    const parts = [];
+
+    // ---- the cabinet: the photo alone, its backdrop already transparent ----
+    parts.push(`<image href="${MSA2_IMAGE}" x="${x}" y="${top}"
+        width="${MSA2_W}" height="${MSA2_H}"
+        preserveAspectRatio="none"/>`);
+
+    /* The level.  It rises from the base of the strip instead of running
+       left to right, because that is how this unit shows it.  Clipped to the
+       track so the fill's leading edge stays square - a round end on both
+       sides reads as a slider rather than a level.  A missing reading draws
+       the empty track only. */
+    const barX = x + MSA2_W * MSA2_BAR.x0;
+    const barW = MSA2_W * (MSA2_BAR.x1 - MSA2_BAR.x0);
+    const barTop = top + MSA2_H * MSA2_BAR.y0;
+    const barBot = top + MSA2_H * MSA2_BAR.y1;
+    const barH = barBot - barTop;
+    const pct = soc == null ? null : Math.max(0, Math.min(100, num(soc)));
+    parts.push(`<clipPath id="hm-msa2-bar"><rect x="${barX}" y="${barTop}"
+        width="${barW}" height="${barH}" rx="3"/></clipPath>`);
+    parts.push(`<rect x="${barX}" y="${barTop}" width="${barW}" height="${barH}"
+        rx="3" fill="#0e2a1c"/>`);
+    if (pct) {
+      const fillH = barH * pct / 100;
+      parts.push(`<g clip-path="url(#hm-msa2-bar)">
+        <rect x="${barX}" y="${(barBot - fillH).toFixed(1)}" width="${barW}"
+          height="${fillH.toFixed(1)}" fill="url(#hm-msa2-bar-fill)"/>
+      </g>`);
+    }
+
+    /* The single pack callout, on the left.  The dot sits inside the front
+       face and clear of the strip, so the leader line never crosses the
+       display. */
+    const pack = active && active[0];
+    if (pack) {
+      const cy = top + MSA2_H * 0.52;
+      const dotX = x + 46;
+      const edgeX = LEFT_BOX_X + CALLOUT_W;
+      const heat = HEAT_KINDS[pack.heat] || null;
+      const calloutH = heat ? CALLOUT_H_HEAT : CALLOUT_H;
+      const boxY = cy - calloutH / 2;
+      const titleY = heat ? boxY + 17 : cy - 6;
+      const valueY = heat ? boxY + 38 : cy + 15;
+      parts.push(`<line x1="${edgeX}" y1="${cy}" x2="${dotX}" y2="${cy}"
+        stroke="${DOT_COLOR}" stroke-width="1.8"/>`);
+      parts.push(`<circle cx="${dotX}" cy="${cy}" r="5" fill="${DOT_COLOR}"
+        stroke="#fff" stroke-width="1.6"/>`);
+      parts.push(`<g class="bat-call">
+        <rect x="${LEFT_BOX_X}" y="${boxY}" width="${CALLOUT_W}"
+          height="${calloutH}" rx="11" fill="rgba(56,61,70,0.88)"/>
+        <text x="${LEFT_BOX_X + 14}" y="${titleY}" class="bat-call-t">${esc(pack.label)}</text>
+        <text x="${LEFT_BOX_X + 14}" y="${valueY}" class="bat-call-v">${pack.soc == null ? "--" : `${pack.soc.toFixed(2)}%`}<tspan
+          class="bat-call-temp" dx="9">${pack.temp == null ? "--" : `${pack.temp.toFixed(1)}°C`}</tspan></text>
+        ${heat ? heatPill(LEFT_BOX_X + 14, boxY + 46, heat,
+          pack.heatText, pack.heatHint) : ""}
+      </g>`);
+    }
+
+    if (fans && fans.pcs != null) {
+      parts.push(fanIndicator("pcs", { cx: x + MSA2_W + 10, cy: top + 58 },
+        fans.pcs, fans.pcsCaption));
+    }
+
+    return { markup: parts.join(""), bodyTop: top + MSA2_H * 0.1, bottom };
   }
 
   /* ------------------------------------------------------------------ *
@@ -829,26 +1331,47 @@ function _hmBatteryRegister() {
       this._flowClock = 0;
       this._spinEl = null;
       this._pulseEls = [];
+      this._fanEls = [];
+      /* One angle per fan, kept across the rebuilds the readings cause - the
+         rotor then resumes where it was instead of snapping back to 0. */
+      this._fanDeg = new Map();
       this._flowRaf = 0;
       this._flowLast = 0;
       this._spinDeg = 0;
       this._pulsePhase = 0;
       this._flowTick = this._flowTick.bind(this);
+      /* The "the packs are cold" banner.  It has no clock: it stays up for as
+         long as a pack keeps asking for heat, and only the user closes it. */
+      this._heatNotice = null;
+      this._heatNoticeKey = "";
+      /* The request set the user closed by hand.  Kept so the same situation
+         does not raise the banner again on the next reading - it comes back only
+         when the requests themselves change (or clear and return). */
+      this._heatDismissed = "";
     }
 
     /**
      * Collect the parts that a requestAnimationFrame loop drives.
      *
-     * Only the status glyph is left in that loop - the spinning ring and the
-     * segments that fill while charging.  The branch flow is a CSS animation and
-     * needs nothing here.
+     * The status glyph (its ring and the segments that fill while charging) and
+     * the two fan rotors.  The branch flow is a CSS animation and needs nothing
+     * here.
      */
     _syncAnimation() {
       const root = this.renderRoot;
       if (!root) return;
       this._spinEl = root.querySelector("[data-hm-spin]");
       this._pulseEls = Array.from(root.querySelectorAll("[data-hm-pulse]"));
-      if (!this._flowRaf && (this._spinEl || this._pulseEls.length)) {
+      this._fanEls = Array.from(root.querySelectorAll("[data-hm-fan]"));
+      /* The SVG was just rebuilt, so every rotor starts at 0: put each one back
+         at the angle its fan had reached. */
+      for (const el of this._fanEls) {
+        const key = el.getAttribute("data-hm-fan") || "";
+        const deg = this._fanDeg.get(key) || 0;
+        el.setAttribute("transform", `rotate(${deg.toFixed(1)} 12 12)`);
+      }
+      if (!this._flowRaf
+        && (this._spinEl || this._pulseEls.length || this._fanEls.length)) {
         this._flowLast = 0;
         this._flowRaf = requestAnimationFrame(this._flowTick);
       }
@@ -856,6 +1379,84 @@ function _hmBatteryRegister() {
 
     updated() {
       this._syncAnimation();
+      this._checkHeatRequest();
+    }
+
+    /**
+     * Which packs are asking for heat right now (``"1:chg_req|2:dchg_req"``).
+     *
+     * Only the two requests count: `heating` already has its pill and needs no
+     * advice, and `idle` is not a problem.
+     */
+    _heatRequestKey() {
+      const out = [];
+      for (let i = 1; i <= PACK_MAX; i += 1) {
+        const state = (this._readText(`pack${i}_heating_state`) || "").toLowerCase();
+        const kind = HEAT_KINDS[state];
+        if (kind && kind.req) out.push(`${i}:${state}`);
+      }
+      return out.join("|");
+    }
+
+    /**
+     * Raise the banner while (and only while) a pack is asking for heat.
+     *
+     * A request is a condition, not an event: it can last for hours, so there is
+     * no timer.  The banner is up whenever the request set is non-empty, and it
+     * goes away for two reasons only - the requests are gone, or the user closed
+     * it.  Closing it is remembered per request set, so the next reading does not
+     * bring it straight back.
+     */
+    _checkHeatRequest() {
+      const key = this._heatRequestKey();
+      if (!key) {
+        this._heatNoticeKey = "";
+        this._heatDismissed = "";
+        if (this._heatNotice) {
+          this._heatNotice = null;
+          this.requestUpdate();
+        }
+        return;
+      }
+      if (key === this._heatDismissed) return;
+      if (key === this._heatNoticeKey) return;
+      this._heatNoticeKey = key;
+      this._heatNotice = key;
+      this.requestUpdate();
+    }
+
+    /**
+     * Closing is an act of the user, not a timeout: the requests are still there,
+     * so the card remembers this exact set and stays quiet until it changes.
+     */
+    _dismissHeatNotice() {
+      this._heatDismissed = this._heatNoticeKey;
+      this._heatNotice = null;
+      this.requestUpdate();
+    }
+
+    /**
+     * The banner itself: a floating strip inside the device page, near the top
+     * but over the drawing - not part of the card's flow, and not fixed to the
+     * viewport (that put it on top of the dashboard header and its view tabs).
+     */
+    _heatNoticeMarkup() {
+      if (!this._heatNotice) return "";
+      const icon = `<svg viewBox="0 0 15 15" width="18" height="18" fill="none"
+        stroke="currentColor" stroke-width="1.2" stroke-linecap="round"
+        stroke-linejoin="round" aria-hidden="true">${snowflakeArms()}</svg>`;
+      return html`<div class="heat-note" role="status">
+        <span class="bi">${this._untrusted(icon)}</span>
+        <span class="bt">${this._t(
+          "The batteries are cold. Turning heating on restores the usable "
+          + "capacity at low temperature and extends their life "
+          + "(Control -> Heating).",
+          "电池温度偏低，建议开启加热：低温下可用容量与充放电能力都会受限，"
+          + "开启加热可提升可用容量并延长电池寿命（控制 → 加热控制）。",
+        )}</span>
+        <button class="bx" @click=${() => this._dismissHeatNotice()}
+          aria-label=${this._t("Dismiss", "关闭")}>×</button>
+      </div>`;
     }
 
     /**
@@ -884,9 +1485,9 @@ function _hmBatteryRegister() {
       this._flowClock = 0;
     }
 
-    /** Advance the status glyph.  The branch flow is CSS and not driven here. */
+    /** Advance the status glyph and the fan rotors.  The branch flow is CSS. */
     _flowTick(ts) {
-      if (!this._spinEl && !this._pulseEls.length) {
+      if (!this._spinEl && !this._pulseEls.length && !this._fanEls.length) {
         this._flowRaf = 0;
         return;
       }
@@ -914,6 +1515,17 @@ function _hmBatteryRegister() {
         }
       }
 
+      // Fans: the speed comes from the level, so a higher level spins faster.
+      // Level 0 carries `data-dps="0"` and is left where it is - a stopped fan.
+      for (const el of this._fanEls) {
+        const dps = Number(el.getAttribute("data-dps")) || 0;
+        if (!(dps > 0)) continue;
+        const key = el.getAttribute("data-hm-fan") || "";
+        const deg = ((this._fanDeg.get(key) || 0) + (dt * dps) / 1000) % 360;
+        this._fanDeg.set(key, deg);
+        el.setAttribute("transform", `rotate(${deg.toFixed(1)} 12 12)`);
+      }
+
       this._flowRaf = requestAnimationFrame(this._flowTick);
     }
 
@@ -927,7 +1539,7 @@ function _hmBatteryRegister() {
 
     static get styles() {
       return css`
-        :host { display: block; }
+        :host { display: block; position: relative; }
         ha-card { padding: 12px 14px 14px; overflow: hidden; }
         .head { display: flex; align-items: center; gap: 10px;
                 justify-content: space-between; }
@@ -935,8 +1547,19 @@ function _hmBatteryRegister() {
                   font-weight: 600; color: var(--primary-text-color); }
         .hstat { display: flex; align-items: center; gap: 10px; min-width: 40px;
                  justify-content: flex-end; }
+        /* The alert badge is the first thing in the head, so it has to hug the
+           left edge instead of being pushed right like the signal bars. */
+        .hstat.left { justify-content: flex-start; }
         .hstat svg { display: block; }
-        .bell { color: var(--error-color); font-size: 17px; line-height: 1; }
+        /* The reading sits to the right of the bars, small and grey so the
+           numbers never compete with the power figures in the drawing. */
+        .hsig { display: inline-flex; align-items: center; gap: 6px;
+                font-size: 12.5px; color: var(--secondary-text-color);
+                font-variant-numeric: tabular-nums; }
+        /* Offline: the bars go grey and the text takes the error colour, so the
+           head band states the fact instead of just losing its signal meter. */
+        .hsig.off .hsig-v { color: var(--error-color, #db4437);
+                            font-weight: 600; }
         .wrap { display: flex; justify-content: center;
                 /* max_width caps the illustration, and the dashboard column is
                    usually wider than that - without auto margins the leftover
@@ -951,6 +1574,12 @@ function _hmBatteryRegister() {
         .bat-call-v { font-size: 17.8px; font-weight: 600; fill: #ffffff; }
         .bat-call-temp { font-size: 13.5px; font-weight: 500;
                          fill: rgba(255,255,255,0.82); }
+        /* The fan level.  The fan has no caption - it is drawn against the part
+           it cools, so the number alone is enough.  Sized between the corner
+           figures (24px) and their captions (13px) so the annotation reads as
+           belonging to the drawing, not as a corner readout of its own. */
+        .bat-fan-l { font-size: 17px; font-weight: 600;
+                     fill: var(--primary-text-color); }
 
         /* The branch flow is one streak of light sent along the connector.  The
            three stops are CSS variables because they depend on the length of the
@@ -1000,6 +1629,51 @@ function _hmBatteryRegister() {
         .summary b { color: var(--primary-text-color); font-weight: 600; }
         .msg { font-size: 12.5px; color: var(--secondary-text-color);
                padding: 10px 0 2px; }
+
+        /* ================================================================== *
+         * Cold-battery banner
+         *
+         * A heating request is a condition, not a click: it has to be noticed
+         * without hunting through the callouts.
+         *
+         * It floats **at the top of the device page**, in the strip just below the
+         * view tabs and over the card's head band - not in the card's flow
+         * (pushing the drawing down for minutes is worse than a floating strip)
+         * and not fixed to the viewport either (that put it on top of the
+         * dashboard header and covered the very view tabs it asks the user to
+         * click).  The host element is the device page area, so absolute
+         * positioning against it keeps the banner inside it and lets it scroll
+         * away with the card.
+         *
+         * It has no clock - it stays while a pack keeps asking for heat, and only
+         * the close button (or the request going away) removes it.  Opaque card
+         * colour plus a shadow, because it is drawn over the illustration.
+         * ================================================================== */
+        .heat-note {
+          position: absolute; top: -14px; left: 50%; z-index: 6;
+          transform: translateX(-50%);
+          display: flex; align-items: center; gap: 10px;
+          width: min(470px, calc(100% - 28px));
+          padding: 9px 6px 9px 12px; border-radius: 11px;
+          background-color: var(--card-background-color, #fff);
+          background-image: linear-gradient(
+            rgba(125, 211, 252, 0.10), rgba(125, 211, 252, 0.10));
+          color: var(--primary-text-color);
+          border: 1px solid rgba(125, 211, 252, 0.5);
+          border-left: 4px solid #7DD3FC;
+          box-shadow: 0 6px 22px rgba(15, 23, 42, 0.18);
+          animation: hm-heat-in 0.3s cubic-bezier(0.2, 0.9, 0.3, 1);
+        }
+        .heat-note .bi { display: inline-flex; flex: 0 0 auto; color: #7DD3FC; }
+        .heat-note .bi svg { display: block; }
+        .heat-note .bt { font-size: 13px; line-height: 1.45; }
+        .heat-note .bx { flex: 0 0 auto; border: none; background: none;
+                         color: var(--secondary-text-color); font-size: 17px;
+                         line-height: 1; padding: 2px 6px; cursor: pointer; }
+        @keyframes hm-heat-in {
+          from { opacity: 0; transform: translate(-50%, -12px); }
+          to { opacity: 1; transform: translate(-50%, 0); }
+        }
       `;
     }
 
@@ -1043,16 +1717,31 @@ function _hmBatteryRegister() {
     _signature() {
       const packs = [];
       for (let i = 1; i <= PACK_MAX; i += 1) {
-        packs.push(`${this._read(`pack${i}_soc`, null)}:${this._read(`pack${i}_temperature`, null)}`);
+        /* The heating state is part of the per-pack signature: it changes on its
+           own (the heater starts while the SOC and temperature stand still), and
+           without it here the pill would only appear on the next SOC tick. */
+        packs.push(`${this._read(`pack${i}_soc`, null)}:${this._read(`pack${i}_temperature`, null)}`
+          + `:${this._readText(`pack${i}_heating_state`)}`);
       }
+      const alarms = this._alarms();
       return [
         hmLang(this._hass, this._config),
         this._config.max_width, this._title(),
         this._config.show_title, this._config.alarm_entity, this._range,
+        // The PV corner, the PV connector and the SOLAR readout are all part of
+        // the drawing, so a card told there is no PV input has to redraw.
+        this._hasPv(),
         // The model arrives with the device registry, which can load after the
         // first render, so it has to be part of what triggers a rebuild.
         this._title(),
-        this._read("rssi", null), this._alarmOn(),
+        // The chassis drawing follows the model as well (the 1920 AC is a wide
+        // single box, not a stack), and a custom `title` would hide that, so
+        // the model is carried explicitly.
+        this._model(),
+        this._read("rssi", null), `${alarms.known}:${alarms.count}`,
+        // The badge wording follows the language switch, so a language change
+        // has to redraw it even while the readings are unchanged.
+        this._t("No active alarms", "当前无告警"),
         this._read("pv_power", 0), this._read("grid_on_power", 0),
         this._read("grid_off_power", 0),
         // The head display and the bottom-left readout use the system level
@@ -1062,18 +1751,18 @@ function _hmBatteryRegister() {
         this._read("bat_power", null),
         this._packCount(), packs.join(","),
         this._readText("battery_status"), this._readText("bat_sts"),
-        this._showHostTemp() ? this._hostTemp() : null,
         this._read("soc", null),
+        // The fan indicators are part of the drawing, so their levels have to
+        // be in the key: a fan that starts or stops has to redraw even though
+        // no power reading changed.
+        this._fanLevel("pcs_fan_level"), this._fanLevel("battery_fan_level"),
+        // The cold-battery banner is not derived from a reading, so its state
+        // has to be part of the key - otherwise `requestUpdate()` would be
+        // swallowed and the banner would never appear or disappear.
+        this._heatNotice ? "notice" : "",
         this._history ? `${this._history.soc.length}:${this._history.charge}:${this._history.discharge}` : "none",
         this._histError || "",
       ].join("\u0001");
-    }
-
-    _alarmOn() {
-      const entityId = this._config.alarm_entity;
-      if (!entityId || !this._hass) return false;
-      const state = (this._hass.states || {})[entityId];
-      return !!state && state.state === "on";
     }
 
     /* ----------------------------- lookup ----------------------------- */
@@ -1131,6 +1820,48 @@ function _hmBatteryRegister() {
     }
 
     /**
+     * Whether this unit has a PV input at all.
+     *
+     * `show_pv: false` in the config is what the generated dashboard sends for
+     * an **AC coupled** model (HiBattery 4020 AC): that unit has no MPPT port,
+     * yet the firmware still publishes every PV topic as a hard 0, so the card
+     * cannot tell from the data.  The model lives in the device registry, which
+     * the dashboard generator reads - see ``const.MODELS_WITHOUT_PV``.
+     *
+     * The portrait MS-A2 cabinet has no PV input either, and a card configured
+     * by hand has no `show_pv` key at all, so the chassis decides in that case:
+     * an explicit `show_pv` still wins, but the MS-A2 does not need to be told.
+     */
+    _hasPv() {
+      const configured = (this._config || {}).show_pv;
+      if (configured !== undefined) return configured !== false;
+      return this._chassis() !== "msa2";
+    }
+
+    /**
+     * Which chassis drawing this unit needs.
+     *
+     *   "msa2"  the portrait MS-A2 cabinet - photo, vertical level strip,
+     *           percentage printed on the body;
+     *   "flat"  the wide 1920 AC - photo, level bar on its own screen;
+     *   "stack" everything else: a head module plus battery modules.
+     *
+     * Matched on the model with punctuation removed, so "MS-A2", "MSA2" and
+     * "HiBattery MS-A2" all land on the same chassis.  The model is the only
+     * reliable source: the entity names differ per firmware, the cabinet does
+     * not.
+     */
+    _chassis() {
+      const model = this._model();
+      if (!model) return "stack";
+      const raw = String(model).trim().toLowerCase();
+      const key = raw.replace(/[\s_-]+/g, "");
+      if (key === "msa2" || key === "hibatterymsa2") return "msa2";
+      if (FLAT_CHASSIS.includes(raw)) return "flat";
+      return "stack";
+    }
+
+    /**
      * Header title: explicit config wins, then what the device says it is, and
      * only then a generic placeholder — a hard-coded name goes stale as soon as
      * the hardware changes.
@@ -1147,6 +1878,16 @@ function _hmBatteryRegister() {
     }
 
     _resolveEntity(suffix, domain = "sensor") {
+      const found = this._resolveExact(suffix, domain);
+      if (found) return found;
+      for (const alias of (SUFFIX_ALIASES[suffix] || [])) {
+        const alt = this._resolveExact(alias, domain);
+        if (alt) return alt;
+      }
+      return null;
+    }
+
+    _resolveExact(suffix, domain = "sensor") {
       const overrides = (this._config.entities || {});
       if (overrides[suffix]) return overrides[suffix];
 
@@ -1173,10 +1914,35 @@ function _hmBatteryRegister() {
         }
       }
 
+      if (!found) {
+        // A renamed device keeps all of its entities but changes their entity
+        // ids: renaming the device to "G3" turns `sensor.msa_2805..._pv_power`
+        // into `sensor.g3_msa_2805..._pv_power`, which defeats both the
+        // conventional name and the prefix match above.  The serial is still in
+        // the id, so match on "serial, then exactly the suffix" - an exact tail
+        // comparison, because a loose `endsWith` would confuse `pv_power` with
+        // `system_pv_power`.
+        const serial = String(this._dev() || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        const wanted = norm(suffix);
+        if (serial) {
+          for (const entityId of Object.keys(hass.states)) {
+            if (!entityId.startsWith(`${domain}.`)) continue;
+            const normed = norm(entityId);
+            const at = normed.indexOf(serial);
+            if (at < 0) continue;
+            if (normed.slice(at + serial.length) !== wanted) continue;
+            if (!found || entityId.length < found.length) found = entityId;
+          }
+        }
+      }
+
       if (!found && hass.entities) {
         const uniqueSuffix = `hoymiles_${this._dev()}_${suffix}`;
         for (const [entityId, entry] of Object.entries(hass.entities)) {
-          if (entry && entry.unique_id === uniqueSuffix) {
+          // The registry keeps entries for entities a platform no longer creates
+          // (a renamed or removed entity); those have no state, and picking one
+          // would hide the live replacement.
+          if (entry && entry.unique_id === uniqueSuffix && hass.states[entityId]) {
             found = entityId;
             break;
           }
@@ -1209,6 +1975,51 @@ function _hmBatteryRegister() {
       return state ? String(state.state) : "";
     }
 
+    /**
+     * The first suffix that actually **has a value**, in priority order.
+     *
+     * A **slave** publishes none of the `sys_*` fields of `quick/state`: the
+     * system level readings belong to the master, so the entities this
+     * integration creates for them exist but stay `unknown` for ever.  Picking
+     * the source by "does the entity exist" therefore locked the drawing to the
+     * fallback - `_read()` on an unknown entity returns its fallback, and the
+     * device level `bat_p` / `pv_p` was never consulted.  The symptom was a
+     * slave that charged at 1001 W while the diagram said "0.0 W".
+     *
+     * `_stateOf()` already answers `null` for `unknown` / `unavailable`, so the
+     * first non-null reading is the first one that is real.  A genuine `0` is a
+     * value like any other and stops the search, which is what a master at rest
+     * needs.
+     */
+    _firstRead(suffixes, fallback = 0) {
+      for (const suffix of suffixes) {
+        const value = this._read(suffix, null);
+        if (value !== null) return value;
+      }
+      return fallback;
+    }
+
+    /**
+     * Is the device itself offline?
+     *
+     * Same rule as the control card: the integration marks the fast topics'
+     * entities `unavailable` once nothing has arrived for a minute, and a fresh
+     * Home Assistant shows `unknown` until the first payload lands.  The first
+     * entity that exists decides - a *missing* entity (older firmware) is not
+     * an offline device.
+     */
+    _deviceOffline() {
+      if (!this._hass) return false;
+      for (const suffix of ["soc", "system_pv_power", "pv_power", "battery_status"]) {
+        const entityId = this._resolveEntity(suffix, "sensor");
+        if (!entityId) continue;
+        const state = (this._hass.states || {})[entityId];
+        if (!state) continue;
+        return state.state === "unavailable" || state.state === "unknown";
+      }
+      return false;
+    }
+
     /* ---------------------------- the data ---------------------------- */
 
     /**
@@ -1229,34 +2040,20 @@ function _hmBatteryRegister() {
       return Math.max(1, Math.min(count, PACK_MAX));
     }
 
-    /** `show_host_temp: false` (also accepts the editor's "false") hides it. */
-    _showHostTemp() {
-      const value = (this._config || {}).show_host_temp;
-      return !(value === false || value === "false");
-    }
-
     /**
-     * Head-unit ("主机") temperature.
+     * The level a fan is actually running at, or `null` when the drawing must
+     * leave it out.
      *
-     * The head module on top of the stack is the BMS / PCS unit; it has no
-     * temperature sensor of its own, so the vendor app shows the average of the
-     * installed packs.  Only the packs the card actually draws are averaged,
-     * and a pack that reports no temperature is skipped rather than counted as
-     * zero.  If none of them report one, the firmware's own
-     * `battery_temperature` (`device/state` → `bat_temp`, itself an average) is
-     * used as a fallback; `null` leaves the readout off the drawing.
+     * `fan_actual` (§32) reports 0..10 and uses **255** for "not fitted / not
+     * enabled".  Anything outside the documented range therefore means "no
+     * indicator", not "a very fast fan" - and a missing entity (older firmware,
+     * or a model without fans) reads as `null` for the same reason.
      */
-    _hostTemp() {
-      const count = this._packCount();
-      const temps = [];
-      for (let i = 1; i <= count; i += 1) {
-        const temp = this._read(`pack${i}_temperature`, null);
-        if (temp !== null) temps.push(temp);
-      }
-      if (temps.length) {
-        return temps.reduce((sum, value) => sum + value, 0) / temps.length;
-      }
-      return this._read("battery_temperature", null);
+    _fanLevel(suffix) {
+      const value = this._read(suffix, null);
+      if (value === null) return null;
+      const level = Math.round(value);
+      return level >= 0 && level <= FAN_LEVEL_MAX ? level : null;
     }
 
     _batteryStatus(battery) {
@@ -1276,28 +2073,52 @@ function _hmBatteryRegister() {
     render() {
       if (!this._config) return html``;
 
-      let battery = this._read("system_battery_power", 0);
-      if (!this._resolveEntity("system_battery_power")) {
-        battery = this._read("bat_power", 0);
-      }
-      let pv = this._read("system_pv_power", 0);
-      if (!this._resolveEntity("system_pv_power")) pv = this._read("pv_power", 0);
+      /* The system level reading wins **when it has a value** - a master reports
+         `sys_bat_p` / `sys_pv_p`, while a slave reports only its own `bat_p` /
+         `pv_p` and leaves the `sys_*` entities at `unknown`.  Testing "does the
+         entity exist" instead froze a charging slave at 0.0 W, because the
+         entity does exist there and simply never gets a value.
+
+         **The battery reading is device level first, though.**  This drawing
+         depicts *this unit*, and the corner callout prints `bat_sts` - also this
+         unit's own state - right next to the number.  Taking the system total
+         there made a master that was merely standing by read "365 W ·
+         battery standby": the 365 W was its slave charging, while the caption
+         came from the master's own `bat_sts`.  `sys_bat_p` is only the safety
+         net, for a firmware that does not publish the device level field. */
+      let battery = this._firstRead(["bat_power", "system_battery_power"], 0);
+      let pv = this._firstRead(["system_pv_power", "pv_power"], 0);
 
       const gridOn = this._read("grid_on_power", 0);
       const gridOff = this._read("grid_off_power", 0);
       const status = this._batteryStatus(battery);
 
       const count = this._packCount();
+      /* A one-pack unit has nothing to be numbered against: "Battery 1" there
+         implies a second pack that does not exist, so the callout just says
+         "Battery".  With two or more the number is what tells them apart. */
+      const packName = (i) => (count === 1
+        ? this._t("Battery", "电池")
+        : `${this._t("Battery", "电池")} ${i + 1}`);
       const packs = [];
       for (let i = 0; i < PACK_MAX; i += 1) {
+        /* §32 `packs[].heat`: idle / heating / chg_req / dchg_req.  Read as text
+           because it is an enum, not a number; an unavailable entity reads as
+           "" and simply leaves the callout as it was. */
+        const heat = (this._readText(`pack${i + 1}_heating_state`) || "").toLowerCase();
+        const kind = HEAT_KINDS[heat] || null;
         packs.push({
-          label: `${this._t("Battery", "电池")} ${i + 1}`,
+          label: packName(i),
           soc: this._read(`pack${i + 1}_soc`, null),
           temp: this._read(`pack${i + 1}_temperature`, null),
+          heat,
+          /* The pill is built by a plain function outside the class, so the two
+             strings it shows have to be resolved here, where `_t` exists. */
+          heatText: kind ? this._t(kind.en, kind.zh) : "",
+          heatHint: kind ? this._t(kind.whyEn, kind.whyZh) : "",
         });
       }
       const batteryCaption = this._t("Battery ", "电池") + status.text;
-      const hostTemp = this._showHostTemp() ? this._hostTemp() : null;
       // The head's status display shows the device level SOC (1 s), the same
       // reading the power flow card and the SOC gauges use, plus this unit's
       // own PV and battery power.
@@ -1305,10 +2126,21 @@ function _hmBatteryRegister() {
       const pvDev = this._read("pv_power", 0);
       const batDev = this._read("bat_power", 0);
 
+      /* Fan speeds (§32 `fan_actual`).  `null` means "do not draw one": the
+         level is out of 0..10, which is how the firmware says the fan is not
+         fitted or not enabled (255). */
+      const fans = {
+        pcs: this._fanLevel("pcs_fan_level"),
+        bat: this._fanLevel("battery_fan_level"),
+        pcsCaption: this._t("PCS fan", "PCS 风扇"),
+        batCaption: this._t("Battery fan", "电池风扇"),
+      };
+
       return html`
+        ${this._heatNoticeMarkup()}
         <ha-card>
           <div class="head">
-            <div class="hstat">${this._alarm()}</div>
+            <div class="hstat left">${this._untrusted(this._alarmBadge())}</div>
             ${this._showTitle()
               ? html`<div class="htitle">${esc(this._title())}</div>`
               : html`<div class="htitle"></div>`}
@@ -1317,7 +2149,7 @@ function _hmBatteryRegister() {
           <div class="wrap" style=${this._wrapStyle()}>
             ${this._untrusted(this._svg({
               count, packs, pv, gridOn, gridOff, battery, status, batteryCaption,
-              hostTemp, soc, pvDev, batDev,
+              soc, pvDev, batDev, fans,
             }))}
           </div>
           ${this._config.show_history === false ? "" : this._historySection()}
@@ -1330,31 +2162,108 @@ function _hmBatteryRegister() {
       return width > 0 ? `max-width:${width}px` : "max-width:560px";
     }
 
-    _alarm() {
-      return this._alarmOn() ? html`<span class="bell">🔔</span>` : "";
+    /**
+     * The alarm state, as the device reports it.
+     *
+     * `known: false` means nothing was ever published - firmware before V0.6.2
+     * has no alarm topic at all, and this card draws nothing in that case.  A
+     * green tick would be a claim it cannot back up; a red triangle would be a
+     * false alarm.
+     */
+    _alarms() {
+      const configured = this._config && this._config.alarm_entity;
+      if (configured && this._hass) {
+        const state = (this._hass.states || {})[configured];
+        if (state) {
+          return {
+            known: state.state !== "unavailable",
+            count: state.state === "on" ? 1 : 0,
+          };
+        }
+      }
+      const entityId = this._resolveEntity("active_alarms");
+      const state = entityId && this._hass ? (this._hass.states || {})[entityId] : null;
+      const items = state && state.attributes && state.attributes.alarms;
+      if (!Array.isArray(items)) return { known: false, count: 0 };
+      return { known: true, count: items.length };
     }
 
-    /** Wi-Fi style signal bars derived from the device's `rssi` sensor. */
-    _signal() {
-      const rssi = this._read("rssi", null);
-      let bars = 0;
-      if (rssi !== null) {
-        if (rssi >= -55) bars = 4;
-        else if (rssi >= -65) bars = 3;
-        else if (rssi >= -75) bars = 2;
-        else bars = 1;
+    /**
+     * The head-band badge: a red triangle while alarms are active, a green
+     * circle with a tick when the device reports none, nothing when it never
+     * says.  Built as markup because `_untrusted()` injects it - a lit template
+     * cannot create `<path>` nodes inside an inline `<svg>`.
+     */
+    _alarmBadge() {
+      const alarms = this._alarms();
+      if (!alarms.known) return "";
+
+      if (alarms.count > 0) {
+        const title = esc(`${alarms.count} · ${this._t("Active alarms", "当前告警")}`);
+        // The stroke is the same colour as the fill and exists only to round
+        // the three corners; a plain path has needle-sharp ones.
+        return `<svg width="22" height="22" viewBox="0 0 22 22" role="img"`
+          + ` aria-label="${title}"><title>${title}</title>`
+          + `<path d="M11 3.1 20 18.6H2Z" fill="var(--error-color, #db4437)"`
+          + ` stroke="var(--error-color, #db4437)" stroke-width="2.6"`
+          + ` stroke-linejoin="round"/>`
+          + `<rect x="10.05" y="8.2" width="1.9" height="5.2" rx="0.95" fill="#ffffff"/>`
+          + `<circle cx="11" cy="15.6" r="1.1" fill="#ffffff"/></svg>`;
       }
+
+      const title = esc(this._t("No active alarms", "当前无告警"));
+      return `<svg width="22" height="22" viewBox="0 0 22 22" role="img"`
+        + ` aria-label="${title}"><title>${title}</title>`
+        + `<circle cx="11" cy="11" r="8.6" fill="none" stroke="#2f9e63" stroke-width="2"/>`
+        + `<path d="M7 11.3 9.9 14.2 15.1 8.3" fill="none" stroke="#2f9e63"`
+        + ` stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    }
+
+    /**
+     * Wi-Fi signal: four bars plus the raw reading, the way a phone shows it.
+     *
+     * Returns "" when the device reports no `rssi` at all (older firmware, or a
+     * unit that is not connected), so the head band is never decorated with a
+     * meaningless 0 dBm.
+     */
+    _signal() {
+      /* An offline unit reports no `rssi` at all, so the head band would be
+         empty exactly when the user is wondering what happened.  Say it there
+         instead - this card is the only "device" view a slave has, and a slave
+         is the unit most likely to drop off without anything else changing. */
+      if (this._deviceOffline()) {
+        const title = esc(this._t("The device is offline", "设备离线"));
+        return `<span class="hsig off" title="${title}">`
+          + `${this._signalBars(0)}<span class="hsig-v">${this._t("Offline", "离线")}</span></span>`;
+      }
+      const rssi = this._read("rssi", null);
+      if (rssi === null) return "";
+
+      const bars = rssiBars(rssi);
+      const quality = bars === 4 ? this._t("Excellent", "优秀")
+        : bars === 3 ? this._t("Good", "良好")
+          : bars === 2 ? this._t("Fair", "一般")
+            : bars === 1 ? this._t("Weak", "较弱")
+              : this._t("No signal", "无信号");
+      const dbm = `${rssi.toFixed(0)} dBm`;
+      const title = esc(`${this._t("Wi-Fi signal", "Wi-Fi 信号")}: ${quality} · ${dbm}`);
+
+      return `<span class="hsig" title="${title}">`
+        + `${this._signalBars(bars)}<span class="hsig-v">${dbm}</span></span>`;
+    }
+
+    /** The four bars; geometry matches what the header has always drawn. */
+    _signalBars(bars) {
       const color = bars === 0
         ? "var(--disabled-text-color, #b6bcc4)"
         : "var(--primary-color)";
-      let out = `<svg width="22" height="18" viewBox="0 0 22 18">`;
+      let out = `<svg width="22" height="18" viewBox="0 0 22 18" aria-hidden="true">`;
       for (let i = 0; i < 4; i += 1) {
         const h = 4 + i * 3.4;
-        out += `<rect x="${1 + i * 5}" y="${16 - h}" width="3.4" height="${h}" rx="1.4"
-          fill="${i < bars ? color : "var(--divider-color, #dcdfe4)"}"/>`;
+        out += `<rect x="${1 + i * 5}" y="${16 - h}" width="3.4" height="${h}" rx="1.4"`
+          + ` fill="${i < bars ? color : "var(--divider-color, #dcdfe4)"}"/>`;
       }
-      out += "</svg>";
-      return out;
+      return `${out}</svg>`;
     }
 
     /* --------------------------- the diagram --------------------------- */
@@ -1362,16 +2271,42 @@ function _hmBatteryRegister() {
     _svg(d) {
       // The head shows this unit's own readings, the corner callouts the system
       // level ones - the panel draws the device itself, not the whole system.
-      const { markup, bodyTop, bottom } = stackMarkup(
-        d.count, d.packs, d.hostTemp, this._t("Host", "主机"),
-        d.soc, d.pvDev, d.batDev,
-      );
+      //
+      // `_hasPv()` is false on an AC coupled model: the unit has no PV input, so
+      // its sun corner, its PV readout and its PV connector are all left out
+      // instead of showing a port that can only ever read 0 W.
+      const hasPv = this._hasPv();
+      // A photo chassis is a different product - one 1920 AC box, or the
+      // portrait MS-A2 cabinet - so each gets its own drawing, with the state
+      // of charge on the unit itself.  See `flatMarkup` / `msa2Markup`.
+      const chassis = this._chassis();
+      const { markup, bodyTop, bottom } = chassis === "msa2"
+        ? msa2Markup(d.packs, d.soc, d.fans)
+        : chassis === "flat"
+          ? flatMarkup(d.packs, d.soc, d.fans)
+          : stackMarkup(d.count, d.packs, d.soc, d.pvDev, d.batDev, d.fans, hasPv);
       const bottomY = bottom + HEADER_GAP;
       const totalH = bottomY + TAIL_GAP;
 
-      return `<svg viewBox="0 0 ${VB_W} ${totalH}" preserveAspectRatio="xMidYMid meet"
-                   xmlns="http://www.w3.org/2000/svg" role="img">
-        <defs>
+      /* Only the gradients the chassis in use references.  Both are painted in
+         `userSpaceOnUse` coordinates taken from the body the caller just built,
+         so the fall-off follows the real height instead of a hard-coded 0..1.
+         The photo chassis are transparent outside the moulding, so the only
+         thing left to paint is the level bar - horizontal on the 1920 AC,
+         vertical on the MS-A2. */
+      const defs = chassis === "msa2"
+        ? `
+          <linearGradient id="hm-msa2-bar-fill" x1="0" y1="1" x2="0" y2="0">
+            <stop offset="0" stop-color="#22c55e"/>
+            <stop offset="1" stop-color="#4ade80"/>
+          </linearGradient>`
+        : chassis === "flat"
+          ? `
+          <linearGradient id="hm-flat-bar-fill" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stop-color="#4ade80"/>
+            <stop offset="1" stop-color="#22c55e"/>
+          </linearGradient>`
+          : `
           <linearGradient id="hm-bat-top" x1="0" y1="0" x2="0.25" y2="1">
             <stop offset="0" stop-color="#333a42"/>
             <stop offset="1" stop-color="#14181c"/>
@@ -1383,11 +2318,14 @@ function _hmBatteryRegister() {
             <stop offset="0.58" stop-color="#949ba3"/>
             <stop offset="0.82" stop-color="#4a5058"/>
             <stop offset="1" stop-color="#16181b"/>
-          </linearGradient>
-        </defs>
+          </linearGradient>`;
+
+      return `<svg viewBox="0 0 ${VB_W} ${totalH}" preserveAspectRatio="xMidYMid meet"
+                   xmlns="http://www.w3.org/2000/svg" role="img">
+        <defs>${defs}</defs>
         ${this._flowPaths(d, bottom, bottomY)}
         ${markup}
-        ${this._row(30, 62, "sun", fmtW(d.pv), this._t("PV", "光伏"), "start")}
+        ${hasPv ? this._row(30, 62, "sun", fmtW(d.pv), this._t("PV", "光伏"), "start") : ""}
         ${this._row(VB_W - 30, VB_W - 58, "socket", fmtW(d.gridOn),
           this._t("Grid port", "并网端口"), "end")}
         ${this._row(30, 62, `status:${d.status.key}`, fmtW(d.battery),
@@ -1421,36 +2359,49 @@ function _hmBatteryRegister() {
      * device instead of entering it.
      */
     _flowPaths(d, bottom, bottomY) {
-      const headRight = FRONT_X + FRONT_W;   // 430, the body's right face
+      // The photo chassis are narrower / wider than the stack, so the branch
+      // connectors end at whatever the drawing's right face is.  The MS-A2 is a
+      // portrait cabinet, so its two right-hand ports also plug in much lower:
+      // its AC socket sits on the angled side face, not under the top edge.
+      const chassis = this._chassis();
+      const headRight = chassis === "msa2" ? FRONT_X + MSA2_W
+        : chassis === "flat" ? FRONT_X + FLAT_W
+          : FRONT_X + FRONT_W;
+      const acY = chassis === "msa2" ? MSA2_AC_Y : 108;
       const portX = VB_W - 30;               // 590, shared by both right ports
       const topY = 60;                       // just under the top readouts
       const BURY = 12;                       // how far a connector hides in the body
 
-      // The off-grid line always leaves the head, 12 units below the on-grid
-      // line that enters the body at 108, so the two right hand ports read as
-      // one column split in two - with a deliberate gap, because they are
-      // different ports.
+      // The off-grid line always leaves the head 12 units below the on-grid
+      // line, so the two right hand ports read as one column split in two -
+      // with a deliberate gap, because they are different ports.
       //
       // It used to duck below the lowest right hand callout instead, which
       // meant that with more than one pack the line started halfway down the
       // body instead of at the PCS.  The callouts are now inset from the right
       // edge (RIGHT_BOX_X) so the vertical at `portX` runs past them, and the
       // branch can stay where it belongs whatever the pack count is.
-      const offY = 120;
+      const offY = chassis === "msa2" ? MSA2_OFF_Y : 120;
 
-      const branches = [
-        {
+      // An AC coupled model has no PV input, so there is no connector to draw.
+      // Everything else keeps its geometry: the remaining branches are anchored
+      // to fixed coordinates, not to the list length.
+      const branches = [];
+      if (this._hasPv()) {
+        branches.push({
           key: "pv",
           // down from the sun, then right, behind the head's left face
           path: `M30 ${topY} L30 112 L${FRONT_X + BURY} 112`,
           value: d.pv,
           // PV can only ever feed the unit
           intoWhenPositive: true,
-        },
+        });
+      }
+      branches.push(
         {
           key: "gridOn",
           // down from the socket, then left, behind the head's right face
-          path: `M${portX} ${topY} L${portX} 108 L${headRight - BURY} 108`,
+          path: `M${portX} ${topY} L${portX} ${acY} L${headRight - BURY} ${acY}`,
           value: d.gridOn,
           // positive: the port is delivering to the load / grid
           intoWhenPositive: false,
@@ -1466,7 +2417,7 @@ function _hmBatteryRegister() {
           // positive: the backup port is feeding its load
           intoWhenPositive: false,
         },
-      ];
+      );
 
       /* How far each streak has got, 0..1 of one trip.  Advanced here because
          the speed depends on the power, which is only known while the branches
@@ -1865,9 +2816,6 @@ function _hmBatteryRegister() {
           <ha-textfield label="show_title (false = hide the heading)"
             .value=${config.show_title === false ? "false" : ""}
             @change=${this._changed("show_title")}></ha-textfield>
-          <ha-textfield label="show_host_temp (false = hide the head unit temperature)"
-            .value=${config.show_host_temp === false ? "false" : ""}
-            @change=${this._changed("show_host_temp")}></ha-textfield>
           <ha-textfield label="max_width (px)" .value=${config.max_width || ""}
             @change=${this._changed("max_width")}></ha-textfield>
           <ha-textfield label="alarm_entity" .value=${config.alarm_entity || ""}
@@ -1891,8 +2839,7 @@ function _hmBatteryRegister() {
       name: "Hoymiles Battery",
       description:
         "Battery stack of a Hoymiles micro storage device with per-pack SOC / "
-        + "temperature callouts and the head unit temperature (the average of "
-        + "the installed packs), scaled to the number of installed packs.",
+        + "temperature callouts, scaled to the number of installed packs.",
       preview: false,
     });
   }
