@@ -3,55 +3,54 @@
  * ----------------------------------------------------------------------------
  * Lovelace card bundled with the `hoymiles` custom integration.
  *
- * It reads the device's energy sensors from the Home Assistant recorder's
- * long-term statistics via the public websocket command
+ * Protocol V0.6.2 §45: the device itself measures where today's energy went and
+ * publishes the nine flows it knows about, every five minutes, on
  *
- *     recorder/statistics_during_period
+ *     sensor/<dev_id>/sankey/state        (Wh, reset at 00:00)
  *
- * and renders a source -> inverter -> load Sankey diagram.
+ *     pv_prod    e2l  pv -> load          e2b  pv -> battery
+ *                e2g  pv -> grid          b2g  battery -> grid
+ *                tp2b third party -> battery
+ *                tp2g third party -> grid
+ *     load_cons  efpv pv -> load (same as e2l)
+ *                efb  battery -> load     efg  grid -> load
+ *                g2b  grid -> battery
  *
- * IMPORTANT design notes
- * ----------------------
- * - The card NEVER touches the recorder database. It only calls the HA
- *   websocket API; HA does the SQL work.
- * - The websocket command does not require admin rights, but the recorder
- *   integration must be enabled (it is part of `default_config`).
- * - `types: ["change"]` makes HA return the already-computed delta for the
- *   range, so we never do value-differencing ourselves (this also sidesteps
- *   the `total_increasing` reset-detection edge cases).
- * - Rendering is hand-rolled SVG (no ECharts / no CDN), so the card keeps
- *   working on an offline Raspberry Pi.
+ * The integration decodes that into the `Energy Flow Today` sensor, and this
+ * card draws those numbers.  Nothing is estimated and nothing is read from the
+ * recorder: the diagram matches the one in the vendor app, because it is the
+ * same measurement.
+ *
+ * DAY NAVIGATION: the device clears these totals at 00:00, so a past day's
+ * diagram cannot be produced on demand.  The integration therefore keeps one
+ * snapshot per day on disk (that day's **last** report, which is the diagram as
+ * it stood at 23:59) and this card fetches the archive over the WebSocket
+ * command `hoymiles/sankey/history`.  Today still comes from the entity; the
+ * picker appears as soon as there are two days to choose from.  The archive
+ * starts when this version is installed - days before that are not invented.
  *
  * Card config:
  *   type: custom:hoymiles-energy-sankey
  *   dev_id: MSA-280520260806      # required
- *   title: Energy flow            # optional
- *   language: en                  # optional (en|zh|de); omit to follow Home Assistant
- *   range: today                  # optional (today|7d|30d|month)
- *   balancer_label: Loss          # optional label for the residual node
- *   show_toolbar: true            # optional
- *   ribbon_gap: 3                 # optional px of white line between ribbons
- *   ribbon_opacity: 0.5           # optional ribbon opacity (0..1)
+ *   title: Energy flow      # optional; accepts an en/zh map
+ *   language: en                  # optional (en|zh|de); omit to follow the picker
+ *   icon: sankey                  # optional header icon (flow|sankey|swap, or text)
+ *   ribbon_gap: 0                 # optional px of white line between ribbons
+ *   ribbon_opacity: 0.58          # optional ribbon opacity (0..1)
  *   icons:                        # optional per-node emoji overrides
- *     pv: "☀️"
- *   statistics:                   # optional statistic_id overrides
- *     pv: sensor.my_pv_energy
- *     grid_in: [sensor.a, sensor.b]
+ *     pv: "sun"
  *
- * Layout: a direct source -> sink sankey (no hub). Each side is a single
- * column of node boxes (icon + value + unit + share of the period) with a
- * tinted label band facing the ribbons. Because the device meters every port
- * separately, the routing behind the ribbons is NOT measured: it is estimated
- * by spreading each source over the sinks proportionally (iterative
- * proportional fitting), forbidding impossible loops such as
- * battery-discharge -> battery-charge. Read the ribbons as a best-effort
- * attribution, not as metered truth.
+ * HIDDEN WITHOUT A METER: the whole card renders nothing when the device says
+ * it has no grid meter (`has_meter` is false or not reported yet), because the
+ * grid flows would all be zero and the picture would claim the unit never
+ * imports or exports.  The dashboard layout is built with that in mind.
+ *
+ * Layout: a direct source -> sink sankey.  Four sources on the left, three
+ * sinks on the right, and a ribbon for every flow the device reported.
  *
  * Interaction: click a ribbon to highlight that single flow, or click a node
- * box to highlight every ribbon that touches it. The rest of the diagram dims
- * and a detail panel lists the involved flows. Click the same target again (or
- * click empty diagram space) to clear. This is a pure view state: the numbers
- * never change.
+ * box to highlight every ribbon that touches it.  Pure view state - the
+ * numbers never change.
  * ========================================================================== */
 
 function _hmSankeyRegister() {
@@ -62,38 +61,39 @@ function _hmSankeyRegister() {
   /* ------------------------------------------------------------------ *
    * Language
    *
-   * Three languages: English, Simplified Chinese and German.
+   * The choice belongs to the viewer, not to the dashboard: it lives in one
+   * localStorage key and is announced with one window event, so the dropdown
+   * on any card switches every card on the page at once, and the choice
+   * survives a reload.  English is the default.
    *
-   * Resolution order, first hit wins:
-   *   1. `language:` on the card - an explicit choice, and what an older
-   *      dashboard may already carry;
-   *   2. the Home Assistant user's language, so the cards follow the UI like
-   *      every built-in one does;
-   *   3. English.
-   *
-   * `zh-Hans` / `zh-Hant` / `zh-CN` all collapse to `zh`: the wording is the
-   * same in either script, and the card has no Traditional translation to
-   * offer.  `de-AT` / `de-CH` collapse to `de` for the same reason.
+   * `zh-Hans` / `zh-Hant` / `zh-CN` all collapse to `zh`, `de-AT` / `de-CH` to
+   * `de`: the wording is the same in either variant.
    * ------------------------------------------------------------------ */
-  /* German wording, keyed by the English string.
-
-     Keyed by English on purpose: the call sites pass English and Chinese
-     only, so they needed no third argument when German was added, and a
-     missing entry falls back to English instead of leaving a blank. */
   const T_DE = {
-    "No energy sensor of this device was found. Check that the integration is set up and the device is online.": "Es wurde kein Energie-Sensor dieses Geräts gefunden. Prüfe, ob die Integration eingerichtet und das Gerät online ist.",
-    "The recorder integration is unavailable, so long-term statistics cannot be read.": "Die Recorder-Integration ist nicht verfügbar, daher können keine Langzeitstatistiken gelesen werden.",
-    "Failed to read statistics": "Statistiken konnten nicht gelesen werden",
     "Energy flow": "Energiefluss",
+    "Energy flow today": "Energiefluss heute",
+    "PV": "PV",
+    "Third-party PV": "Drittanbieter-PV",
+    "Battery out": "Batterieabgabe",
+    "Battery in": "Batterieladung",
+    "Grid in": "Netzbezug",
+    "Grid out": "Netzeinspeisung",
+    "Load": "Last",
     "total": "gesamt",
-    "Click again to clear.": "Erneut klicken zum Aufheben.",
-    "Refresh": "Aktualisieren",
-    "Reading statistics…": "Statistiken werden gelesen…",
     "No data yet.": "Noch keine Daten.",
-    "No energy was recorded in the selected period.": "Im gewählten Zeitraum wurde keine Energie aufgezeichnet.",
+    "No energy recorded today.": "Heute keine Energie aufgezeichnet.",
+    "No energy recorded on this day.": "An diesem Tag keine Energie aufgezeichnet.",
+    "No energy flow data for this device.": "Keine Energieflussdaten f\u00fcr dieses Ger\u00e4t.",
+    "No record for this day.": "F\u00fcr diesen Tag liegt kein Eintrag vor.",
+    "No grid meter was connected that day.": "An diesem Tag war kein Netzz\u00e4hler angeschlossen.",
+    "Nothing recorded yet today.": "Heute noch nichts aufgezeichnet.",
+    "Click again to clear.": "Erneut klicken zum Aufheben.",
     "Tip: click a ribbon or a node box to highlight that part of the flow.": "Tipp: Auf ein Band oder einen Knoten klicken, um diesen Teil des Flusses hervorzuheben.",
-    "Ports are metered independently, so a balance line is shown for conversion losses and unmeasured flows.": "Die Anschlüsse werden unabhängig gemessen; deshalb zeigt eine Ausgleichslinie Wandlungsverluste und nicht gemessene Flüsse.",
-    "No statistics yet for: ": "Noch keine Statistiken für: ",
+    "Today's cumulative values as measured by the device; they reset at 00:00.": "Vom Ger\u00e4t gemessene Tageswerte, um 00:00 zur\u00fcckgesetzt.",
+    "The device's last cumulative values of that day, as archived by Home Assistant.": "Die letzten Tageswerte des Ger\u00e4ts an diesem Tag, von Home Assistant archiviert.",
+    "Previous day": "Vorheriger Tag",
+    "Next day": "N\u00e4chster Tag",
+    "Only days since this integration was running are archived.": "Archiviert werden nur Tage, an denen die Integration lief.",
   };
 
   /** Map any Home Assistant language tag to one of the three card languages. */
@@ -105,21 +105,8 @@ function _hmSankeyRegister() {
     return "";
   }
 
-  /* ------------------------------------------------------------------ *
-   * The language the user picked
-   *
-   * The choice belongs to the viewer, not to the dashboard: it lives in one
-   * localStorage key and is announced with one window event, so the dropdown
-   * on any card switches every card on the page at once, and the choice
-   * survives a reload.
-   *
-   * English is the default.  It deliberately does NOT follow the Home
-   * Assistant UI language any more: a dashboard is often shared, and the point
-   * of the dropdown is that the reader decides.
-   * ------------------------------------------------------------------ */
   const LANG_KEY = "hoymiles.language";
   const LANG_EVENT = "hoymiles-language";
-  const LANG_CHOICES = [["en", "English"], ["zh", "\u4e2d\u6587"], ["de", "Deutsch"]];
 
   /** The stored choice, or "" when nothing has been picked (or no storage). */
   function hmStored() {
@@ -130,19 +117,13 @@ function _hmSankeyRegister() {
     }
   }
 
-  /** Remember a choice and tell every card about it. */
-  function hmSetLang(value) {
-    const lang = hmNormalise(value) || "en";
-    try {
-      window.localStorage.setItem(LANG_KEY, lang);
-    } catch (err) {
-      /* nothing to remember it with; the event still switches this page */
-    }
-    window.dispatchEvent(new CustomEvent(LANG_EVENT, { detail: lang }));
-  }
-
   function hmLang(hass, config) {
-    return hmStored() || hmNormalise(config && config.language) || "en";
+    const locale = hass && hass.locale;
+    const ui = (locale && locale.language) || (hass && hass.language);
+    return hmStored()
+      || hmNormalise(config && config.language)
+      || hmNormalise(ui)
+      || "en";
   }
 
   /**
@@ -150,8 +131,7 @@ function _hmSankeyRegister() {
    *
    * German comes from the card's own dictionary, keyed by the English string -
    * that is why `_t()` call sites did not have to change when the third
-   * language was added.  A missing entry falls back to English, so an
-   * untranslated string shows English rather than nothing.
+   * language was added.  A missing entry falls back to English.
    */
   function hmPick(lang, en, zh) {
     if (lang === "zh") return zh;
@@ -162,8 +142,6 @@ function _hmSankeyRegister() {
     return en;
   }
 
-  /* (hmLang defined above, with the dictionary.) */
-
   /* ------------------------------------------------------------------ *
    * Localised config strings
    *
@@ -173,13 +151,6 @@ function _hmSankeyRegister() {
    *   title:
    *     en: Energy flow
    *     zh: 能量流
-   *   balancer_label:
-   *     en: Loss / other
-   *     zh: 损耗/其他
-   *
-   * That is what lets the text *you* write follow the language the reader
-   * picked, instead of pinning a dashboard to one language. A map missing the current language
-   * falls back to `en`, then to whichever entry exists.
    * ------------------------------------------------------------------ */
   function hmText(value, lang) {
     if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -206,91 +177,165 @@ function _hmSankeyRegister() {
   const PAD_TOP = 14;
   const PAD_BOTTOM = 14;
   const SIDE_PAD = 12;
-  const NODE_W = 58;      // width of a node box (icon + value + %)
-  const CHIP_W = 186;     // tinted "label band" drawn next to a node box
-  const GAP = 14;         // vertical gap between node boxes
-  const MIN_NODE_H = 46;  // keep small nodes readable
+  const NODE_W = 68;      // width of a node box (icon + value + unit + %)
+  const GAP = 7;          // vertical gap between node boxes
+  const MIN_NODE_H = 64;  // keep small nodes readable
+  const EDGE_GAP = 0;     // ribbons leave the node box flush, no visible slit
+  const LABEL_INSET = 12; // label text distance from the edge of its box
   const LEFT_X = SIDE_PAD;                    // left node box
-  const LEFT_CHIP_X = LEFT_X + NODE_W;        // left label band
-  const RIBBON_L = LEFT_CHIP_X + CHIP_W;      // ribbons start here
   const RIGHT_X = VB_W - SIDE_PAD - NODE_W;   // right node box
-  const RIGHT_CHIP_X = RIGHT_X - CHIP_W;      // right label band
-  const RIBBON_R = RIGHT_CHIP_X;              // ribbons end here
+  /* The ribbons run the whole width, straight out of the node boxes, and the
+     names are painted on top of them.  Reserving a column for the labels left
+     two tall empty strips of card colour down the sides, which the eye reads as
+     white slabs no matter what was drawn behind the text. */
+  const RIBBON_L = LEFT_X + NODE_W + EDGE_GAP;   // ribbons start here
+  const RIBBON_R = RIGHT_X - EDGE_GAP;           // ribbons end here
+  const LEFT_CHIP_X = LEFT_X + NODE_W;           // left label anchor
+  const RIGHT_CHIP_X = RIGHT_X;                  // right label anchor
   const CHART_H = VB_H - PAD_TOP - PAD_BOTTOM;
 
-  /** Emoji glyphs keep the card dependency-free (no icon font, no CDN). */
-  const ICONS = {
-    pv: "☀️",
-    grid_in: "⚡",
-    grid_out: "⚡",
-    bat_discharge: "🔋",
-    bat_charge: "🔋",
-    plug_in: "🔌",
-    plug_out: "🔌",
-    eps_in: "⚠️",
-    eps_out: "⚠️",
-    loss: "📉",
-    unmeasured: "❓",
-  };
+  /** The grid pylon, shared by the supply and the feed-in node.  One shape for
+     both directions; the plate and the direction of the ribbons already say
+     which way the energy goes, so a second pictogram only added noise. */
+  const GLYPH_PYLON = `<g fill="none" stroke="#fff" stroke-width="1.9"
+      stroke-linecap="round" stroke-linejoin="round">
+      <path d="M9.4 4.4h5.2l1.3 3.2H8.1z"/>
+      <path d="M2.8 9.6h18.4"/>
+      <path d="M8.1 7.6 5.2 9.6M15.9 7.6l2.9 2"/>
+      <path d="M7.2 9.6 4.6 20.4M16.8 9.6l2.6 10.8"/>
+      <path d="M6.2 11.6 17.8 18.2M17.8 11.6 6.2 18.2"/>
+    </g>`;
 
   /**
-   * Flows that cannot physically exist inside one accounting period:
-   * a medium cannot feed itself (battery discharge -> battery charge, ...).
+   * The glyphs inside a node box.
+   *
+   * Each one is a WHITE pictogram that says what the node IS (sun = PV,
+   * battery = storage, pylon = grid supply and feed-in, house = load), printed
+   * straight onto the dark plate at the top of the box.  White rather than
+   * coloured: the plate is a translucent black over a saturated node colour, so
+   * any hue in the drawing either vanished into that colour or read as a stain -
+   * white is the one value that stands off every node colour, and it also
+   * matches the light glyphs the vendor app uses.
+   *
+   * Not emoji: an emoji is rendered by the platform's own font, so it arrived
+   * with its own colours and shadows and a different size on every OS, none of
+   * which matched the box it sat on.  `icons:` in the card config still
+   * overrides one with any text.
+   * Each entry is the inner markup of a 24 x 24 viewBox.
    */
-  const NO_LOOP = [
-    ["bat_discharge", "bat_charge"],
-    ["grid_in", "grid_out"],
-    ["plug_in", "plug_out"],
-    ["eps_in", "eps_out"],
+  const GLYPH = {
+    /* Sun: solid disc with eight rays. The classic PV pictogram. */
+    pv: `<circle cx="12" cy="12" r="4.2" fill="#fff"/>
+      <g stroke="#fff" stroke-width="2" stroke-linecap="round">
+        <path d="M12 2.9v2.5M12 18.6v2.5M2.9 12h2.5M18.6 12h2.5"/>
+        <path d="M5.5 5.5 7.3 7.3M16.7 16.7l1.8 1.8M18.5 5.5 16.7 7.3M7.3 16.7l-1.8 1.8"/>
+      </g>`,
+    /* A second, smaller sun: "another PV source".  No longer used - third-party
+       PV is folded into `pv` - but kept so an old dashboard that still passes
+       `icons.tp` has something to draw. */
+    tp: `<circle cx="10" cy="10" r="3.6" fill="#fff"/>
+      <g stroke="#fff" stroke-width="1.7" stroke-linecap="round">
+        <path d="M10 2v2M2 10h2M4.6 4.6 6 6M15.4 4.6 14 6M4.6 15.4 6 14"/>
+      </g>
+      <circle cx="17.4" cy="17.4" r="3" fill="#fff"/>`,
+    /* Battery with a bolt: energy is leaving the pack. */
+    bat_out: `<rect x="2.6" y="6.4" width="14.6" height="11.2" rx="2.6"
+        fill="none" stroke="#fff" stroke-width="1.9"/>
+      <path d="M19.6 9.9v4.2" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/>
+      <path d="M13.3 8.4 9.2 13h2.6l-1 3 4.2-4.6h-2.7z" fill="#fff"/>`,
+    /* The same battery with a plus: energy is being stored. */
+    bat_in: `<rect x="2.6" y="6.4" width="14.6" height="11.2" rx="2.6"
+        fill="none" stroke="#fff" stroke-width="1.9"/>
+      <path d="M19.6 9.9v4.2" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/>
+      <path d="M8.3 12h6.4M11.5 8.8v6.4" stroke="#fff" stroke-width="2"
+        stroke-linecap="round"/>`,
+    /* Transmission pylon: a small cage on top, a cross-arm whose tips run past
+       the legs, two splayed legs and one big X brace - the shape the vendor app
+       uses for the grid, both directions. */
+    grid_in: GLYPH_PYLON,
+    grid_out: GLYPH_PYLON,
+    /* House with a lit window: the load. */
+    load: `<path d="M3.3 11.3 12 3.9l8.7 7.4" fill="none" stroke="#fff"
+        stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M5.7 10.5v8.5a1.2 1.2 0 0 0 1.2 1.2h10.2a1.2 1.2 0 0 0 1.2-1.2v-8.5"
+        fill="none" stroke="#fff" stroke-width="1.9" stroke-linejoin="round"/>
+      <rect x="10.1" y="13.2" width="3.8" height="4.4" rx=".7" fill="#fff"/>`,
+  };
+
+  /** Fallback glyph, so an unknown node id is never invisible. */
+  const GLYPH_FALLBACK = `<circle cx="12" cy="12" r="4" fill="#fff"/>`;
+
+  /* ------------------------------------------------------------------ *
+   * Node model — four sources on the left, three sinks on the right.
+   *
+   * Battery and grid appear on both sides on purpose: "battery out" is
+   * discharge and "battery in" is charge, and one node cannot be both a
+   * source and a sink of the same diagram.
+   * ------------------------------------------------------------------ */
+  /* Colors follow the reference the user supplied: PV is yellow, battery is
+     green (two shades, so charge and discharge stay apart), the grid is grey
+     (it is a metered utility, not a colour of its own) and the load is blue.
+     The node text is dark (#111), which stays legible on all four. */
+  const SOURCES = [
+    { id: "pv", side: "src", en: "PV", zh: "光伏供电", color: "#F5C342" },
+    { id: "bat_out", side: "src", en: "Battery out", zh: "电池供电", color: "#45C08C" },
+    { id: "grid_in", side: "src", en: "Grid in", zh: "电网供电", color: "#A9AEB3" },
+  ];
+
+  const SINKS = [
+    { id: "load", side: "snk", en: "Load", zh: "负载消耗", color: "#2E90D6" },
+    { id: "bat_in", side: "snk", en: "Battery in", zh: "存入电池", color: "#22C55E" },
+    { id: "grid_out", side: "snk", en: "Grid out", zh: "馈入电网", color: "#8F959B" },
   ];
 
   /* ------------------------------------------------------------------ *
-   * Node model — sources on the left, sinks on the right, ribbons in
-   * between. There is no artificial "hub" node: the diagram is a direct
-   * source -> sink sankey, exactly like an energy-flow reference chart.
+   * The nine flows the device reports, and the sensor attribute each one
+   * arrives in.  `e2l` and `efpv` are the same quantity seen from the two
+   * sides of the topic; the production side (`e2l`) is used, so no flow is
+   * counted twice.
    * ------------------------------------------------------------------ */
-  const NODE_DEFS = [
-    // ---- sources (left) ----
-    { id: "pv", side: "src", en: "PV", zh: "光伏", color: "#F5A623",
-      keys: ["system_pv_energy_today", "system_pv2_energy_today"] },
-    { id: "grid_in", side: "src", en: "Grid in", zh: "电网受电", color: "#4A90D9",
-      keys: ["grid_on_energy_in_today"] },
-    { id: "bat_discharge", side: "src", en: "Battery out", zh: "电池放电", color: "#9B8AFF",
-      keys: ["battery_discharge_energy_today"] },
-    { id: "plug_in", side: "src", en: "Plug in", zh: "插座输入", color: "#2DD4BF",
-      keys: ["plug_input_energy_today"] },
-    { id: "eps_in", side: "src", en: "EPS in", zh: "EPS 输入", color: "#FB923C",
-      keys: ["eps_input_energy_today"] },
-    // ---- sinks (right) ----
-    { id: "grid_out", side: "snk", en: "Grid out", zh: "电网送电", color: "#2E6DB4",
-      keys: ["grid_on_energy_out_today"] },
-    { id: "bat_charge", side: "snk", en: "Battery in", zh: "电池充电", color: "#7B61FF",
-      keys: ["battery_charge_energy_today"] },
-    { id: "plug_out", side: "snk", en: "Plug out", zh: "插座输出", color: "#12B76A",
-      keys: ["plug_output_energy_today"] },
-    { id: "eps_out", side: "snk", en: "EPS out", zh: "EPS 输出", color: "#E5484D",
-      keys: ["eps_output_energy_today"] },
+  const FLOWS = [
+    { id: "pv_e2l", from: "pv", to: "load" },
+    { id: "pv_e2b", from: "pv", to: "bat_in" },
+    { id: "pv_e2g", from: "pv", to: "grid_out" },
+    /* Third-party PV is a second PV input on the same unit, not a different
+       kind of energy, so the card folds it into the single `pv` node: the
+       reference picture has one yellow source on the left.  Its two flows keep
+       their own ids (they are separate measurements) and are ADDED to the same
+       pv -> bat_in / pv -> grid_out entries - see the accumulation in
+       _buildGraph. */
+    { id: "pv_tp2b", from: "pv", to: "bat_in" },
+    { id: "pv_tp2g", from: "pv", to: "grid_out" },
+    { id: "pv_b2g", from: "bat_out", to: "grid_out" },
+    { id: "load_efb", from: "bat_out", to: "load" },
+    { id: "load_efg", from: "grid_in", to: "load" },
+    { id: "load_g2b", from: "grid_in", to: "bat_in" },
   ];
 
-  // Synthetic nodes, only drawn when a balancing amount exists.
-  const SYNTH = {
-    unmeasured: { id: "unmeasured", side: "src", en: "Unmetered", zh: "未计量", color: "#A78BFA" },
-    loss: { id: "loss", side: "snk", en: "Loss / other", zh: "损耗/其他", color: "#9CA3AF" },
-  };
-
-  const RANGES = [
-    { id: "today", en: "Today", zh: "今日" },
-    { id: "7d", en: "7 days", zh: "近 7 天" },
-    { id: "30d", en: "30 days", zh: "近 30 天" },
-    { id: "month", en: "This month", zh: "本月" },
-  ];
-  const DEFAULT_RANGE = "today";
+  /* Below this a flow is noise, not a ribbon (kWh).  Shared by `_buildGraph`
+     and by the picker, so "this day is empty" means the same thing in both
+     places: the date can never stay black over an empty diagram. */
+  const EMPTY_EPS = 0.0005;
 
   /* ------------------------------------------------------------------ *
    * Small helpers
    * ------------------------------------------------------------------ */
   function slug(id) {
     return String(id).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  }
+
+  /**
+   * The SN part of `<prefix>-<SN>`.
+   *
+   * The integration names its entities after the **device name**, so renaming a
+   * device to "G3" turns `sensor.msa_280577777777_energy_flow_today` into
+   * `sensor.g3_msa_280577777777_energy_flow_today`. The SN survives that rename
+   * and the frontend no longer exposes `unique_id`, so the SN is what the
+   * lookup keys on.
+   */
+  function serialOf(devId) {
+    const parts = String(devId == null ? "" : devId).split("-");
+    return parts[parts.length - 1].toLowerCase();
   }
 
   function esc(text) {
@@ -305,16 +350,40 @@ function _hmSankeyRegister() {
     return Number.isFinite(parsed) ? parsed : 0;
   }
 
+  /**
+   * Zero-pad a number to two digits, for `YYYY-MM-DD` keys.
+   */
+  function pad2(value) {
+    return String(value).padStart(2, "0");
+  }
+
+  /**
+   * Zero-pad a number to two digits, for `YYYY-MM-DD` keys.
+   */
+  function pad2(value) {
+    return String(value).padStart(2, "0");
+  }
+
+  /**
+   * Step a `YYYY-MM-DD` key by whole days.
+   *
+   * `Date.UTC` on purpose: the key is a calendar date, not an instant, so the
+   * browser's time zone must not take part.  Parsing `"2026-11-18"` with `new
+   * Date()` reads it as UTC midnight and then shifts it back a day west of
+   * Greenwich.
+   */
+  function shiftDay(key, step) {
+    const parts = String(key || "").split("-").map(Number);
+    if (parts.length !== 3 || parts.some((part) => !Number.isFinite(part))) return "";
+    const stamp = Date.UTC(parts[0], parts[1] - 1, parts[2]) + step * 86400000;
+    return new Date(stamp).toISOString().slice(0, 10);
+  }
+
   /* ------------------------------------------------------------------ *
-   * Icon set
+   * Header icon
    *
-   * The same filled, multi-colour SVG language as the control and gauge cards,
-   * so the header of this card does not fall back to an emoji while the rest of
-   * the dashboard is drawn art.  Only the flow-related shapes live here; the
-   * gauge card carries the production / battery ones.
-   *
-   * `icon:` takes one of these names, or any other string, which is rendered as
-   * text - that keeps an `icon: 📊` config working.
+   * `icon:` takes one of these names, or any other string, which is rendered
+   * as text - that keeps a plain emoji in the config working.
    * ------------------------------------------------------------------ */
   const ICON_SVG = {
     /* Three coloured sources merging into one thick slate line. */
@@ -352,6 +421,10 @@ function _hmSankeyRegister() {
     dot: () => `<circle cx="12" cy="12" r="4.2" fill="currentColor"/>`,
   };
 
+  /* The sensor reports watt-hours; everything below works in kWh, which is
+   * what the formatter works with. */
+  const WH_PER_KWH = 1000;
+
   /** Split a kWh value into a readable number + unit (484 Wh / 4.74 kWh). */
   function splitEnergy(kwh) {
     const v = num(kwh);
@@ -374,40 +447,26 @@ function _hmSankeyRegister() {
     return `${text} ${unit}`;
   }
 
+  /* Two decimals: the node shares and the per-ribbon shares are read against
+     each other, and one decimal made small splits collapse onto the same value
+     (1.2 % next to 0.0 %). */
   function fmtPct(part, total) {
-    if (!total) return "0%";
-    return `${((part / total) * 100).toFixed(1)}%`;
+    if (!total) return "0.00%";
+    return `${((part / total) * 100).toFixed(2)}%`;
   }
 
-  /** Start of the local day, `offsetDays` days back. */
-  function dayStart(date, offsetDays) {
-    const d = new Date(date);
-    d.setHours(0, 0, 0, 0);
-    d.setDate(d.getDate() - (offsetDays || 0));
-    return d;
-  }
-
-  function resolveWindow(rangeId, now) {
-    switch (rangeId) {
-      case "7d":
-        return { start: dayStart(now, 6), end: now };
-      case "30d":
-        return { start: dayStart(now, 29), end: now };
-      case "month": {
-        const d = new Date(now);
-        d.setHours(0, 0, 0, 0);
-        d.setDate(1);
-        return { start: d, end: now };
-      }
-      case "today":
-      default:
-        return { start: dayStart(now, 0), end: now };
-    }
-  }
-
-  /** Smooth sankey ribbon between two vertical segments. */
+  /**
+   * Smooth sankey ribbon between two vertical segments.
+   *
+   * The control points sit 0.62 of the span away from each end, i.e. they pass
+   * each other slightly in the middle. That makes the band leave and enter the
+   * node almost horizontally and do its turning in the middle third - the
+   * rounded, unhurried curve the vendor app draws. At 0.5 the two control
+   * points meet exactly in the centre and the result is a flat diagonal that
+   * reads as a straight stripe rather than as flow.
+   */
   function ribbon(x1, y1, h1, x2, y2, h2) {
-    const dx = Math.max(12, (x2 - x1) * 0.5);
+    const dx = Math.max(12, (x2 - x1) * 0.62);
     return [
       `M ${x1} ${y1}`,
       `C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`,
@@ -443,59 +502,6 @@ function _hmSankeyRegister() {
     return { scale: hi, minH };
   }
 
-  /**
-   * Split every source over every sink.
-   *
-   * The device meters each port on its own, so the real routing (which kWh
-   * went where) is NOT measured. We therefore spread each source over the
-   * sinks proportionally to the sink sizes and then run a few iterations of
-   * iterative proportional fitting so that both the row totals (sources) and
-   * the column totals (sinks) come out right. `forbidden` removes cells that
-   * cannot physically exist, e.g. a battery discharging into itself.
-   *
-   * The result is a best-effort estimate, which is why the card keeps an
-   * explicit "loss / unmetered" node instead of pretending to be exact.
-   */
-  function allocate(srcs, snks, forbidden) {
-    const n = srcs.length;
-    const m = snks.length;
-    const total = srcs.reduce((acc, v) => acc + v, 0) || 1;
-    const a = srcs.map(() => new Array(m).fill(0));
-    for (let i = 0; i < n; i += 1) {
-      for (let j = 0; j < m; j += 1) a[i][j] = (srcs[i] * snks[j]) / total;
-    }
-    for (const [i, j] of forbidden) {
-      if (i >= 0 && i < n && j >= 0 && j < m) a[i][j] = 0;
-    }
-    for (let it = 0; it < 8; it += 1) {
-      for (let i = 0; i < n; i += 1) {
-        const row = a[i].reduce((x, v) => x + v, 0);
-        if (row > 0) for (let j = 0; j < m; j += 1) a[i][j] *= srcs[i] / row;
-      }
-      for (let j = 0; j < m; j += 1) {
-        let col = 0;
-        for (let i = 0; i < n; i += 1) col += a[i][j];
-        if (col > 0) for (let i = 0; i < n; i += 1) a[i][j] *= snks[j] / col;
-      }
-    }
-    // Landing pass: make the source side exact so ribbon thickness always
-    // adds up to the value printed in the source node.
-    for (let i = 0; i < n; i += 1) {
-      const row = a[i].reduce((x, v) => x + v, 0);
-      if (row > 0) {
-        const k = srcs[i] / row;
-        for (let j = 0; j < m; j += 1) a[i][j] *= k;
-      } else if (m) {
-        const allowed = [];
-        for (let j = 0; j < m; j += 1) {
-          if (!forbidden.some(([fi, fj]) => fi === i && fj === j)) allowed.push(j);
-        }
-        if (allowed.length) a[i][allowed[0]] += srcs[i];
-      }
-    }
-    return a;
-  }
-
   /* ------------------------------------------------------------------ *
    * Card
    * ------------------------------------------------------------------ */
@@ -504,33 +510,62 @@ function _hmSankeyRegister() {
       return {
         _config: { type: Object },
         _hass: { type: Object },
-        _range: { type: String },
-        _loading: { type: Boolean },
-        _error: { type: String },
         _graph: { type: Object },
-        _missing: { type: Array },
-        _noStats: { type: Array },
+        _hidden: { type: Boolean },
+        _missing: { type: Boolean },
         _selected: { type: Object },
       };
     }
 
     constructor() {
       super();
-      this._range = DEFAULT_RANGE;
-      this._loading = false;
-      this._error = null;
       this._graph = null;
-      this._missing = [];
-      this._noStats = [];
-      this._fetchToken = 0;
+      // `true` while the device reports no meter: the card renders nothing.
+      this._hidden = false;
+      // `true` when the sensor itself is missing (integration not set up).
+      this._missing = false;
+      // Signature of the numbers the current `_graph` was built from, so a
+      // `hass` assignment that changed nothing else does not rebuild it.
+      this._sig = null;
+      this._entityId = null;
       // Click-to-highlight state. Stored by node id / flow endpoints (not by
       // array index) so it survives a data refresh that rebuilds the graph.
-      //   null                                  -> nothing highlighted
-      //   { kind: "flow", from, to }            -> one ribbon
+      //   null                                    -> nothing highlighted
+      //   { kind: "flow", from, to }              -> one ribbon
       //   { kind: "node", side: "src"|"snk", id } -> every ribbon of a node
       this._selected = null;
+      // Which archived day the card is showing; `null` means "today, live".
+      this._day = null;
+      // Archived days from the integration (`hoymiles/sankey/history`):
+      // `[{date, payload, flags, saved_at}]`, oldest first.
+      this._days = [];
+      // Key of the live numbers the archive was last fetched for: a device
+      // publish refreshes it, merely switching days does not.
+      this._dayKey = null;
+      this._loadingDays = false;
+      // `true` once the archive has answered (or there was no way to ask).
+      // Until then the card refuses to render: the live entity is `unavailable`
+      // while the unit is off and carries no `has_meter`, so drawing immediately
+      // meant showing the card and taking it away again a moment later.
+      this._daysReady = false;
+      // `true` when the selected day has no archived payload (pruned, or never
+      // recorded) - which is not the same as "that day used no energy".
+      this._dayMissing = false;
+      // `true` when the selected day's archive says the unit had **no grid
+      // meter** that day: there is no energy flow to draw, meter or not.
+      this._noMeterDay = false;
+      // Day picker popover: whether it is open and which month it shows.
+      this._calOpen = false;
+      this._calMonth = null;
+      // Last `has_meter` the device reported.  `unavailable` drops the
+      // attributes, and without remembering the flag an offline unit would hide
+      // the card instead of showing what it last had.
+      this._hasMeterKnown = null;
       // Unique prefix so several cards on one page do not clash on <clipPath> ids.
       this._uid = `hm-sk-${Math.random().toString(36).slice(2, 9)}`;
+      // Bound here rather than as a class field: the click handler needs `this`
+      // however Lit rebinds the listener.
+      this._handleClick = (event) => this._onClick(event);
     }
 
     static getConfigElement() {
@@ -538,7 +573,7 @@ function _hmSankeyRegister() {
     }
 
     static getStubConfig() {
-      return { dev_id: "", range: DEFAULT_RANGE };
+      return { dev_id: "" };
     }
 
     static get styles() {
@@ -547,21 +582,101 @@ function _hmSankeyRegister() {
         ha-card { padding: 12px 14px 14px; }
         .head { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center;
                 justify-content: space-between; }
-        .title { font-size: 15px; font-weight: 500; color: var(--primary-text-color);
-                 display: flex; align-items: center; gap: 7px; }
+        /* The title is a caption, not a heading: at 15px it competed with the
+           node numbers, which are the point of the picture. */
+        .title { font-size: 13px; font-weight: 500; color: var(--primary-text-color);
+                 display: flex; align-items: center; gap: 6px; }
         .title svg { display: block; flex: none; }
-        .total { font-size: 12px; color: var(--secondary-text-color); }
-        .toolbar { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0 4px; }
-        .pill { padding: 3px 10px; border: 1px solid var(--divider-color); border-radius: 999px;
-                cursor: pointer; font-size: 12px; color: var(--secondary-text-color);
-                background: none; }
-        .pill.on { background: var(--primary-color); border-color: var(--primary-color);
-                   color: var(--text-primary-color, #fff); }
+        /* Header right side: the date navigator, pushed to the far right. */
+        .hright { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+        /* Date navigator: the same pill the history card uses - ‹ date ›. */
+        .daynav { display: flex; align-items: center; gap: 2px;
+                  border: 1px solid var(--divider-color); border-radius: 999px;
+                  padding: 2px; background: var(--card-background-color, #fff); }
+        .daynav button { width: 26px; height: 26px; border-radius: 50%; border: none;
+                         background: none; cursor: pointer; font: inherit;
+                         font-size: 15px; line-height: 1;
+                         display: inline-flex; align-items: center;
+                         justify-content: center; color: var(--primary-text-color); }
+        .daynav button:hover:not(:disabled) {
+          background: var(--secondary-background-color, rgba(127,127,127,.1)); }
+        .daynav button:disabled { opacity: .3; cursor: default; }
+        /* A day with nothing to draw: the date itself goes grey, the way a
+           disabled field does.  The picture is never greyed - a day that *has*
+           an energy flow is drawn at full colour whether the device is online or
+           not. */
+        .daynav .daybtn.empty { color: var(--disabled-text-color, #b6bcc4); }
+
+        /* ------------------------------------------------------------------ *
+         * Day calendar
+         *
+         * The same widget the history chart uses: the native date input only
+         * greys the future, so it cannot answer "which days have something to
+         * draw".  This popover can - a day with an energy flow keeps the normal
+         * text colour, a day without one is grey, and the legend says so.
+         * ------------------------------------------------------------------ */
+        .dayhost { position: relative; display: inline-flex; }
+        .daybtn { font: inherit; font-size: 12.5px; font-weight: 600;
+                  color: var(--primary-text-color); background: none;
+                  border: none; outline: none; padding: 4px 6px;
+                  text-align: center; cursor: pointer; border-radius: 7px;
+                  min-width: 92px; font-variant-numeric: tabular-nums; }
+        .daybtn:hover { background: var(--secondary-background-color, rgba(127,127,127,0.1)); }
+        .cal {
+          position: absolute; top: calc(100% + 6px); right: 0;
+          z-index: 60; width: 238px; padding: 8px 9px 7px; box-sizing: border-box;
+          border-radius: 12px; background: var(--card-background-color, #fff);
+          border: 1px solid var(--divider-color);
+          box-shadow: 0 10px 26px rgba(0,0,0,.18);
+        }
+        .cal-head { display: flex; align-items: center; gap: 4px; margin-bottom: 4px; }
+        .cal-month { flex: 1 1 auto; text-align: center; font-size: 12.5px;
+                     font-weight: 600; color: var(--primary-text-color); }
+        .cal-nav { width: 24px; height: 24px; border: none; background: none;
+                   cursor: pointer; border-radius: 50%; font: inherit;
+                   font-size: 14px; line-height: 1; color: var(--primary-text-color);
+                   display: inline-flex; align-items: center; justify-content: center; }
+        .cal-nav:hover:not(:disabled) {
+          background: var(--secondary-background-color, rgba(127,127,127,.1)); }
+        .cal-nav:disabled { opacity: .3; cursor: default; }
+        /* Seven equal columns; the weekday row uses the same grid so the
+           columns line up without any width guessing. */
+        .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 1px; }
+        .cal-wd { text-align: center; font-size: 10.5px; padding: 2px 0 3px;
+                  color: var(--secondary-text-color); }
+        .cal-blank { height: 26px; }
+        /* A day cell has three looks, and telling them apart is the point:
+             - an energy flow was recorded -> normal text colour
+             - nothing to draw              -> muted grey, still clickable (the
+               card then says so, which is honest and lets the user go back)
+             - future                       -> muted grey and disabled
+           The selected day is filled, the current day is outlined. */
+        .cal-day {
+          height: 26px; border: none; background: none; cursor: pointer;
+          font: inherit; font-size: 12px; border-radius: 7px; padding: 0;
+          color: var(--primary-text-color); font-variant-numeric: tabular-nums;
+        }
+        .cal-day:hover:not(:disabled) {
+          background: var(--secondary-background-color, rgba(127,127,127,.14)); }
+        .cal-day.empty { color: var(--secondary-text-color); opacity: .55; }
+        .cal-day.future { opacity: .28; cursor: default; }
+        .cal-day.today { box-shadow: inset 0 0 0 1px var(--primary-color); }
+        .cal-day.sel { background: var(--primary-color);
+                       color: var(--text-primary-color, #fff); font-weight: 600;
+                       box-shadow: none; }
+        .cal-legend { display: flex; align-items: center; gap: 5px; margin-top: 6px;
+                      font-size: 10.5px; color: var(--secondary-text-color); }
+        .cal-legend .lg { width: 8px; height: 8px; border-radius: 2px;
+                          background: var(--primary-text-color); }
+        .cal-legend .lg.empty { background: var(--secondary-text-color); opacity: .55; }
+        .cal-legend .lg + .lg { margin-left: 6px; }
         svg { display: block; width: 100%; height: auto; }
         /* Click-to-highlight: the ribbons and node boxes are hit targets. */
         svg .ribbon { cursor: pointer; transition: fill-opacity 0.18s ease; }
         svg .node { cursor: pointer; transition: opacity 0.18s ease; }
         svg .node.dim { opacity: 0.38; }
+        /* Shares printed on the highlighted ribbons: a label, not a target. */
+        svg text.fpct { pointer-events: none; font-variant-numeric: tabular-nums; }
         .detail { margin-top: 8px; padding: 8px 10px; border-radius: 8px;
                   background: var(--secondary-background-color, rgba(127, 127, 127, 0.12));
                   border: 1px solid var(--divider-color); }
@@ -573,25 +688,8 @@ function _hmSankeyRegister() {
                   flex: 0 0 auto; }
         .dhint { font-size: 11px; color: var(--secondary-text-color); margin-top: 6px;
                  opacity: 0.8; }
-        .legend { display: grid; gap: 4px 14px; margin-top: 8px;
-                  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
-        .item { display: flex; align-items: center; gap: 6px; font-size: 12.5px;
-                color: var(--primary-text-color); }
-        .dot { width: 9px; height: 9px; border-radius: 2px; flex: 0 0 auto; }
-        .item .val { margin-left: auto; color: var(--secondary-text-color);
-                     font-variant-numeric: tabular-nums; }
-        .sep { grid-column: 1 / -1; height: 1px; background: var(--divider-color);
-               margin: 6px 0 2px; }
-        .note { font-size: 12px; color: var(--secondary-text-color); margin-top: 8px;
-                line-height: 1.5; }
         .msg { padding: 14px 4px; font-size: 13px; color: var(--secondary-text-color);
                line-height: 1.6; }
-        .err { color: var(--error-color); }
-        code { font-size: 12px; }
-        .spin { display: inline-block; width: 12px; height: 12px; margin-right: 6px;
-                border: 2px solid var(--divider-color); border-top-color: var(--primary-color);
-                border-radius: 50%; animation: sp 0.8s linear infinite; vertical-align: -2px; }
-        @keyframes sp { to { transform: rotate(360deg); } }
       `;
     }
 
@@ -600,31 +698,32 @@ function _hmSankeyRegister() {
         throw new Error("hoymiles-energy-sankey: 'dev_id' is required");
       }
       this._config = { ...config };
-      if (config.range) this._range = config.range;
+      this._sig = null;
+      this._entityId = null;
       this._graph = null;
+      this._selected = null;
+      // A new config may point at another device, so the archive is refetched
+      // and the selected day drops back to today.
+      this._day = null;
+      this._days = [];
+      this._dayKey = null;
+      this._daysReady = false;
+      this._dayMissing = false;
+      this._noMeterDay = false;
+      this._calOpen = false;
+      this._calMonth = null;
+      /* Another device may have a different hardware set, and the flag below is
+         remembered across `unavailable` on purpose - so it has to be forgotten
+         here, not just overwritten when the next answer arrives. */
+      this._hasMeterKnown = null;
       // setConfig may run after the first `hass` assignment (e.g. when the
       // dashboard is edited in place), so refresh in that case.
-      if (this._hass) this._fetch();
+      if (this._hass) this._sync();
     }
 
     set hass(hass) {
-      const first = !this._hass;
       this._hass = hass;
-      if (first && hass) {
-        this._fetch();
-        return;
-      }
-      /* Node and ribbon labels are baked into `_graph` when it is built, so a
-       * language change has to rebuild it - otherwise the title and toolbar
-       * switch language while the diagram keeps the old one. */
-      const lang = hmLang(hass, this._config);
-      if (this._langUsed && lang !== this._langUsed) {
-        this._langUsed = lang;
-        this._graph = null;
-        this._fetch();
-        return;
-      }
-      this.requestUpdate();
+      this._sync();
     }
 
     getCardSize() { return 6; }
@@ -632,17 +731,32 @@ function _hmSankeyRegister() {
     /* --------------------------- text / config --------------------------- */
 
     /**
-     * Language changes are announced on `window`; re-rendering is all a card
-     * has to do, because the wording is chosen while it renders.
+     * Language changes are announced on `window`.  Node labels are baked into
+     * the graph when it is built, so the signature in `_sync` carries the
+     * language and a switch rebuilds the diagram.
      */
     connectedCallback() {
       super.connectedCallback();
-      this._onLangChange = () => this.requestUpdate();
+      this._onLangChange = () => {
+        this._sig = null;
+        this._sync();
+      };
       window.addEventListener(LANG_EVENT, this._onLangChange);
+      /* The calendar closes on any press outside the card.  `pointerdown` rather
+         than `click`: the opening click happens first, so this listener can
+         never close the popover it just opened. */
+      this._onWindowDown = (event) => {
+        if (this._calOpen && !event.composedPath().includes(this)) {
+          this._calOpen = false;
+          this.requestUpdate();
+        }
+      };
+      window.addEventListener("pointerdown", this._onWindowDown);
     }
 
     disconnectedCallback() {
       window.removeEventListener(LANG_EVENT, this._onLangChange);
+      if (this._onWindowDown) window.removeEventListener("pointerdown", this._onWindowDown);
       super.disconnectedCallback();
     }
 
@@ -654,180 +768,629 @@ function _hmSankeyRegister() {
     _text(value) {
       return hmText(value, hmLang(this._hass, this._config));
     }
+
     _dev() { return this._config.dev_id; }
 
     _label(def) { return this._t(def.en, def.zh); }
 
-    /** Resolve an entity id for one of this device's energy sensors. */
+    /**
+     * Resolve the energy-flow sensor of this device.
+     *
+     * Matched by the SN inside the entity id rather than by a fixed prefix: the
+     * entity id starts with the *device name* (`sensor.g3_msa_...`), which the
+     * user can rename to anything, while the SN stays.  `hass.entities` no
+     * longer carries `unique_id`, so there is nothing better to key on.
+     */
     _resolveEntity(suffix, domain = "sensor") {
       const hass = this._hass;
       if (!hass) return null;
       const states = hass.states || {};
-      const entities = hass.entities || {};
-      const dev = slug(this._dev());
+      const dev = this._dev();
+      if (!dev) return null;
 
-      const conventional = `${domain}.${dev}_${suffix}`;
-      if (states[conventional]) return conventional;
-
-      const prefix = `${domain}.${dev}`;
+      const serial = serialOf(dev);
+      const tail = `_${suffix}`;
+      let found = null;
       for (const entityId of Object.keys(states)) {
-        if (entityId.startsWith(prefix) && entityId.endsWith(suffix)) return entityId;
+        if (!entityId.startsWith(`${domain}.`)) continue;
+        if (!entityId.endsWith(tail)) continue;
+        if (!entityId.includes(serial)) continue;
+        if (!found || entityId.length < found.length) found = entityId;
+      }
+      return found;
+    }
+
+    /* ------------------------------ reading ------------------------------ */
+
+    /**
+     * Read the sensor (or the archive) and rebuild the diagram when it changed.
+     *
+     * Called from the `hass` setter, which Home Assistant fires for *every*
+     * state change on the page, so the cheap signature check comes first: a
+     * diagram is only rebuilt when one of the nine flows, the meter flag, the
+     * entity, the selected day or the language actually changed.
+     *
+     * Two sources, one picture:
+     *
+     * * **today** comes from the entity, because it is the live cumulative the
+     *   device keeps updating;
+     * * **a past day** comes from the integration's archive, because the device
+     *   clears these totals at 00:00 and can no longer reproduce them.
+     */
+    _sync() {
+      const hass = this._hass;
+      const cfg = this._config;
+      if (!hass || !cfg) return;
+
+      if (!this._entityId || !(hass.states || {})[this._entityId]) {
+        this._entityId = this._resolveEntity("energy_flow_today");
       }
 
-      const uniqueSuffix = `hoymiles_${this._dev()}_${suffix}`;
-      for (const [entityId, entry] of Object.entries(entities)) {
-        if (entry && entry.unique_id === uniqueSuffix) return entityId;
+      const state = this._entityId ? (hass.states || {})[this._entityId] : null;
+      const liveAttrs = state ? state.attributes || {} : null;
+
+      /* Which optional branches exist does NOT depend on the device being
+         reachable, and `unavailable` drops the attributes - so the last answer
+         is remembered. */
+      const liveMeter = liveAttrs ? liveAttrs.has_meter : undefined;
+      if (typeof liveMeter === "boolean") this._hasMeterKnown = liveMeter;
+      /* Nothing live to read?  The archive recorded `has_meter` with every
+         snapshot, so ask it.  Without this a unit that *never* had a grid meter
+         grew the card back after every reload: the entity is `unavailable` while
+         the unit is off, `unavailable` carries no attributes, and an unknown
+         flag was read as "maybe it has one". */
+      if (this._hasMeterKnown === null) {
+        const flags = this._newestFlags();
+        if (flags && typeof flags.has_meter === "boolean") {
+          this._hasMeterKnown = flags.has_meter;
+        }
+      }
+      const hasMeter = this._hasMeterKnown === true;
+      /* Hide only on a positive "this unit has no grid meter".  An unknown
+         answer means nobody has told us yet - after a restart the entity is
+         `unknown` and carries a null `has_meter` - and a card that disappears is
+         a worse answer than one that says there is no data yet. */
+      const hideCard = this._hasMeterKnown === false;
+
+      /* Refresh the archive whenever the LIVE numbers move - that is what "the
+         device published" looks like from here - and never merely because the
+         user switched days. */
+      if (liveAttrs) this._refreshDays(this._liveKey(liveAttrs));
+
+      /* Hold the first paint until the archive answers (or the live attributes
+         already gave a definitive flag).  A unit that has never had a meter is
+         the case this protects: its entity is `unavailable` while it is off, the
+         attributes are empty, and an unknown flag used to be drawn as "maybe it
+         has one" - so the card appeared and vanished on every reload. */
+      if (!this._daysReady && this._hasMeterKnown === null) {
+        /* Waiting for the archive: collapse the box, but keep the element
+           mounted.  Setting `hidden` here would make Home Assistant drop the
+           card element altogether (`hui-card` unbinds a child that reports
+           itself hidden) - and an unbound element never receives the answer,
+           so the card could not come back once the archive said it should. */
+        this._hidden = false;
+        this.style.display = "none";
+        return;
+      }
+      /* Decided (or already known): undo the waiting state. */
+      if (this.style.display === "none") this.style.display = "";
+
+      const today = this._today();
+      const day = this._day && this._day !== today ? this._day : null;
+
+      /* Availability is deliberately *not* consulted any more.  The diagram is a
+         record of what the device measured, so the question is only "do we have
+         a record for this day":
+
+         * a past day comes from the archive, because the device clears these
+           totals at 00:00 and can no longer reproduce them;
+         * today comes from the live attributes while the device is publishing,
+           and otherwise from the archive's entry for today - that entry is
+           rewritten on every `sankey/state` the device sends, so it *is* the
+           last picture it drew.  A unit that goes quiet therefore keeps the
+           diagram it had, exactly like the history chart keeps its last point. */
+      const archive = this._dayEntry(day || today);
+      /* A day the unit spent without a grid meter has no energy flow to draw,
+         even if the firmware still published a (zero) snapshot for it.  The
+         archive keeps the flags from that day for exactly this question. */
+      const dayMeter = archive && archive.flags
+        && typeof archive.flags.has_meter === "boolean"
+        ? archive.flags.has_meter
+        : null;
+      const noMeterDay = !!day && dayMeter === false;
+
+      let readings = null;
+      if (day) {
+        if (archive && !noMeterDay) readings = this._readingsFromPayload(archive.payload);
+      } else {
+        readings = this._liveReadings();
+        if (!readings && archive) readings = this._readingsFromPayload(archive.payload);
+      }
+
+      if (!day && !state) {
+        if (this._sig !== "missing") {
+          this._sig = "missing";
+          this._graph = null;
+          this._missing = true;
+          this._dayMissing = false;
+          this._noMeterDay = false;
+          this._hidden = false;
+          this.requestUpdate();
+        }
+        return;
+      }
+
+      if (!readings) {
+        /* Nothing for this day: say so, and leave the date grey so the picker
+           shows which days do have a record. */
+        const sig = `${day ? `no-archive|${day}|${noMeterDay ? "nm" : ""}` : "no-today"}`
+          + `|${hideCard ? "1" : "0"}`;
+        if (sig !== this._sig) {
+          this._sig = sig;
+          this._graph = null;
+          this._missing = false;
+          this._dayMissing = true;
+          this._noMeterDay = noMeterDay;
+          this._hidden = hideCard;
+          this.requestUpdate();
+        }
+        return;
+      }
+
+      const sig = [
+        hmLang(hass, cfg),
+        this._entityId,
+        day || "today",
+        hasMeter ? "1" : "0",
+        ...FLOWS.map((f) => num(readings[f.id]).toFixed(4)),
+      ].join("|");
+      if (sig === this._sig) return;
+      this._sig = sig;
+
+      this._missing = false;
+      this._dayMissing = false;
+      this._noMeterDay = false;
+      this._hidden = hideCard;
+      this._graph = hideCard ? null : this._buildGraph(readings);
+      this.requestUpdate();
+    }
+
+    /**
+     * Today's nine flows, or ``null`` when the entity is not reporting.
+     *
+     * `unavailable` / `unknown` only mean "no live reading right now" - they no
+     * longer mean "nothing to show", because the archive keeps the last one.
+     */
+    _liveReadings() {
+      const hass = this._hass;
+      const state = this._entityId && hass ? (hass.states || {})[this._entityId] : null;
+      if (!state) return null;
+      if (state.state === "unavailable" || state.state === "unknown") return null;
+      return this._readingsFromAttrs(state.attributes || {});
+    }
+
+    /** The nine flows, read from the sensor attributes (today). */
+    _readingsFromAttrs(attrs) {
+      const readings = {};
+      for (const flow of FLOWS) readings[flow.id] = num(attrs[flow.id]) / WH_PER_KWH;
+      return readings;
+    }
+
+    /**
+     * The nine flows, read from an archived `sankey/state` payload.
+     *
+     * The archive stores the device's own document (`pv_prod` / `load_cons`),
+     * not the sensor attributes, so one payload keeps its wire meaning and the
+     * card can be re-read years later without depending on attribute naming.
+     * `pv_e2l` therefore becomes `payload.pv_prod.e2l`.
+     */
+    _readingsFromPayload(payload) {
+      const readings = {};
+      for (const flow of FLOWS) {
+        const [group, field] = flow.id.split("_");
+        const bucket = payload[group === "pv" ? "pv_prod" : "load_cons"] || {};
+        readings[flow.id] = num(bucket[field]) / WH_PER_KWH;
+      }
+      return readings;
+    }
+
+    /* ------------------------------ archive ------------------------------ */
+
+    /** Today's date in the Home Assistant time zone, as `YYYY-MM-DD`. */
+    _today() {
+      const tz = this._hass && this._hass.config && this._hass.config.time_zone;
+      try {
+        // `sv-SE` formats as YYYY-MM-DD, which is exactly the archive's key.
+        // The browser's own zone would disagree with the server whenever the two
+        // differ, and the card would then show "today" twice in one list.
+        return new Intl.DateTimeFormat("sv-SE", tz ? { timeZone: tz } : undefined)
+          .format(new Date());
+      } catch (err) {
+        return new Date().toISOString().slice(0, 10);
+      }
+    }
+
+    /**
+     * The key the archive fetch is throttled on.
+     *
+     * It carries the nine flows (so any device publish refetches) plus
+     * `history_days`, the size of the integration's archive.  That second part
+     * matters on a cold start: the card may fetch before the integration has
+     * finished backfilling from the recorder, and without this it would keep its
+     * "today only" answer until the device published again - hours on a quiet
+     * day.
+     */
+    _liveKey(attrs) {
+      return [
+        this._entityId,
+        attrs.has_meter === true ? "1" : "0",
+        num(attrs.history_days),
+        ...FLOWS.map((f) => num(attrs[f.id])),
+      ].join("|");
+    }
+
+    /** Fetch the archive when the live numbers changed (or on first render). */
+    _refreshDays(key) {
+      if (this._loadingDays || this._dayKey === key) return;
+      this._dayKey = key;
+      this._loadDays();
+    }
+
+    /**
+     * Ask the integration for the archived days.
+     *
+     * A WebSocket command rather than a sensor attribute: up to a month of
+     * payloads on an entity would follow every state write into the recorder.
+     * An integration older than the command simply answers with an error, and
+     * the card then behaves exactly as it did before - today only, no picker.
+     */
+    async _loadDays() {
+      const hass = this._hass;
+      const dev = this._dev();
+      if (!hass || !dev || typeof hass.callWS !== "function") {
+        /* No way to ask: stop waiting and let the live attributes decide. */
+        this._daysReady = true;
+        this._sync();
+        return;
+      }
+      this._loadingDays = true;
+      let days = [];
+      try {
+        const result = await hass.callWS({
+          type: "hoymiles/sankey/history",
+          dev_id: dev,
+        });
+        days = result && Array.isArray(result.days) ? result.days : [];
+      } catch (err) {
+        days = [];
+      } finally {
+        this._loadingDays = false;
+      }
+      this._days = days.filter((d) => d && typeof d.date === "string" && d.payload);
+      this._daysReady = true;
+      /* Re-run the verdict: the archive's `flags.has_meter` may be the only
+         answer there is while the unit is silent, and until now the card was
+         drawing on a guess.  Without this call the card stayed visible until the
+         next `hass` assignment - the flash the user reported. */
+      this._sig = null;
+      this._sync();
+      this.requestUpdate();
+    }
+
+    /** Every day the picker may show: archived dates up to today, oldest first. */
+    _dayList() {
+      const today = this._today();
+      const keys = this._days
+        .map((entry) => entry.date)
+        .filter((date) => typeof date === "string" && date <= today);
+      // ISO dates sort correctly as plain strings.
+      keys.sort();
+      return keys;
+    }
+
+    _dayEntry(day) {
+      return this._days.find((entry) => entry.date === day) || null;
+    }
+
+    /** The flags recorded for the newest archived day, or ``null``. */
+    _newestFlags() {
+      const list = this._dayList();
+      for (let i = list.length - 1; i >= 0; i -= 1) {
+        const entry = this._dayEntry(list[i]);
+        if (entry && entry.flags) return entry.flags;
       }
       return null;
     }
 
-    /** statistic_ids for a node: config override, else resolved entities. */
-    _statisticIds(def) {
-      const overrides = (this._config.statistics || {})[def.id];
-      if (overrides) {
-        return (Array.isArray(overrides) ? overrides : [overrides]).filter(Boolean);
-      }
-      const ids = [];
-      for (const suffix of def.keys || []) {
-        const entityId = this._resolveEntity(suffix);
-        if (entityId) ids.push(entityId);
-      }
-      return ids;
+    /**
+     * Does this day have an energy flow to show?
+     *
+     * Three ways to have none: no archive at all, an archive that says the unit
+     * had no grid meter that day (the firmware still publishes a zero snapshot
+     * then), or a snapshot whose flows are all zero.  The last one used to be
+     * counted as "has a record", so the date stayed black while the body said
+     * there was no energy that day.
+     */
+    _dayHasFlow(day) {
+      return this._hasEnergy(this._readingsFor(day));
     }
 
-    /* ------------------------------ fetching ----------------------------- */
+    /** Is there anything to draw in these readings? */
+    _hasEnergy(readings) {
+      if (!readings) return false;
+      let total = 0;
+      for (const flow of FLOWS) total += num(readings[flow.id]);
+      return total > EMPTY_EPS;
+    }
 
-    async _fetch() {
-      const hass = this._hass;
-      if (!hass || !this._config) return;
+    /**
+     * The readings `_sync` would draw for `day` (``null`` when there are none).
+     *
+     * Shared with the date colour so the picker and the diagram can never
+     * disagree: whatever makes the body say "no energy" also greys the date.
+     */
+    _readingsFor(day) {
+      const today = this._today();
+      const entry = this._dayEntry(day || today);
+      if (entry && entry.flags && entry.flags.has_meter === false) return null;
+      if (day && day !== today) {
+        return entry ? this._readingsFromPayload(entry.payload) : null;
+      }
+      const live = this._liveReadings();
+      if (live) return live;
+      return entry ? this._readingsFromPayload(entry.payload) : null;
+    }
 
-      const token = ++this._fetchToken;
-      this._loading = true;
-      this._error = null;
+    /** Where the picker sits right now: the selected day, or today. */
+    _navState() {
+      const today = this._today();
+      const list = this._dayList();
+      const current = this._day && this._day !== today ? this._day : today;
+      /* Step through the *calendar*, not through the days that happen to have a
+         record: walking only the archived ones made every day look busy, and the
+         user could not tell "this day had no energy" from "this day was never
+         recorded".  The oldest archived day is the floor. */
+      const min = list.length ? list[0] : today;
+      const entry = this._dayEntry(current);
+      const noMeter = !!entry && !!entry.flags && entry.flags.has_meter === false;
+      return {
+        list,
+        current,
+        min,
+        max: today,
+        prev: current > min,
+        next: current < today,
+        /* Is there anything to draw for this day?  Drives the grey date. */
+        has: this._dayHasFlow(current),
+        /* Why it is grey, for the tooltip: no record / no meter / all zeros. */
+        why: entry ? (noMeter ? "meter" : "empty") : "none",
+      };
+    }
+
+    _shiftDay(step) {
+      const nav = this._navState();
+      const next = shiftDay(nav.current, step);
+      if (!next || next < nav.min || next > nav.max) return;
+      this._selectDay(next);
+    }
+
+    /** `null` (or today's date) means "show the live numbers". */
+    _selectDay(day) {
+      const today = this._today();
+      const next = !day || day >= today ? null : day;
+      if (next === this._day) return;
+      this._day = next;
+      // A highlight belongs to one diagram; carrying it over would dim the new
+      // day's flows against a selection the user made a day ago.
+      this._selected = null;
+      this._sig = null;
       this.requestUpdate();
+      this._sync();
+    }
 
+    /** ‹ date › - hidden while the archive is empty (nothing to go back to). */
+    _dayNav() {
+      const nav = this._navState();
+      if (!nav.list.length) return "";
+      return html`
+        <div class="daynav" title=${nav.has
+          ? this._t("Only days since this integration was running are archived.",
+            "只存档集成运行期间的天数。")
+          : nav.why === "meter"
+            ? this._t("No grid meter was connected that day.", "该日未接入电表。")
+            : nav.why === "empty"
+              ? this._t("No energy flow was recorded that day.", "该日没有能量流记录。")
+              : this._t("No record for this day.", "该日没有记录。")}>
+          <button title=${this._t("Previous day", "上一天")} ?disabled=${!nav.prev}
+            @click=${(event) => { event.stopPropagation(); this._shiftDay(-1); }}>‹</button>
+          <div class="dayhost">
+            <button class="daybtn ${nav.has ? "" : "empty"}"
+              title=${this._t("Pick a day", "选择日期")}
+              @click=${(event) => { event.stopPropagation(); this._toggleCalendar(); }}>${nav.current}</button>
+            ${this._calOpen ? this._calendar() : ""}
+          </div>
+          <button title=${this._t("Next day", "下一天")} ?disabled=${!nav.next}
+            @click=${(event) => { event.stopPropagation(); this._shiftDay(1); }}>›</button>
+        </div>`;
+    }
+
+    /* --------------------------- day calendar --------------------------- */
+
+    /**
+     * The day picker, the same widget the history chart uses.
+     *
+     * The native `<input type="date">` was replaced because it cannot say which
+     * days have something to draw - its calendar only greys the future, so every
+     * past day looks equally valid.  This one knows: a day with an energy flow is
+     * drawn in the normal text colour, a day without one in grey, and the legend
+     * under the grid spells that out.
+     */
+    _toggleCalendar() {
+      this._calOpen = !this._calOpen;
+      if (this._calOpen) {
+        const [year, month] = this._navState().current.split("-").map(Number);
+        this._calMonth = new Date(year, month - 1, 1);
+      }
+      this.requestUpdate();
+    }
+
+    /** Locale used for the calendar's own labels (month name, weekdays). */
+    _locale() {
+      const lang = hmLang(this._hass, this._config);
+      if (lang === "zh") return "zh-CN";
+      if (lang === "de") return "de-DE";
+      return "en-GB";
+    }
+
+    _monthLabel(month) {
       try {
-        const window = resolveWindow(this._range, new Date());
-
-        // Gather every statistic_id we might need, and remember which node
-        // could not be resolved at all (entity missing / renamed).
-        const ids = [];
-        const missing = [];
-        const nodeIds = {};
-        for (const def of NODE_DEFS) {
-          const nodeStatIds = this._statisticIds(def);
-          if (!nodeStatIds.length) missing.push(this._label(def));
-          nodeIds[def.id] = nodeStatIds;
-          ids.push(...nodeStatIds);
-        }
-
-        if (!ids.length) {
-          if (token !== this._fetchToken) return;
-          this._graph = null;
-          this._missing = missing;
-          this._error = this._t(
-            "No energy sensor of this device was found. Check that the integration is set up and the device is online.",
-            "未找到该设备的能量传感器。请确认集成已配置且设备在线。"
-          );
-          return;
-        }
-
-        const result = await hass.callWS({
-          type: "recorder/statistics_during_period",
-          start_time: window.start.toISOString(),
-          end_time: window.end.toISOString(),
-          statistic_ids: ids,
-          period: "day",
-          units: { energy: "kWh" },
-          types: ["change"],
-        });
-
-        if (token !== this._fetchToken) return;
-
-        // Sum `change` per node.
-        const values = {};
-        const noStats = [];
-        for (const def of NODE_DEFS) {
-          let sum = 0;
-          let found = false;
-          for (const statId of nodeIds[def.id] || []) {
-            const rows = result && result[statId];
-            if (Array.isArray(rows) && rows.length) {
-              found = true;
-              for (const row of rows) sum += num(row.change);
-            }
-          }
-          if (!found && (nodeIds[def.id] || []).length) noStats.push(this._label(def));
-          values[def.id] = sum;
-        }
-
-        this._graph = this._buildGraph(values, window, token);
-        this._missing = missing;
-        this._noStats = noStats;
+        return new Intl.DateTimeFormat(this._locale(), {
+          year: "numeric", month: "long",
+        }).format(month);
       } catch (err) {
-        if (token !== this._fetchToken) return;
-        this._graph = null;
-        const message = String((err && err.message) || err);
-        this._error = /recorder/i.test(message)
-          ? this._t(
-              "The recorder integration is unavailable, so long-term statistics cannot be read.",
-              "recorder 集成不可用，无法读取长期统计。"
-            )
-          : `${this._t("Failed to read statistics", "读取统计失败")}: ${message}`;
-      } finally {
-        if (token === this._fetchToken) {
-          this._loading = false;
-          /* Record it for *every* outcome, including the error paths: their
-           * message is language dependent too, and leaving it unset would make
-           * the language check in `set hass` skip the rebuild. */
-          this._langUsed = hmLang(this._hass, this._config);
-          this.requestUpdate();
+        return `${month.getFullYear()}-${pad2(month.getMonth() + 1)}`;
+      }
+    }
+
+    /** Monday-first weekday initials, taken from the browser's own locale data. */
+    _weekdayLabels() {
+      const out = [];
+      /* 2024-01-01 was a Monday, so it is a stable base for a Monday-first row. */
+      for (let i = 0; i < 7; i += 1) {
+        const day = new Date(2024, 0, 1 + i);
+        try {
+          out.push(new Intl.DateTimeFormat(this._locale(), { weekday: "short" }).format(day));
+        } catch (err) {
+          out.push("MTWTFSS".charAt(i));
         }
       }
+      return out;
+    }
+
+    _shiftCalendar(step) {
+      const base = this._calMonth || new Date();
+      const next = new Date(base.getFullYear(), base.getMonth() + step, 1);
+      const [todayYear, todayMonth] = this._today().split("-").map(Number);
+      if (step > 0 && (next.getFullYear() > todayYear
+        || (next.getFullYear() === todayYear && next.getMonth() > todayMonth - 1))) {
+        return;
+      }
+      const [minYear, minMonth] = (this._navState().min || this._today())
+        .split("-").map(Number);
+      if (step < 0 && (next.getFullYear() < minYear
+        || (next.getFullYear() === minYear && next.getMonth() < minMonth - 1))) {
+        return;
+      }
+      this._calMonth = next;
+      this.requestUpdate();
+    }
+
+    _pickDay(key) {
+      if (key > this._today()) return;
+      this._calOpen = false;
+      this._selectDay(key);
+    }
+
+    _calendar() {
+      const todayKey = this._today();
+      const month = this._calMonth || (() => {
+        const [year, mon] = this._navState().current.split("-").map(Number);
+        return new Date(year, mon - 1, 1);
+      })();
+      const year = month.getFullYear();
+      const mon = month.getMonth();
+      const lead = (new Date(year, mon, 1).getDay() + 6) % 7; // Monday-first
+      const count = new Date(year, mon + 1, 0).getDate();
+      const selected = this._navState().current;
+
+      const cells = [];
+      for (let i = 0; i < lead; i += 1) {
+        cells.push(html`<span class="cal-blank"></span>`);
+      }
+      for (let day = 1; day <= count; day += 1) {
+        const key = `${year}-${pad2(mon + 1)}-${pad2(day)}`;
+        const future = key > todayKey;
+        const has = !future && this._dayHasFlow(key);
+        const cls = [
+          "cal-day",
+          future ? "future" : "",
+          !future && !has ? "empty" : "",
+          key === todayKey ? "today" : "",
+          key === selected ? "sel" : "",
+        ].filter(Boolean).join(" ");
+        const title = future
+          ? this._t("This day has not happened yet", "这一天还没到")
+          : has
+            ? this._t("An energy flow was recorded", "该日有能量流记录")
+            : this._t("No energy flow was recorded", "该日没有能量流记录");
+        cells.push(html`
+          <button class=${cls} ?disabled=${future} title=${title}
+            @click=${(event) => { event.stopPropagation(); this._pickDay(key); }}>${day}</button>`);
+      }
+
+      const [todayYear, todayMonth] = todayKey.split("-").map(Number);
+      const atNowMonth = year > todayYear
+        || (year === todayYear && mon >= todayMonth - 1);
+
+      return html`
+        <div class="cal" role="dialog">
+          <div class="cal-head">
+            <button class="cal-nav"
+              @click=${(event) => { event.stopPropagation(); this._shiftCalendar(-1); }}>‹</button>
+            <span class="cal-month">${this._monthLabel(month)}</span>
+            <button class="cal-nav" ?disabled=${atNowMonth}
+              @click=${(event) => { event.stopPropagation(); this._shiftCalendar(1); }}>›</button>
+          </div>
+          <div class="cal-grid cal-week">
+            ${this._weekdayLabels().map((w) => html`<span class="cal-wd">${w}</span>`)}
+          </div>
+          <div class="cal-grid">${cells}</div>
+          <div class="cal-legend">
+            <span class="lg has"></span>${this._t("has data", "有数据")}
+            <span class="lg empty"></span>${this._t("no data", "无数据")}
+          </div>
+        </div>`;
     }
 
     /* ---------------------------- graph layout --------------------------- */
 
-    _buildGraph(values, window, token) {
+    /**
+     * Lay out the diagram from the nine measurements.
+     *
+     * A node's height is the sum of the flows that touch it, so both columns
+     * always add up to the same total: the device reports both ends of every
+     * flow, and nothing has to be estimated, balanced or hidden in a "loss"
+     * node.
+     */
+    _buildGraph(readings) {
       const cfg = this._config || {};
+      const EPS = EMPTY_EPS; // kWh - below this a flow is noise, not a ribbon
 
-      const srcs = NODE_DEFS.filter((d) => d.side === "src")
-        .map((d) => ({ ...d, value: num(values[d.id]) }))
-        .filter((d) => d.value > 0.0005);
-
-      const snks = NODE_DEFS.filter((d) => d.side === "snk")
-        .map((d) => ({ ...d, value: num(values[d.id]) }))
-        .filter((d) => d.value > 0.0005);
-
-      const inTotal = srcs.reduce((acc, d) => acc + d.value, 0);
-      const outTotal = snks.reduce((acc, d) => acc + d.value, 0);
-
-      // Sankey requires conservation. The device meters each port
-      // independently, so a difference is expected (conversion losses,
-      // sampling offsets, unmeasured loads). Absorb it in an explicit node
-      // instead of rescaling the real numbers.
-      const balance = inTotal - outTotal;
-      const THRESHOLD = 0.001; // kWh – below this it is noise
-      let balancer = null;
-      if (balance > THRESHOLD) {
-        balancer = {
-          ...SYNTH.loss,
-          value: balance,
-          label: this._text(cfg.balancer_label) || this._label(SYNTH.loss),
-        };
-        snks.push(balancer);
-      } else if (balance < -THRESHOLD) {
-        balancer = {
-          ...SYNTH.unmeasured,
-          value: -balance,
-          label: this._text(cfg.balancer_label) || this._label(SYNTH.unmeasured),
-        };
-        srcs.push(balancer);
+      const table = {};
+      const srcValue = {};
+      const snkValue = {};
+      let total = 0;
+      for (const flow of FLOWS) {
+        const value = num(readings[flow.id]);
+        /* Accumulate, do not assign: two measurements can now feed the same
+           pair of nodes (pv_e2b + pv_tp2b both become pv -> bat_in).  Plain
+           assignment would keep only the last one and quietly drop energy. */
+        const key = `${flow.from}|${flow.to}`;
+        table[key] = (table[key] || 0) + value;
+        srcValue[flow.from] = (srcValue[flow.from] || 0) + value;
+        snkValue[flow.to] = (snkValue[flow.to] || 0) + value;
+        total += value;
       }
 
-      const total = srcs.reduce((acc, d) => acc + d.value, 0);
-      if (total <= 0) {
-        return { empty: true, window };
+      const srcs = SOURCES
+        .map((d) => ({ ...d, value: srcValue[d.id] || 0 }))
+        .filter((d) => d.value > EPS);
+      const snks = SINKS
+        .map((d) => ({ ...d, value: snkValue[d.id] || 0 }))
+        .filter((d) => d.value > EPS);
+
+      if (total <= EPS || !srcs.length || !snks.length) {
+        return { empty: true, total: 0 };
       }
 
       // Each column fills the chart height on its own: the left column stacks
@@ -848,129 +1411,192 @@ function _hmSankeyRegister() {
       const srcNodes = stack(srcs, leftFit);
       const snkNodes = stack(snks, rightFit);
 
-      // Estimate which source feeds which sink (ports are metered apart).
-      const indexOf = (arr, id) => arr.findIndex((x) => x.id === id);
-      const forbidden = [];
-      for (const [srcId, snkId] of NO_LOOP) {
-        const i = indexOf(srcNodes, srcId);
-        const j = indexOf(snkNodes, snkId);
-        if (i >= 0 && j >= 0) forbidden.push([i, j]);
-      }
-      const matrix = allocate(
-        srcNodes.map((n) => n.value),
-        snkNodes.map((n) => n.value),
-        forbidden
-      );
-
-      // Ribbon thickness is value * scale and attaches centred on the node
-      // box, so a tiny node still gets a hairline ribbon.
-      const gapPx = num(cfg.ribbon_gap != null ? cfg.ribbon_gap : 3);
+      /* Ribbons cover their node box completely.
+         The thickness used to be value * a column-wide scale, so a node whose
+         height was clamped up to MIN_NODE_H (or one that simply did not fill
+         the column) had its ribbons bunched in the middle of the box with card
+         colour above and below them - the flow looked like it started from a
+         point inside the box instead of from the box's whole edge.  Now each
+         end is scaled by the node it touches: (value / node.value) * node.h,
+         so the ribbons of one node always add up to exactly its height and
+         leave/enter flush with the top and bottom edges, as in the vendor app.
+         The ribbon then tapers between its two ends, which is what makes the
+         diagram read as flow rather than as spaghetti. */
+      const gapPx = num(cfg.ribbon_gap != null ? cfg.ribbon_gap : 0);
       const flows = [];
-      const srcCursor = srcNodes.map(
-        (n) => n.y + n.h / 2 - (n.value * leftFit.scale) / 2
-      );
-      const snkCursor = snkNodes.map(
-        (n) => n.y + n.h / 2 - (n.value * rightFit.scale) / 2
-      );
+      const srcCursor = srcNodes.map((n) => n.y);
+      const snkCursor = snkNodes.map((n) => n.y);
 
       for (let i = 0; i < srcNodes.length; i += 1) {
         for (let j = 0; j < snkNodes.length; j += 1) {
-          const value = matrix[i][j];
-          if (!(value > 0)) continue;
-          const hL = value * leftFit.scale;
-          const hR = value * rightFit.scale;
+          const value = table[`${srcNodes[i].id}|${snkNodes[j].id}`] || 0;
+          if (!(value > EPS)) continue;
+          const hL = (value / srcNodes[i].value) * srcNodes[i].h;
+          const hR = (value / snkNodes[j].value) * snkNodes[j].h;
           if (hL < 0.7 && hR < 0.7) continue;
           const insetL = hL > gapPx * 2.5 ? gapPx / 2 : 0;
           const insetR = hR > gapPx * 2.5 ? gapPx / 2 : 0;
+          /* Height of both ends, kept so the highlight can print a share at
+             each end, centred on the ribbon it belongs to. */
+          const topL = srcCursor[i] + insetL;
+          const topR = snkCursor[j] + insetR;
+          const hgtL = Math.max(0.6, hL - insetL * 2);
+          const hgtR = Math.max(0.6, hR - insetR * 2);
           flows.push({
-            path: ribbon(
-              RIBBON_L, srcCursor[i] + insetL, Math.max(0.6, hL - insetL * 2),
-              RIBBON_R, snkCursor[j] + insetR, Math.max(0.6, hR - insetR * 2)
-            ),
+            path: ribbon(RIBBON_L, topL, hgtL, RIBBON_R, topR, hgtR),
+            yL: topL + hgtL / 2,
+            yR: topR + hgtR / 2,
+            /* Share denominators: how much the whole node carries, so a
+               highlighted node can say "61 of 69 Wh = 88.4 %". */
+            srcValue: srcNodes[i].value,
+            snkValue: snkNodes[j].value,
+            /* Both ends, because the ribbon is painted as a gradient between
+               them: it leaves the source in the source's colour and arrives at
+               the sink in the sink's - which is what makes a crossing diagram
+               readable, instead of seven ribbons in four flat colours. */
             color: srcNodes[i].color,
+            toColor: snkNodes[j].color,
             value,
             srcId: srcNodes[i].id,
             snkId: snkNodes[j].id,
-            from: srcNodes[i].label || this._label(srcNodes[i]),
-            to: snkNodes[j].label || this._label(snkNodes[j]),
+            from: this._label(srcNodes[i]),
+            to: this._label(snkNodes[j]),
           });
           srcCursor[i] += hL;
           snkCursor[j] += hR;
         }
       }
 
-      return {
-        empty: false,
-        window,
-        total,
-        outTotal: snkNodes.reduce((acc, n) => acc + n.value, 0),
-        srcs: srcNodes,
-        snks: snkNodes,
-        flows,
-        hasBalancer: !!balancer,
-      };
+      return { empty: false, total, srcs: srcNodes, snks: snkNodes, flows };
     }
 
     /* ------------------------------ rendering ---------------------------- */
 
     /**
-     * One node = a coloured box (icon + value + unit + share of the period)
-     * plus a tinted label band on the ribbon-facing side.
+     * One node: a colour block (glyph + value + unit + share of the day) and its
+     * name printed next to it, on top of the ribbons.
+     *
+     * The name used to sit on a flat tinted rectangle, then on a gradient that
+     * faded out of the node colour, and finally on the bare card background.
+     * None of them worked, because the real problem was the column itself: a
+     * fixed 158px strip kept free for the text showed the card colour all the
+     * way down the chart, and a tall node turned that strip into a pale slab.
+     * Now the ribbons start at the node box and the text is painted over them,
+     * with a thin card-coloured halo so it stays legible on any ribbon.
+     *
+     * The glyph is a coloured SVG pictogram printed on a soft dark plate, not an
+     * emoji: an emoji is drawn by the platform's own font, so it arrived with
+     * its own colours and shadows and a different size on every OS, none of
+     * which matched the box it sat on.
      */
     _nodeBox(node, boxX, chipX, chipAnchor, shareBase, info) {
       const color = node.color;
       const label = node.label || this._label(node);
       const uid = `${this._uid}-${node.side}-${node.id}`;
       const cx = boxX + NODE_W / 2;
-      const icon = (this._config.icons || {})[node.id] || ICONS[node.id] || "•";
-      const tall = node.h >= 76;
+      const custom = (this._config.icons || {})[node.id];
+      const glyph = GLYPH[node.id] || GLYPH_FALLBACK;
+      const showGlyph = node.h >= 50;
       const inner = [];
       const key = `${node.side}:${node.id}`;
 
-      // Selection: true when this node touches the highlighted flow(s).
+      /* One rhythm for every box, whatever its height: a soft dark plate pinned
+         to the TOP of the node, the icon printed straight onto that plate, the
+         energy reading just below the icon (mid-plate, a touch low), and the
+         share hugging the bottom edge of the node.
+
+         The plate replaced the white circular badge: a 21 px disc in a 68 px
+         box looked like a sticker, its drop shadow only traced the circle, and
+         the icon inside it competed with the colour block behind.  A rectangle
+         spanning the box width reads as one recessed panel, the icon sits on it
+         like a crest, and the three parts (icon / energy / share) share one
+         vertical axis for all six nodes. */
+      const PLATE_X = 4;
+      const PLATE_Y = 3;
+      const PLATE_W = NODE_W - PLATE_X * 2;
+      /* Height for the icon only: 26 px gives a 5 px radius around an 18 px
+         drawing without clipping it.  The plate is a header for the glyph, not
+         a panel for data - its 46 px version also held the energy number and
+         pushed that reading into the dark area. */
+      const PLATE_H = 26;
+      const plateTop = node.y + PLATE_Y;
+      const iconCY = plateTop + PLATE_H / 2;
+      /* Bigger than the old badge glyph (0.62): without a white disc around it, a
+         15 px drawing had no presence on a 60 px plate. */
+      const G_SCALE = 0.78;
+      const gx = cx - (24 * G_SCALE) / 2;
+      const gy = iconCY - (24 * G_SCALE) / 2;
+      /* "Mid-plate, a touch low" no longer applies: the reading is on the node
+         colour, right under the plate - the 12 px offset keeps it clear of the
+         panel's shadow. */
+      const valueY = plateTop + PLATE_H + 12;
+      /* The share is not on the plate - it sits at the very bottom of the node,
+         which is what makes the box read as three stacked bands. */
+      const pctY = node.y + node.h - 5;
+
+      // Selection: the node that touches the highlighted flow(s) stays at full
+      // strength while everything else fades.  No outline: a 2.5px ring around
+      // the box read as a black frame bolted onto the diagram, and the contrast
+      // between 100 % and 38 % opacity already says which part is highlighted.
       const isSel = !!info && info.nodeKeys.has(key);
       const isDim = !!info && !isSel;
-      const ring = isSel
-        ? `<rect x="${boxX - 2}" y="${node.y - 2}" width="${NODE_W + 4}"
-            height="${node.h + 4}" rx="8" fill="none"
-            stroke="var(--primary-text-color, #212121)" stroke-width="2.5"></rect>`
-        : "";
 
-      if (node.h >= 42) {
-        inner.push(`<text x="${cx}" y="${node.y + (tall ? 18 : 14)}" text-anchor="middle"
-          font-size="${tall ? 15 : 11}">${esc(icon)}</text>`);
+      /* The plate first: everything else is painted on top of it.  A custom
+         `icons:` entry is plain text (it may be an emoji the user chose), so it
+         keeps the text path. */
+      if (showGlyph) {
+        inner.push(`<rect x="${boxX + PLATE_X}" y="${plateTop}" width="${PLATE_W}"
+          height="${PLATE_H}" rx="5" fill="#000" fill-opacity="0.20"
+          filter="url(#${uid}-sh)"/>`);
+        if (custom) {
+          inner.push(`<text x="${cx}" y="${iconCY + 5}" text-anchor="middle"
+            font-size="13" fill="#fff">${esc(custom)}</text>`);
+        } else {
+          inner.push(`<g transform="translate(${gx} ${gy}) scale(${G_SCALE})"
+            >${glyph}</g>`);
+        }
       }
-      if (tall) {
-        inner.push(`<text x="${cx}" y="${node.y + 43}" text-anchor="middle" font-size="17"
-          font-weight="600" fill="#fff">${esc(fmtValue(node.value))}</text>`);
-        inner.push(`<text x="${cx}" y="${node.y + 56}" text-anchor="middle" font-size="9.5"
-          fill="#fff" fill-opacity="0.85">${esc(fmtUnit(node.value))}</text>`);
-      } else if (node.h >= 30) {
-        inner.push(`<text x="${cx}" y="${node.y + 31}" text-anchor="middle" font-size="11.5"
-          font-weight="600" fill="#fff">${esc(fmtEnergy(node.value))}</text>`);
-      } else {
-        inner.push(`<text x="${cx}" y="${node.y + node.h / 2 + 4}" text-anchor="middle"
-          font-size="10.5" font-weight="600" fill="#fff">${esc(fmtEnergy(node.value))}</text>`);
-      }
+      /* Inside the box the text is plain body colour on the node colour: no
+         white, and no darker strip behind the share line - that band was there
+         to keep white text readable, and with dark text it just looked like a
+         shadow draped over the bottom of the node. */
+      const INK = "#111";
+      inner.push(`<text x="${cx}" y="${valueY}" text-anchor="middle" font-size="13"
+        fill="${INK}">${esc(fmtEnergy(node.value))}</text>`);
       if (node.h >= 40) {
-        inner.push(`<rect x="${boxX}" y="${node.y + node.h - 16}" width="${NODE_W}" height="16"
-          fill="#000" fill-opacity="0.14"></rect>`);
-        inner.push(`<text x="${cx}" y="${node.y + node.h - 4.5}" text-anchor="middle"
-          font-size="9.5" fill="#fff" fill-opacity="0.95">${esc(fmtPct(node.value, shareBase))}</text>`);
+        inner.push(`<text x="${cx}" y="${pctY}" text-anchor="middle" font-size="11"
+          fill="${INK}" fill-opacity="0.85">${esc(fmtPct(node.value, shareBase))}</text>`);
       }
 
-      const chipTextX = chipAnchor === "end" ? chipX + CHIP_W - 12 : chipX + 12;
+      /* The name is plain text painted over the ribbons, right against its box.
+         No halo, no plate: a stroke around the glyphs reads as an outline at any
+         width, and the card already sits on a light surface so the body text
+         keeps its contrast against the 50 % ribbons. */
+      const chipTextX =
+        chipAnchor === "end" ? chipX - LABEL_INSET : chipX + LABEL_INSET;
+      /* While something is highlighted, the names on the annotated side drop
+         out: the per-ribbon shares are printed in that very strip, and on a
+         short box the two land on the same baseline.  The dimmed nodes on the
+         other side keep their names - they fade with the group, so they no
+         longer out-shout the highlight. */
+      const hideName = !!info &&
+        (info.mutedSides.indexOf(node.side) >= 0 || info.mutedNames.has(key));
+      const name = hideName
+        ? ""
+        : `<text x="${chipTextX}" y="${node.y + node.h / 2 + 4.5}" text-anchor="${chipAnchor}"
+          font-size="12.5" fill="var(--primary-text-color, #212121)">${esc(label)}</text>`;
+
       return `<g class="node${isDim ? " dim" : ""}" data-node="${esc(key)}">
+        <defs><filter id="${uid}-sh" x="-25%" y="-30%" width="150%" height="180%">
+          <feDropShadow dx="0" dy="1.6" stdDeviation="2.1" flood-color="#000"
+            flood-opacity="0.34"/>
+        </filter></defs>
         <clipPath id="${uid}"><rect x="${boxX}" y="${node.y}" width="${NODE_W}"
-          height="${node.h}" rx="6"></rect></clipPath>
-        <rect x="${boxX}" y="${node.y}" width="${NODE_W}" height="${node.h}" rx="6"
+          height="${node.h}"></rect></clipPath>
+        <rect x="${boxX}" y="${node.y}" width="${NODE_W}" height="${node.h}"
           fill="${color}"><title>${esc(`${label}: ${fmtEnergy(node.value)}`)}</title></rect>
         <g clip-path="url(#${uid})">${inner.join("")}</g>
-        <rect x="${chipX}" y="${node.y}" width="${CHIP_W}" height="${node.h}" rx="4"
-          fill="${color}" fill-opacity="0.16"></rect>
-        <text x="${chipTextX}" y="${node.y + node.h / 2 + 4.5}" text-anchor="${chipAnchor}"
-          font-size="13" fill="var(--primary-text-color, #212121)">${esc(label)}</text>
-        ${ring}
+        ${name}
       </g>`;
     }
 
@@ -988,7 +1614,7 @@ function _hmSankeyRegister() {
      */
     _selectionInfo(graph) {
       const sel = this._selected;
-      if (!sel || !graph) return null;
+      if (!sel || !graph || graph.empty) return null;
       const flows = graph.flows.filter((f) => this._flowSelected(f, sel));
       if (!flows.length) return null;
       let node = null;
@@ -1002,37 +1628,86 @@ function _hmSankeyRegister() {
         nodeKeys.add(`src:${f.srcId}`);
         nodeKeys.add(`snk:${f.snkId}`);
       }
-      return { sel, flows, node, nodeKeys };
+      /* The shares are printed in the strip the node NAME occupies, so the names
+         on the annotated side step aside while something is highlighted: a node
+         highlight annotates one whole column (its out-flows on the left, its
+         in-flows on the right), a single-ribbon highlight annotates both ends
+         and therefore only the two endpoint names have to go.  The other column
+         keeps its names (faded with the rest of the diagram), so the picture is
+         never nameless. */
+      const mutedSides = sel.kind === "node" ? [sel.side] : [];
+      const mutedNames = new Set();
+      if (sel.kind !== "node") {
+        for (const f of flows) {
+          mutedNames.add(`src:${f.srcId}`);
+          mutedNames.add(`snk:${f.snkId}`);
+        }
+      }
+      return { sel, flows, node, nodeKeys, mutedSides, mutedNames };
     }
 
     _chart(graph) {
       const base = num(
-        this._config.ribbon_opacity != null ? this._config.ribbon_opacity : 0.5
+        this._config.ribbon_opacity != null ? this._config.ribbon_opacity : 0.58
       );
       const info = this._selectionInfo(graph);
       const parts = [];
+      const defs = [];
 
-      // Ribbons first so the node boxes are drawn on top of them.
-      for (const f of graph.flows) {
+      /* Ribbons first so the node boxes are drawn on top of them.
+         Each ribbon is filled with its OWN gradient, running from the source
+         colour to the sink colour: with four flat source colours a diagram where
+         everything happens to come from the grid is a wall of one blue, and the
+         eye cannot tell a ribbon going to the battery from one going to the load.
+         The gradient carries both ends, so neither direction has to be guessed. */
+      graph.flows.forEach((f, i) => {
+        const gid = `${this._uid}-fl-${i}`;
+        defs.push(`<linearGradient id="${gid}" gradientUnits="userSpaceOnUse"
+          x1="${RIBBON_L}" y1="0" x2="${RIBBON_R}" y2="0">
+          <stop offset="0" stop-color="${f.color}"/>
+          <stop offset="1" stop-color="${f.toColor}"/>
+        </linearGradient>`);
         const isSel = !!info && info.flows.indexOf(f) >= 0;
         const opacity = !info ? base : isSel ? Math.min(1, base + 0.4) : Math.max(0.06, base * 0.16);
-        const stroke = isSel ? ` stroke="${f.color}" stroke-opacity="0.95" stroke-width="1"` : "";
-        parts.push(`<path class="ribbon" d="${f.path}" fill="${f.color}"
-          fill-opacity="${opacity.toFixed(3)}" data-flow="${esc(f.srcId)}|${esc(f.snkId)}"${stroke}
-          ><title>${esc(`${f.from} → ${f.to}: ${fmtEnergy(f.value)}`)}</title></path>`);
-      }
+        parts.push(`<path class="ribbon" d="${f.path}" fill="url(#${gid})"
+          fill-opacity="${opacity.toFixed(3)}" data-flow="${esc(f.srcId)}|${esc(f.snkId)}"
+          ><title>${esc(`${f.from} \u2192 ${f.to}: ${fmtEnergy(f.value)}`)}</title></path>`);
+      });
 
       for (const node of graph.srcs) {
         parts.push(this._nodeBox(node, LEFT_X, LEFT_CHIP_X, "start", graph.total, info));
       }
       for (const node of graph.snks) {
-        parts.push(
-          this._nodeBox(node, RIGHT_X, RIGHT_CHIP_X, "end", graph.outTotal || graph.total, info)
-        );
+        parts.push(this._nodeBox(node, RIGHT_X, RIGHT_CHIP_X, "end", graph.total, info));
+      }
+
+      /* Highlight: each involved ribbon gets its share of the node it touches,
+         printed on the ribbon at that end - "88.4 %" for the 61 Wh that leaves
+         a 69 Wh source, "11.6 %" for the remainder.  Highlighting a node shows
+         the shares at that node only (its out-flows on the left, its in-flows
+         on the right); highlighting one ribbon shows both ends, because then
+         both the split of its source and its weight in its sink are wanted.
+         The names of that column are suppressed (see _selectionInfo), so the
+         numbers are not competing with the labels they replace. */
+      if (info) {
+        const sides = info.sel.kind === "flow" ? ["src", "snk"] : [info.sel.side];
+        for (const f of info.flows) {
+          if (sides.indexOf("src") >= 0) {
+            parts.push(`<text class="fpct" x="${RIBBON_L + 9}" y="${f.yL + 4.2}"
+              text-anchor="start" font-size="12.5"
+              fill="var(--primary-text-color, #212121)">${esc(fmtPct(f.value, f.srcValue))}</text>`);
+          }
+          if (sides.indexOf("snk") >= 0) {
+            parts.push(`<text class="fpct" x="${RIBBON_R - 9}" y="${f.yR + 4.2}"
+              text-anchor="end" font-size="12.5"
+              fill="var(--primary-text-color, #212121)">${esc(fmtPct(f.value, f.snkValue))}</text>`);
+          }
+        }
       }
 
       return `<svg viewBox="0 0 ${VB_W} ${VB_H}" role="img"
-        aria-label="${esc(this._t("Energy flow", "能量流"))}">${parts.join("")}</svg>`;
+        aria-label="${esc(this._t("Energy flow", "能量流"))}"><defs>${defs.join("")}</defs>${
+        parts.join("")}</svg>`;
     }
 
     /** Detail panel for the current highlight (empty when nothing is selected). */
@@ -1044,21 +1719,20 @@ function _hmSankeyRegister() {
 
       let head;
       if (node) {
-        const shareBase = sel.side === "src" ? graph.total : graph.outTotal || graph.total;
-        head = `${node.label || this._label(node)} · ${fmtEnergy(node.value)} · ${fmtPct(node.value, shareBase)}`;
+        head = `${node.label || this._label(node)} \u00B7 ${fmtEnergy(node.value)} \u00B7 ${fmtPct(node.value, graph.total)}`;
       } else {
         const f = flows[0];
-        head = `${f.from} → ${f.to} · ${fmtEnergy(f.value)} · ${fmtPct(f.value, graph.total)}`;
+        head = `${f.from} \u2192 ${f.to} \u00B7 ${fmtEnergy(f.value)} \u00B7 ${fmtPct(f.value, graph.total)}`;
       }
 
       const chips = flows
         .slice()
         .sort((a, b) => b.value - a.value)
         .map((f) => {
-          const dir = node ? (sel.side === "src" ? "→" : "←") : "→";
+          const dir = node ? (sel.side === "src" ? "\u2192" : "\u2190") : "\u2192";
           const other = node
             ? (sel.side === "src" ? f.to : f.from)
-            : `${f.from} → ${f.to}`;
+            : `${f.from} \u2192 ${f.to}`;
           return `<span class="chip"><i style="background:${f.color}"></i>${esc(
             `${dir} ${other} ${fmtEnergy(f.value)}`
           )}</span>`;
@@ -1066,7 +1740,7 @@ function _hmSankeyRegister() {
         .join("");
 
       const total = flows.length > 1
-        ? ` · ${esc(this._t("total", "合计"))} ${esc(fmtEnergy(sum))}`
+        ? ` \u00B7 ${esc(this._t("total", "合计"))} ${esc(fmtEnergy(sum))}`
         : "";
 
       return `<div class="detail">
@@ -1076,56 +1750,13 @@ function _hmSankeyRegister() {
       </div>`;
     }
 
-    _legend(graph) {
-      const item = (node) => `
-        <div class="item">
-          <span class="dot" style="background:${node.color}"></span>
-          <span>${esc(node.label || this._label(node))}</span>
-          <span class="val">${esc(fmtEnergy(node.value))} · ${esc(fmtPct(node.value, graph.total))}</span>
-        </div>`;
-
-      const srcs = graph.srcs.map(item).join("");
-      const snks = graph.snks.map(item).join("");
-      return `<div class="legend">${srcs}<div class="sep"></div>${snks}</div>`;
-    }
-
-    _toolbar() {
-      if (this._config.show_toolbar === false) return null;
-      const pills = RANGES.map(
-        (r) =>
-          `<button class="pill ${r.id === this._range ? "on" : ""}"` +
-          ` data-range="${esc(r.id)}">${esc(this._t(r.en, r.zh))}</button>`
-      ).join("");
-      const refresh =
-        `<button class="pill" data-range="__refresh">` +
-        `${esc(this._t("Refresh", "刷新"))}</button>`;
-      // Must go through _untrusted(): a plain string would be escaped by Lit
-      // and end up rendered as literal text instead of buttons.
-      return this._untrusted(`<div class="toolbar">${pills}${refresh}</div>`);
-    }
-
     _sameSelection(a, b) {
       if (!a || !b || a.kind !== b.kind) return false;
       if (a.kind === "flow") return a.from === b.from && a.to === b.to;
       return a.side === b.side && a.id === b.id;
     }
 
-    _handleClick = (event) => {
-      const rangeEl = event.target.closest("[data-range]");
-      if (rangeEl) {
-        const value = rangeEl.dataset.range;
-        if (value === "__refresh") {
-          this._fetch();
-          return;
-        }
-        if (value === this._range) return;
-        this._range = value;
-        this._graph = null;
-        this._selected = null;
-        this._fetch();
-        return;
-      }
-
+    _onClick(event) {
       // Click-to-highlight: a ribbon, or any ribbon of a node box.
       const flowEl = event.target.closest("[data-flow]");
       const nodeEl = event.target.closest("[data-node]");
@@ -1149,88 +1780,76 @@ function _hmSankeyRegister() {
         this._selected = null;
         this.requestUpdate();
       }
-    };
+    }
 
     render() {
       if (!this._config) return html``;
+      // No meter: the card is not shown at all.  The grid flows would all be
+      // zero, so the picture would claim the unit never imports or exports.
+      if (this._hidden) return html``;
       const title = this._text(this._config.title) || this._t("Energy flow", "能量流");
+      const graph = this._graph;
+      // Whether the diagram on screen is an archived day rather than the live
+      // cumulative.  It only changes the wording: the picture is the same one.
+      const archived = !!this._day && this._day !== this._today();
 
       let body;
-      if (this._loading && !this._graph) {
-        body = html`<div class="msg"><span class="spin"></span>${this._t("Reading statistics…", "正在读取统计…")}</div>`;
-      } else if (this._error) {
-        body = html`<div class="msg err">${this._error}</div>`;
-      } else if (!this._graph) {
-        body = html`<div class="msg">${this._t("No data yet.", "暂无数据。")}</div>`;
-      } else if (this._graph.empty) {
+      if (this._dayMissing) {
+        body = html`<div class="msg">${this._noMeterDay
+          ? this._t("No grid meter was connected that day.",
+            "该日未接入电表，没有能量流记录。")
+          : archived
+            ? this._t("No record for this day.", "该日没有记录。")
+            : this._t("Nothing recorded yet today.", "今日还没有记录。")}</div>`;
+      } else if (this._missing) {
         body = html`<div class="msg">${this._t(
-          "No energy was recorded in the selected period.",
-          "所选时间段内没有能量记录。"
+          "No energy flow data for this device.",
+          "暂无该设备的能量流数据。"
         )}</div>`;
+      } else if (!graph) {
+        body = html`<div class="msg">${this._t("No data yet.", "暂无数据。")}</div>`;
+      } else if (graph.empty) {
+        body = html`<div class="msg">${archived
+          ? this._t("No energy recorded on this day.", "该日暂无能量记录。")
+          : this._t("No energy recorded today.", "今日暂无能量记录。")}</div>`;
       } else {
         body = html`
-          ${this._untrusted(this._chart(this._graph))}
-          ${this._untrusted(this._detailBar(this._graph))}
-          ${this._untrusted(this._legend(this._graph))}
+          ${this._untrusted(this._chart(graph))}
+          ${this._untrusted(this._detailBar(graph))}
         `;
-      }
-
-      // Optional notes: unresolved entities / entities without statistics.
-      const notes = [];
-      if (this._missing && this._missing.length) {
-        notes.push(this._t(
-          `No entity found for: ${this._missing.join(", ")}.`,
-          `未找到实体：${this._missing.join("、")}。`
-        ));
-      }
-      if (this._noStats && this._noStats.length) {
-        notes.push(this._t(
-          `No statistics yet for: ${this._noStats.join(", ")}.`,
-          `暂无统计数据：${this._noStats.join("、")}。`
-        ));
       }
 
       return html`
         <ha-card @click=${this._handleClick}>
           <div class="head">
             <span class="title">${this._icon(this._config.icon)}${title}</span>
-            ${this._graph && !this._graph.empty
-              ? html`<span class="total">${esc(fmtEnergy(this._graph.total))}</span>`
-              : ""}
+            <div class="hright">${this._dayNav()}</div>
           </div>
-          ${this._toolbar()}
           ${body}
-          ${notes.length
-            ? html`<div class="note">${notes.map((n) => html`${n}<br/>`)}</div>`
-            : ""}
-          ${this._graph && !this._graph.empty && !this._selected
-            ? html`<div class="note">${this._t(
-                "Tip: click a ribbon or a node box to highlight that part of the flow.",
-                "提示：点击彩带或左右节点，即可高亮该部分能量流向。"
-              )}</div>`
-            : ""}
-          ${this._graph && !this._graph.empty && this._graph.hasBalancer
-            ? html`<div class="note">${this._t(
-                "Ports are metered independently, so a balance line is shown for conversion losses and unmeasured flows.",
-                "各端口独立计量，差额以“损耗/其他”或“未计量”表示。"
-              )}</div>`
-            : ""}
         </ha-card>
       `;
     }
 
     /**
-     * Build a TrustedHTML-free fragment.
-     * We render SVG via innerHTML because Lit has no cheap SVG builder here;
-     * every interpolated value goes through `esc()` in `_chart`/`_legend`.
+     * Mirror `_hidden` onto the host element.
+     *
+     * Returning an empty template empties the shadow root but keeps the custom
+     * element's own layout box, so Home Assistant's card wrapper still reserved
+     * a row of blank space where the sankey used to be. `hidden` is what the
+     * alarms card uses for the same purpose, and it is what makes the wrapper
+     * collapse so the cards below move up.
      */
+    updated() {
+      this.hidden = this._hidden === true;
+    }
+
     /**
      * The header icon: a named SVG from the built-in set, or plain text.
      *
      * A name that is not in the set falls through to text, which keeps an
-     * `icon: 📊` config working.  The SVG is injected as a string: a `<path>`
-     * built inside a lit template is parsed in the HTML namespace and never
-     * paints, while the HTML parser handles SVG foreign content correctly.
+     * emoji config working.  The SVG is injected as a string: a `<path>` built
+     * inside a lit template is parsed in the HTML namespace and never paints,
+     * while the HTML parser handles SVG foreign content correctly.
      */
     _icon(name) {
       if (!name) return "";
@@ -1242,6 +1861,11 @@ function _hmSankeyRegister() {
       return this._untrusted(svg);
     }
 
+    /**
+     * Build a TrustedHTML-free fragment.
+     * The SVG is rendered via innerHTML because Lit has no cheap SVG builder
+     * here; every interpolated value goes through `esc()` in `_chart`.
+     */
     _untrusted(markup) {
       const template = document.createElement("template");
       template.innerHTML = markup;
@@ -1263,7 +1887,7 @@ function _hmSankeyRegister() {
 
     _valueChanged(field) {
       return (event) => {
-        const config = { ...(this._config || {}), [field]: event.target.value };
+        const config = { ...this._config, [field]: event.target.value };
         this._config = config;
         this.dispatchEvent(new CustomEvent("config-changed", { detail: { config } }));
       };
@@ -1278,7 +1902,6 @@ function _hmSankeyRegister() {
 
     render() {
       const config = this._config || {};
-      const ranges = RANGES.map((r) => r.id);
       return html`
         <div class="row">
           <ha-textfield label="dev_id" .value=${config.dev_id || ""}
@@ -1288,10 +1911,8 @@ function _hmSankeyRegister() {
           <ha-textfield label="icon (flow | sankey | swap, or any text)"
             .value=${config.icon || ""}
             @change=${this._valueChanged("icon")}></ha-textfield>
-          <ha-textfield label="range (${ranges.join("|")})" .value=${config.range || DEFAULT_RANGE}
-            @change=${this._valueChanged("range")}></ha-textfield>
-          <ha-textfield label="balancer_label (accepts an en/zh map)" .value=${hmField(config.balancer_label)}
-            @change=${this._valueChanged("balancer_label")}></ha-textfield>
+          <ha-textfield label="ribbon_opacity (0..1)" .value=${config.ribbon_opacity || ""}
+            @change=${this._valueChanged("ribbon_opacity")}></ha-textfield>
         </div>
       `;
     }
@@ -1310,8 +1931,7 @@ function _hmSankeyRegister() {
       type: "hoymiles-energy-sankey",
       name: "Hoymiles Energy Flow (Sankey)",
       description:
-        "Sankey diagram of the energy flow of a Hoymiles micro storage device, "
-        + "built from Home Assistant long-term statistics.",
+        "Sankey diagram of the energy flow the device measured, day by day (V0.6.2).",
       preview: false,
     });
   }

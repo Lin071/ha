@@ -34,7 +34,6 @@
  *   system_load_power (sys_load_p)         load / lamp              [W]
  *   system_smart_plug_power (sys_sp_p)     smart plug               [W]
  *   battery_status                         standby|charge|discharge|lock
- *   rssi                                   Wi-Fi RSSI, dBm -> signal bars
  *
  * Card config:
  *   type: custom:hoymiles-power-flow
@@ -57,8 +56,6 @@
  *     system_smart_plug_power: sensor.my_smart_plug_power
  *     soc: sensor.my_soc
  *     battery_status: sensor.my_battery_status
- *     rssi: sensor.my_rssi
- *   show_rssi: true               # optional, hide the fan with false
  *   grid_mode: auto               # auto | meter | no_meter, see below
  * ========================================================================== */
 
@@ -90,11 +87,6 @@ function _hmPowerFlowRegister() {
      missing entry falls back to English instead of leaving a blank. */
   const T_DE = {
     "My home": "Mein Zuhause",
-    "excellent": "sehr gut",
-    "good": "gut",
-    "fair": "mäßig",
-    "weak": "schwach",
-    "Wi-Fi signal": "WLAN-Signal",
     "Solar1": "Solar1",
     "Solar2": "Solar2",
     "Storage": "Speicher",
@@ -128,9 +120,11 @@ function _hmPowerFlowRegister() {
    * on any card switches every card on the page at once, and the choice
    * survives a reload.
    *
-   * English is the default.  It deliberately does NOT follow the Home
-   * Assistant UI language any more: a dashboard is often shared, and the point
-   * of the dropdown is that the reader decides.
+   * The order is: the reader's own pick, then `language:` on the card, then the
+   * Home Assistant UI language, then English.  Following the UI language is
+   * what makes an unconfigured card match the page it sits on - the earlier
+   * "English unless picked" rule left the cards as the only English thing on a
+   * Chinese dashboard.
    * ------------------------------------------------------------------ */
   const LANG_KEY = "hoymiles.language";
   const LANG_EVENT = "hoymiles-language";
@@ -157,7 +151,12 @@ function _hmPowerFlowRegister() {
   }
 
   function hmLang(hass, config) {
-    return hmStored() || hmNormalise(config && config.language) || "en";
+    const locale = hass && hass.locale;
+    const ui = (locale && locale.language) || (hass && hass.language);
+    return hmStored()
+      || hmNormalise(config && config.language)
+      || hmNormalise(ui)
+      || "en";
   }
 
   /**
@@ -215,23 +214,22 @@ function _hmPowerFlowRegister() {
    * ------------------------------------------------------------------ */
   const VB_W = 700;
   const VB_H = 470;
-  const MIN_FLOW = 5; // W; below this a branch is drawn as idle
+  /* W; below this a branch is drawn as idle.  1 W, not 5: a smart plug with
+     something on standby really does report ~2 W, and at the old threshold
+     that live branch was drawn grey and without a streak - it looked like a
+     dead connector.  The firmware quantises power to 0.1 W, so anything at or
+     above 1 W is a real reading rather than sampling noise. */
+  const MIN_FLOW = 1;
   /* How far the load has to read *below* zero before `grid_mode: auto`
      accepts it as proof that there is no meter.  A metered system keeps the
      load at or above zero, so this only has to clear rounding and sensor
      noise rather than any real reading. */
   const METER_PROOF_W = 30; // W
 
-  /* How fast the streak travels along a connector, in SVG units per second.
-     The travel time is derived from the connector length, so a short stub and a
-     long line no longer look like different animals.
-
-     Use the card's `flow_speed` option to nudge the whole thing (1 = default). */
-  const FLOW_SPEED_MIN = 55; // units per second at ~0 W
-  const FLOW_SPEED_MAX = 230; // units per second at full power
-  const FLOW_SPEED_PER_W = 0.25; // units/s gained per watt, saturates near 700 W
-  const FLOW_DUR_MIN = 0.9; // s, keeps the very short stubs readable
-  const FLOW_DUR_MAX = 4.5; // s
+  /* Note on speed: it used to be derived per connector from its power reading.
+     That is gone - a connector now travels inside a fixed stage window, so its
+     speed is simply its own length divided by that window.  The card's
+     `flow_speed` option scales the whole cycle instead (see FLOW_CYCLE_S). */
 
   /* ------------------------------------------------------------------ *
    * The streak
@@ -283,9 +281,18 @@ function _hmPowerFlowRegister() {
      bigger DOM (14 paths per lit connector).  At card size one slice is about
      2 px wide, so the steps are already invisible; going higher only costs. */
   const STREAK_SLICES = 14;
-  /* Share of the cycle spent travelling.  The rest is the pause after the
-     streak has left, and it **must match the keyframe percentages** below. */
-  const STREAK_TRAVEL = 0.72;
+  /* One cycle of the whole diagram, in seconds.  Every connector runs on this
+     single clock: that is what lets several branches meet at the junction
+     instead of each one running on its own timer.  `flow_speed` scales the
+     whole cycle. */
+  const FLOW_CYCLE_S = 6;
+  /* The three stages of that cycle, in order.  Energy gathers into the unit
+     (0), runs through it to the junction - together with everything else
+     arriving there (1) - and finally leaves the junction towards whatever is
+     consuming it (2).  Each stage starts exactly where the previous one ends,
+     so a downstream branch can never light up before the energy that feeds it
+     has arrived.  The keyframe names below must match. */
+  const FLOW_STAGES = ["in", "trunk", "out"];
   /* Width at the head and at the tail, in user units.  The grey pipe is 6.8, so
      the streak sits just inside it. */
   const STREAK_WIDTH = 6;
@@ -390,6 +397,8 @@ function _hmPowerFlowRegister() {
     "plug.off": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgBAMAAAAQtmoLAAAAElBMVEX///////7+///8/f3W3uavv84s6eCpAAAFgElEQVR42pVYzU8bRxT/7dtFhZDEu+C0jRvb44UegipqjHtoDk34yC1Sv8J/WeVWqQccp+klSIG4rtTmYDZj0ySEGu9gqlRK4pkebPDseNfAHBCefb95H/Peb+aNheigHEfZ9QAAoaqAcjwqYEV/+gHKnqtE/5urwgr8YAyApL3qhgi3AQDLHjzVqDGeCPCDspcKD2uAb6VEANhLXqrzMKLDiqxfLoTtGjHZX5OY5PaK16noOizd33QhbNci6/mBveJ1qhJxgzkb6yBmRI1hfeMODSfs4afu6n+bJEUUoATbycxM7A/FTv+Tq6k2xejmrHo0H6OBzX/aqMfaKvK/ZwpNZQDs7q1wK943iHy9NDEpoiZlS6qSQ8JofRBzragGOv66McmTAIr4wjUIHZBffrsVInGo/LvMltIAdFx8+ZFIBqC7n7nRV+EAABavhXU5Rh6Shey3oQY6KL58jbFDvMlcnhQnUcqVVB1njOwgUAQANtvNnQVo7VDxBOA3VZ2fBZBZcdUf+JBa/leJswDoNktPFGADNMN+iewBFbzw5K+2F7npy5MCBMjTxOrXDJNBAEAGgVEdwu1XHPv8PecazdCSB3hKQIltnTOIvnsg4QB2qjGUl3tlzwUAywNmPFUZloi0jhZrcEDNpeEmSHvVVWGodgAsW66H9c0hIguXcQu0PD20yPlehRWtvFY89ZNm07fbnJBzdQHVqJA/cNX3e5svrDWdlFoA4f5wonyfRQPjw9kons6wu0WQdIZEwLx2S0b2PKAPXLMALiNCqCX2YzPJpf3MPV2ChwDJpd6pSu7mmJkReY2JqDbbJOZqaSRYi5n8v6KxqbIs4qmaZnV6kftMT5OgrLkge0fSsaHTnTU/WwExSA4fCAK7XIjQL4qOpaIHzMx6uB0AQP94cI1KdR0IIzCe50EJAJZruSbPpuFYPWZWmwfMxBcR1e71C/X8wyb3YgCLIC4ir0AAP7+8VIJU7SIapDXOBxXH56Tllinf2BzxjyWLA2rifnV01kkGHDLcjjPJSgIQ0DPn3HEmSYHjuGVUEiBd7bRGzpVxGqzbj+7EGpo4Zn6I9UzqUU6I1rAgDA2xiSiiZ7zQCoLvxO2fThK2S5ZuSPZFTIKwiMcOdF5qcRRM+ciJb8ER0/pe0VM1o+dv2DZuCIqi5SD97aoMw0F2d7BZNw7wnqPsKF3brLeJORfAIceGH0S+ypJw4EYveop/sXy4CwCYu4LAKAcLpEay1dkmBgL83h/KTARXUA/SqHNrLeDEfAR7q2ZictRsNn11MrqXlzIZ91UY2ssLqd3opYio+NwRwjUS4ikKni/gQbXNS5GlpP3uTc4kmldTmJqagmo8MUxSpR4cIG3eh/1t3P2nTvfqJk0z7z0nOVpxAZX61wg+4vMjRsgefWPWgZQAMHJrJCdFnNC6ABurHAh4lh6p9VoYx7i5lUOAIBUWR749jVt/D10OArJHLovjBtNUslK1gS8/0nkcYF/dGSyl4tnSVGu5XQbYgPrSzsbxhTFFx8Vq2NfQrY7GKS5GbTa46IaFzMTkWbtB3aX9P0+ossfnzlSRK8naaTvQ3b+pdWrx4/jm3x+JkxNIFo9mSY6PaTr1sDdsaQ6aS+O9oO7C4ELfP+Pk4tHs2JYjl049kHqXddAsjVNB3VvtQccwSAp5g89zligvV+VjHm0tu/sLH9eTjrv8/PXGJ/tRgMq/y0wcxCPY3sLbrddmtytefZaAYHurqZ/VaAOOZubSLo0iGF9zG8OAaJWQrXrrcrTF5+teW2vCNA0i9+565spzX7/0+J3jNa/za07EAdB9eek6Xf2LCqlByAupF/aK16nkeeJDyHxh5CEkrCQ+hFz8qeXkMQfheR9zzvFc9D/yNzodLGdFDgAAAABJRU5ErkJggg==",
     "inverter.on": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgBAMAAAAQtmoLAAAAElBMVEX////+///+/v/4/f5d2OUBxdoQYP2rAAAC9ElEQVR42u2YS2/TQBDH/7uxVKGKZO3k2sZO0wOIR5OmZ0rgE/A9EV8gfSCuKClwpCQOPVLbm8CNxsMhTeu1nfUaVQgh9hJnPb/MzuzOY8PgNjyYjvCYKtx5aCyPexsbFT57YA5gAY6SozRgAQiloTDzAAugI+Oft5eAI0wBuQkLIBkayrtyExxg5hYL/AG3/guAtXpoFQiOUwAbF22BVIFazy6INdUG/kMvD+eZq2io7savtcDB9lsFEAg6vs6Zo21Gqpc4RRqg4mX2Idbb4Gf2QY3FFmoYS+3GJUdr/GX5YQh44x1bgKKhU/VNAHvSswUA2z6KTA6fE/U8AQDMednsFAMs7N240N4ZiUKg2U4kc+fFvAhgF0ryt5+IAqDZUSRYfa4H2EXq1Np7QgvUWOo9q861QP152sjGng5gOUc8FhqAmidp+cvvUgO4rUeTVCy/c7kGmLH2lUKEp33bXQ/wuWDtq8QS6LQvWNVdf1oZwNpv+rTKRed9cZuRcoCYA2CHx4vr73uWUMIzA4hdAHAO/S4A4HwZ+nVGBcnYnl5vu12Uvd3ccsp42XRPZQF2dxVIlgVEWcDPVUHxHdowyhMJ1rt1jTpXE3G5TdL6JcXNHKtp6q/XEOcBM02Ifs1Zk9zW5aUcNwW6rBFvZdZEH3UAeEZF0NSmykktpYKiSAvQIvU+Sq0os7nTkSJAQbWgoNCWoiJMK8iW3amfODvhsZBFRZHqwxsZOvJkcZ0OqoPV48CbmHSV853VU3di1IbGvq4l+t+s/73AgiIJUCTPdF0l57c3CBocCNDAuZ1hLAPEw+wVIHEhtJ6qwKzR2E9VCrav9poiTAJy5LWy7XRyfI4VDXR/ovZ6Amo2oA+k2jB/r7b/r3Cp+sj1VSCu15Kvq7L2qZsMz9oo7aUgSAIdQAzL7DStrcG/czTIXFoCHGBu9s1ZOFlkZ2diafS0m7nlyy+znMmF+AkL4I9z/ZEzWTn4BotctBumf4RgLhlEu8TfRSfxL/wI5N1aTeu8AAAAAElFTkSuQmCC",
     "inverter.off": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgBAMAAAAQtmoLAAAAElBMVEX//////v7+/v7j6e69zNqvv80Z86zbAAACyklEQVR42u2YvW7bMBSFD2kB/UFgk0bWKrTiqUCLNPYDtM3j9hkCP4EDoV1rmdGcSgzQoUNy2SGRI0oUxSwFCoSLZZqfL3l97iFpBnW8QGyrLjHh8n30eLx5/YqjNPGAnYLjmY0DiA5hASQAfu0iAfYJSAC6ip6PPEICzLiKBW6PkAAWReR4NQE4wJ6dpRdgrCXNQzYysOgCxXMjrEVYqJcuwJkcAc6MbgO0vP8WBJZp7mRJoQpKlu+bkTwyv6o3jsKA7mXJbdlgor1AVhQPL5GAKjIJoC54qqMAvZrPDNhCbnVMBE5rxSABzC920ONqpbV4rHLBTvW4vNWpkgcb4ud8FCgXLRcR83QMUJnjOiLjI0CpHNWyniv2vqBjayLlQSA765QFm6ggoHtlxCgIqE3tdtQ3wSmp+Qdt2x2m+rHgAUCL5V37x7WUf2VqWEucSbvaQjZBRL05h5wqPSw+I3C6WU0ftkk2251LYQNqpUSAyS+bJjE3x1KAiXxY3gsAjH++zgQA+/O3YgDmgUULABD8+vGdYkB3S3MAZX0VbvjLHudIyXsoEDQcwQydkoaAvfdkOAxw6wlhjQos2rPRscCi6aTuA7XRwxHIN6UysOjS9Ahr09APt+/bTKUDAL3rJbb6HpQGzztzsvdpECjSTg0ZrcPiI+2EsFSO7HHa9XdT0Ji8U2fZVTm6i2q0DkLVVUQB8auDPupLFQEQbZvHrdIxJcoP58VMR9U06dCR6MXI/h1grQGsMbEA2doCpuMvXbXyJ0WAtmsJu231PNnZAZj2lUytc2ty4gJ6OVl1x6+8htlE2D8dDR8/l66p3pAL3LsWxjCrXTfIOxG4e6fmF9i5OWpqqQHIdQuypsy8RZL4UvJwvyj+J/F57le6KMh/EUqAW535rp6eTpoBCcA+5qHbaqtNlndIcCLEcewfISgxsfVb8ScWoLz+C/5V3YxMzhw7AAAAAElFTkSuQmCC",
+    "gridload.on": "data:image/png;base64,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",
+    "gridload.off": "data:image/png;base64,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",
   };
   /* <<<END_PF_ICONS>>> */
 
@@ -694,23 +703,6 @@ function _hmPowerFlowRegister() {
   }
 
   /**
-   * How fast a pulse travels, in SVG units per second.
-   *
-   * The power sets the speed, but the *travel time* is kept between
-   * `FLOW_DUR_MIN` and `FLOW_DUR_MAX`: an 18 unit stub would otherwise flick
-   * past in a flash, and a long connector at low power would crawl.
-   */
-  function flowSpeed(power, len, speedScale = 1) {
-    const scale = speedScale > 0 ? speedScale : 1;
-    const raw = clamp(
-      FLOW_SPEED_MIN + Math.abs(num(power)) * FLOW_SPEED_PER_W,
-      FLOW_SPEED_MIN, FLOW_SPEED_MAX,
-    ) * scale;
-    if (!(len > 0)) return raw;
-    return clamp(raw, len / FLOW_DUR_MAX, len / FLOW_DUR_MIN);
-  }
-
-  /**
    * Reversed copy of a connector, so a flow can run the other way (charging
    * into the battery, importing from the grid) without moving the drawing:
    * "M236 182 H105 V376" -> "M105 376 V182 H236".
@@ -781,15 +773,17 @@ function _hmPowerFlowRegister() {
    * a small dome instead of a cut edge.
    */
   function flowBeam(plan) {
-    const { route, travel, len, duration, phase } = plan;
+    const { route, travel, len, stage, cycle, delay } = plan;
     const streak = clamp(len * STREAK_SHARE, STREAK_MIN, Math.min(STREAK_MAX, len));
     const slice = streak / STREAK_SLICES;
     /* The gap is well over the connector, so the pattern cannot repeat on it:
        exactly one streak is ever on the wire, however long the line is. */
     const gap = 2 * len + slice;
-    /* A negative delay is the part of the cycle that has already run, which is
-       how a rebuilt path resumes at the distance it had reached. */
-    const delay = (-phase * duration).toFixed(2);
+    /* One negative delay for every connector on the diagram.  It is the part of
+       the shared cycle that has already run, which is what keeps the branches
+       in step across the re-render that every reading change causes. */
+    const delayText = (-delay).toFixed(2);
+    const stageName = `hm-pf-${FLOW_STAGES[stage] || FLOW_STAGES[0]}`;
 
     let out = "";
     for (let i = 0; i < STREAK_SLICES; i += 1) {
@@ -812,8 +806,8 @@ function _hmPowerFlowRegister() {
               stroke-linecap="${i === 0 ? "round" : "butt"}"
               stroke-dasharray="${slice.toFixed(2)} ${gap.toFixed(2)}"
               style="--hm-from:${from.toFixed(2)}px;--hm-to:${to.toFixed(2)}px;`
-        + `--hm-park:${park.toFixed(2)}px;`
-        + `animation-duration:${duration.toFixed(2)}s;animation-delay:${delay}s"/>`;
+        + `--hm-park:${park.toFixed(2)}px;animation-name:${stageName};`
+        + `animation-duration:${cycle.toFixed(2)}s;animation-delay:${delayText}s"/>`;
     }
 
     return `<g class="pf-beam" data-pf-beam="${route.id}">${out}</g>`;
@@ -911,18 +905,6 @@ function _hmPowerFlowRegister() {
     return `rgb(${parts[0]},${parts[1]},${parts[2]})`;
   }
 
-  /**
-   * Signal strength tiers, shared with the battery card so both cards draw the
-   * same icon for the same reading. Returns the number of lit bars (0..4).
-   */
-  function rssiBars(rssi) {
-    if (rssi === null || !Number.isFinite(rssi)) return 0;
-    if (rssi >= -55) return 4;
-    if (rssi >= -65) return 3;
-    if (rssi >= -75) return 2;
-    return 1;
-  }
-
   /* ------------------------------------------------------------------ *
    * Card
    * ------------------------------------------------------------------ */
@@ -939,15 +921,27 @@ function _hmPowerFlowRegister() {
       this._hass = null;
       this._config = null;
       this._cache = new Map();
-      /* Streak phase, one entry per connector, 0..1 of its cycle.  It is advanced
-         once per render (see `_beamPlan`) and the CSS animation carries the
-         streak the rest of the way.  Deliberately not cleared by `setConfig`, so
-         editing an unrelated option does not restart every streak. */
-      this._pfPhase = new Map(); // route id -> 0..1 of one trip
-      this._pfClock = 0; // ms of the last phase advance
+      /* Streak timing.  Every connector shares one cycle (see `_beamPlan`), and
+         `_pfEpoch` is the wall-clock instant that cycle started.  Restarting it
+         on attach is fine: the whole diagram restarts together, which is the
+         one thing that must never break.  Not cleared by `setConfig`, so
+         editing an unrelated option does not make the streaks jump. */
+      this._pfEpoch = 0;
       /* `grid_mode: auto` latches here once a negative load proves that
          `sys_grid_p` is not a meter reading; see `_hasMeter`. */
       this._sawNegativeLoad = false;
+      /* The last snapshot that was read while the device was online.  A device
+         that goes silent hands the card `null` for every reading, and the
+         drawing would then drop the branches that only exist because their
+         entity reported something - so the last good snapshot is kept and drawn
+         (greyed, with dashes) instead. */
+      this._lastGood = null;
+      /* Hardware flags answered by the integration over WebSocket.  Needed
+         because the entity they normally come from drops all its attributes
+         when it goes unavailable - i.e. exactly when this card has to keep the
+         layout it had. */
+      this._wsFlags = null;
+      this._wsQueried = false;
     }
 
     static getConfigElement() {
@@ -970,12 +964,17 @@ function _hmPowerFlowRegister() {
         .hname .dev { font-size: 13px; font-weight: 400; opacity: 0.65;
                       margin-left: 6px; }
         .hright { display: flex; align-items: center; gap: 14px; flex: none; }
-        .signal { display: inline-flex; align-items: center; gap: 6px;
-                  font-size: 13.5px; color: var(--secondary-text-color);
-                  font-variant-numeric: tabular-nums; }
-        .signal .bars { display: block; width: 22px; height: 18px; flex: none; }
         .chip { display: inline-flex; align-items: center; gap: 6px;
                 font-size: 14px; color: var(--primary-text-color); }
+        /* Offline: the same picture as before the unit went quiet - every node
+           and connector stays exactly where it was - but each branch switches to
+           its *dim* artwork and every reading becomes a dash.  No grayscale
+           filter: the icons this card draws already have a grey variant, so
+           filtering the whole drawing only smeared the wiring and the labels
+           without adding any information. */
+        .chip.off { font-size: 12.5px; font-weight: 600; padding: 2px 9px;
+                    border-radius: 9px; color: var(--secondary-text-color);
+                    background: rgba(148,163,184,0.18); }
         .wrap { display: flex; justify-content: center; }
         svg { display: block; width: 100%; height: auto; }
 
@@ -999,7 +998,7 @@ function _hmPowerFlowRegister() {
            the connector, which the keyframes cannot know.  A custom property in
            a keyframe is substituted per element, so this is the only way to give
            every path its own travel distance while all of them share one
-           animation.  The 72% stop has to stay in step with STREAK_TRAVEL.
+           animation.
 
            stroke-linecap is deliberately NOT declared here.  A rule with the
            same specificity as the presentation attribute wins, and this one used
@@ -1014,14 +1013,32 @@ function _hmPowerFlowRegister() {
         .pf-beam path {
           fill: none;
           stroke-linejoin: round;
-          animation-name: hm-flow-run;
+          /* animation-name is set per path (one name per stage), because a
+             stage is where the timing lives, not the connector. */
           animation-timing-function: linear;
           animation-iteration-count: infinite;
         }
-        @keyframes hm-flow-run {
-          0% { stroke-dashoffset: var(--hm-from, 100px); }
-          72% { stroke-dashoffset: var(--hm-to, 0px); }
-          100% { stroke-dashoffset: var(--hm-park, -100px); }
+        /* The three stage windows of one shared cycle.  The percentages must
+           match FLOW_STAGES; the distances themselves differ per connector and
+           arrive as custom properties (see STREAK_SHARE).
+
+           Outside its window a stage parks the dash past the far end, which is
+           the same thing as being invisible - so a downstream connector waits
+           for its neighbours without any script driving it. */
+        @keyframes hm-pf-in {
+          0%, 4% { stroke-dashoffset: var(--hm-from, 100px); }
+          30% { stroke-dashoffset: var(--hm-to, 0px); }
+          35%, 100% { stroke-dashoffset: var(--hm-park, -100px); }
+        }
+        @keyframes hm-pf-trunk {
+          0%, 30% { stroke-dashoffset: var(--hm-from, 100px); }
+          55% { stroke-dashoffset: var(--hm-to, 0px); }
+          60%, 100% { stroke-dashoffset: var(--hm-park, -100px); }
+        }
+        @keyframes hm-pf-out {
+          0%, 55% { stroke-dashoffset: var(--hm-from, 100px); }
+          82% { stroke-dashoffset: var(--hm-to, 0px); }
+          87%, 100% { stroke-dashoffset: var(--hm-park, -100px); }
         }
 
         .pf-v { font-size: 19px; font-weight: 600;
@@ -1053,10 +1070,22 @@ function _hmPowerFlowRegister() {
       }
       this._config = { ...config };
       this._cache.clear();
+      /* The "this branch has been seen working" verdicts belong to the device
+         the card was configured with, so a new config starts from nothing. */
+      this._pfSeenPv2 = false;
+      this._pfSeenPlug = false;
     }
 
     set hass(hass) {
       this._hass = hass;
+      /* Which optional hardware this unit has, asked once per connection.  It
+         has to come from the integration rather than from the entity: an
+         unavailable entity carries no attributes at all, and this card needs
+         the answer exactly then (see `_flags`). */
+      if (!this._wsQueried) {
+        this._wsQueried = true;
+        this._loadWsFlags();
+      }
       this.requestUpdate();
     }
 
@@ -1082,8 +1111,12 @@ function _hmPowerFlowRegister() {
       return [
         hmLang(this._hass, this._config),
         this._config.gradient, this._config.max_width,
-        this._text(this._config.title), this._config.show_title, this._config.show_rssi,
+        this._text(this._config.title), this._config.show_title,
         this._config.flow_speed,
+        /* Offline is part of the key: the drawing switches to the frozen
+           picture (last known layout, grey icons, no readings) the moment the
+           integration marks the entities unavailable. */
+        this._offline() ? "off" : "on",
         /* `auto` latches on a negative load, so the resolved layout - not just
            the setting - is part of what the drawing depends on. */
         this._config.grid_mode, this._sawNegativeLoad,
@@ -1096,12 +1129,19 @@ function _hmPowerFlowRegister() {
            of the key: otherwise a branch could stay grey at exactly MIN_FLOW. */
         wkey(d.pv), wkey(d.pv2), wkey(d.grid), wkey(d.load), wkey(d.smartPlug),
         wkey(d.battery),
+        /* Whether the optional branches are drawn decides the picture, so it is
+           part of the key: a device that starts (or stops) reporting them has
+           to redraw even when every reading is still the same 0 W. */
+        String(d.showPv2), String(d.showPlug),
+        /* Whether the grid and the house are one node decides the caption and
+           the colour of the top right node, so it belongs in the key too. */
+        d.hasMeter === null || d.hasMeter === undefined ? "-" : String(d.hasMeter),
         d.soc === null || d.soc === undefined ? "x" : num(d.soc).toFixed(2),
-        d.status, d.rssi, d.packs,
+        d.status, d.packs,
       ].join("\u0001");
     }
 
-    /** Multiplier for the streak speed (`flow_speed`, 1 = default). */
+    /** Multiplier for the whole flow cycle (`flow_speed`, 1 = default). */
     _flowSpeed() {
       const scale = num(this._config && this._config.flow_speed);
       return scale > 0 ? scale : 1;
@@ -1110,33 +1150,40 @@ function _hmPowerFlowRegister() {
     /* --------------------------- the streak --------------------------- */
 
     /**
-     * Work out where every streak is, and how long one trip takes.
+     * Place every streak on one shared clock.
      *
-     * One entry per lit connector: the geometry (so the caller does not parse the
-     * path twice), the duration of one cycle and the phase, 0..1.  A route that
-     * carries too little power is left out, and so is a degenerate path.
+     * The earlier version gave each connector its own cycle and advanced it
+     * independently.  That looked wrong wherever the diagram branches: a
+     * downstream connector started its trip at t=0 as well, so the junction
+     * lit up with energy that had not arrived yet, and two branches feeding
+     * the same point drifted apart.
      *
-     * The phase is the only state, and it is advanced here rather than by the
-     * browser because the CSS animation is restarted by every re-render - it just
-     * gets the phase back through a negative `animation-delay`.  Advancing by
-     * `dt / duration` keeps the position continuous when the speed changes: a
-     * faster trip covers the same fraction of the connector in less time.
+     * Now there is exactly one cycle (`FLOW_CYCLE_S`), and a connector's phase
+     * inside it is fixed by its stage (see `FLOW_STAGES`): gather into the unit,
+     * run through it to the junction, leave the junction.  Every connector is
+     * handed the same negative `animation-delay`, i.e. the same point of that
+     * cycle, so:
      *
-     * The step is clamped because a hidden tab stops painting, and the minutes
-     * it was away must not be added as one huge jump.
+     *   - nothing downstream moves until the stage before it has finished, and
+     *   - everything feeding the junction arrives together, and everything
+     *     leaving it departs together, because they share a stage window.
+     *
+     * The delay is derived from the wall clock rather than accumulated across
+     * renders, so the re-render that every reading change causes cannot drift
+     * the branches apart either.
      */
     _beamPlan(routes) {
       const now = (typeof performance !== "undefined"
         && typeof performance.now === "function")
         ? performance.now()
         : Date.now();
-      const last = this._pfClock || now;
-      this._pfClock = now;
-      const dt = Math.min(Math.max((now - last) / 1000, 0), 5);
+      if (!this._pfEpoch) this._pfEpoch = now;
 
-      const scale = this._flowSpeed();
+      const cycle = FLOW_CYCLE_S / this._flowSpeed();
+      const phase = ((now - this._pfEpoch) / (cycle * 1000)) % 1;
+      const delay = phase * cycle;
+
       const plan = [];
-
       for (const route of routes) {
         const power = Math.abs(num(route.power));
         if (power < MIN_FLOW) continue;
@@ -1144,19 +1191,7 @@ function _hmPowerFlowRegister() {
         const len = pathLength(travel);
         if (!(len > 0)) continue;
 
-        /* `flowSpeed` is the speed *while travelling*; the cycle also contains
-           the pause after the streak has left, so one trip takes longer than
-           `len / speed`. */
-        const speed = flowSpeed(power, len, scale);
-        const duration = clamp(len / (speed * STREAK_TRAVEL), 0.8, 12);
-
-        const known = this._pfPhase.get(route.id);
-        const phase = dt > 0 && Number.isFinite(known)
-          ? (known + dt / duration) % 1
-          : (Number.isFinite(known) ? known : 0);
-        this._pfPhase.set(route.id, phase);
-
-        plan.push({ route, travel, len, duration, phase });
+        plan.push({ route, travel, len, stage: route.stage || 0, cycle, delay });
       }
       return plan;
     }
@@ -1170,9 +1205,10 @@ function _hmPowerFlowRegister() {
       /* The pulse is a CSS animation, so it keeps running across a detach and
          re-attach by itself - switching dashboard tabs used to freeze it, which
          is why the old dot animation needed a requestAnimationFrame loop that
-         had to be restarted by hand.  Only the clock is forgotten, otherwise the
-         first render after coming back would add the whole time away. */
-      this._pfClock = 0;
+         had to be restarted by hand.  Forgetting the epoch restarts the shared
+         cycle from the beginning, so a card that comes back does not drop into
+         the middle of a stage. */
+      this._pfEpoch = 0;
       this._onLangChange = () => this.requestUpdate();
       window.addEventListener(LANG_EVENT, this._onLangChange);
     }
@@ -1180,7 +1216,10 @@ function _hmPowerFlowRegister() {
     disconnectedCallback() {
       window.removeEventListener(LANG_EVENT, this._onLangChange);
       super.disconnectedCallback();
-      this._pfClock = 0;
+      this._pfEpoch = 0;
+      /* Ask again next time: the card may come back on a device that has been
+         switched off since, or after a Home Assistant restart. */
+      this._wsQueried = false;
     }
 
     /* ----------------------------- lookup ----------------------------- */
@@ -1239,10 +1278,31 @@ function _hmPowerFlowRegister() {
       if (!found && hass.entities) {
         const uniqueSuffix = `hoymiles_${this._dev()}_${suffix}`;
         for (const [entityId, entry] of Object.entries(hass.entities)) {
-          if (entry && entry.unique_id === uniqueSuffix) {
+          // Skip registry entries without a state: a removed entity leaves one
+          // behind, and returning it would shadow the live replacement.
+          if (entry && entry.unique_id === uniqueSuffix && hass.states[entityId]) {
             found = entityId;
             break;
           }
+        }
+      }
+
+      if (!found) {
+        /* Last resort: the entity id may have been renamed so that the device
+           slug no longer sits right after the domain - for example
+           `sensor.msa_…_energy_flow_today` renamed to
+           `sensor.g3_msa_…_energy_flow_today`.  Recent Home Assistant does
+           not expose the registry's `unique_id` to the frontend, so the unique
+           id strategy above cannot see it.  Match on what the id still
+           carries: the device slug immediately followed by the suffix.  The
+           adjacency test also keeps `soc` from matching `system_soc`. */
+        const wanted = norm(suffix);
+        const device = norm(dev);
+        for (const entityId of Object.keys(hass.states)) {
+          if (!entityId.startsWith(`${domain}.`)) continue;
+          const tail = norm(entityId.slice(domain.length + 1));
+          if (!tail.endsWith(device + wanted)) continue;
+          if (!found || entityId.length < found.length) found = entityId;
         }
       }
 
@@ -1289,6 +1349,14 @@ function _hmPowerFlowRegister() {
       const load = this._read("system_load_power", null);
       const smartPlug = this._read("system_smart_plug_power", null);
 
+      // Is there a PV2 inverter / a smart plug in this system at all?  The
+      // readings above cannot answer that: hardware that is installed but
+      // idle, asleep or in the dark reports 0 W, exactly like hardware that
+      // is not there.  The device answers it in its state snapshot
+      // (`has_pv2` / `has_plug`), which the integration mirrors onto the
+      // energy flow sensor's attributes.
+      const flags = this._flags();
+
       // Battery is the one node without a `sys_` counterpart at the system
       // level, so it keeps the usual system → device fallback.
       let battery = this._read("system_battery_power", null);
@@ -1305,10 +1373,6 @@ function _hmPowerFlowRegister() {
       let status = this._readText("battery_status");
       if (!status) status = this._readText("bat_sts");
 
-      // Wi-Fi signal strength; the power flow card prints it as a fan in the
-      // top right corner of the header.
-      const rssi = this._read("rssi", null);
-
       // How many battery modules the illustration draws. `pack_count` is
       // authoritative, but it is a diagnostic entity and may be hidden or
       // missing on older firmware, so the highest pack that actually reports a
@@ -1322,20 +1386,130 @@ function _hmPowerFlowRegister() {
 
       return {
         pv, pv2, grid, load, smartPlug, battery, soc,
-        status: status.toLowerCase(), rssi, packs,
+        status: status.toLowerCase(), packs,
+        hasMeter: flags.meter, hasPv2: flags.pv2, hasPlug: flags.plug,
+        /* Whether the optional branch is drawn at all.  The device's own flag
+           answers that; a device that never reports one (older firmware) is
+           judged on evidence instead, so an uninstalled PV2 / smart plug can
+           no longer sit in the drawing as a permanent 0 W node. */
+        showPv2: this._optional(flags.pv2, pv2,
+          this._read("system_pv2_energy_today", 0), "_pfSeenPv2"),
+        showPlug: this._optional(flags.plug, smartPlug, 0, "_pfSeenPlug"),
       };
+    }
+
+    /**
+     * Does an optional branch physically exist?
+     *
+     * The device reports `has_pv2` / `has_plug` in its state snapshot, and that
+     * is the only thing that can tell installed-but-idle hardware (0 W) from
+     * hardware that is not there at all.  Older firmware does not send the
+     * snapshot, so the flag is `null` and the card falls back to evidence:
+     *
+     *   - the branch is carrying power right now, or
+     *   - it produced something today (`pv2_e`; the smart plug has no such
+     *     energy field, so there it is the power reading only).
+     *
+     * Once either is true the verdict is latched for this config, because a
+     * PV2 inverter that worked this morning is still installed tonight when it
+     * reads 0 W - without the latch the node would vanish at dusk.
+     */
+    _optional(flag, power, energy, latch) {
+      /* A live reading is proof that the hardware is there.  The device's flag
+         is trusted when it says `true`; when it says `false` it still hides the
+         branch (that is the documented meaning), but not while that branch is
+         visibly carrying power - a firmware whose flag had not been refreshed
+         left a smart plug drawing 1.8 W out of the drawing entirely.  A flag
+         that is simply absent (`null`, older firmware) keeps the old
+         evidence-plus-latch rule. */
+      const live = Math.abs(num(power)) >= MIN_FLOW || num(energy) > 0;
+      if (flag === true) return true;
+      if (flag === false) return live;
+      if (live) this[latch] = true;
+      return !!this[latch];
+    }
+
+    /**
+     * Capability flags from the device's own state snapshot.
+     *
+     * `null` means *not reported* (older firmware, or the device has not sent
+     * a snapshot since Home Assistant started) and must not be read as `false`:
+     * a restart would then make installed hardware vanish from the drawing.
+     * The caller falls back to the old rule in that case, which is "draw the
+     * branch as soon as its entity carries a value".
+     */
+    _flags() {
+      // Read the attributes straight off the state object: the sensor's own
+      // value can still be `unknown` (the energy payload is slower than the
+      // power one), and `_stateOf` would throw those attributes away.
+      const entityId = this._resolveEntity("energy_flow_today");
+      const state = entityId && this._hass ? (this._hass.states || {})[entityId] : null;
+      const attributes = (state && state.attributes) || {};
+      const ws = this._wsFlags || {};
+      /* Entity first (it is the live answer), then the remembered one from the
+         integration.  Without that second source a device that goes offline - or
+         a page opened after it did - loses every attribute, and the fallbacks
+         below invent a layout: a unit with no meter grew a separate grid node
+         and its smart plug disappeared, which is not the picture it had. */
+      const flag = (key, wsKey) => {
+        if (typeof attributes[key] === "boolean") return attributes[key];
+        return typeof ws[wsKey] === "boolean" ? ws[wsKey] : null;
+      };
+      return {
+        meter: flag("has_meter", "has_meter"),
+        pv2: flag("has_pv2", "has_pv2"),
+        plug: flag("has_plug", "has_plug"),
+      };
+    }
+
+    async _loadWsFlags() {
+      if (!this._hass || typeof this._hass.callWS !== "function") return;
+      try {
+        const info = await this._hass.callWS({
+          type: "hoymiles/device/info",
+          dev_id: this._dev(),
+        });
+        if (this.isConnected && info && info.known) {
+          this._wsFlags = info;
+          this.requestUpdate();
+        }
+      } catch (err) {
+        /* Older integration, or a device that has no entry: keep using the
+           entity attributes and try again on the next connection. */
+        this._wsQueried = false;
+      }
     }
 
     /* ----------------------------- render ----------------------------- */
 
     render() {
       if (!this._config) return html``;
-      const d = this._data();
+      const live = this._data();
+      const offline = this._offline();
+      /* Freeze and grey rather than blank out.
+
+         When the device goes silent the integration marks every entity
+         `unavailable`, so `_data()` returns `null` for each reading - and the
+         diagram used to lose half its nodes (a missing `load` drops the branch
+         with it).  Falling back to the last good snapshot keeps the wiring
+         exactly as the user left it, which is what "the device is offline"
+         should look like; `_nodes()` then prints a dash instead of a number and
+         every icon keeps its dim variant. */
+      if (!offline) this._lastGood = live;
+      /* The `offline` flag has to be set even when this page was opened *after*
+         the unit went quiet and `_lastGood` is still empty: without it the nodes
+         printed "0.0 W" for every reading instead of a dash, which reads as a
+         device that is reporting zero rather than one that is not reporting at
+         all. The wiring is the live one in that case - nothing better is known -
+         but the numbers stay honest. */
+      const d = offline
+        ? { ...(this._lastGood || live || {}), offline: true }
+        : live;
       const temp = this._temperature();
       const showName = this._showName();
 
       return html`
-        <ha-card>
+        <ha-card class=${offline ? "offline" : ""}>
           <div class="head ${showName ? "" : "bare"}">
             ${showName ? html`
               <div class="hname">
@@ -1343,7 +1517,7 @@ function _hmPowerFlowRegister() {
                 <span class="dev">${esc(this._dev())}</span>
               </div>` : ""}
             <div class="hright">
-              ${this._signal(d)}
+              ${offline ? html`<div class="chip off">${this._t("Offline", "离线")}</div>` : ""}
               ${temp === null ? "" : html`
                 <div class="chip">
                   <span>☀️</span><span>${temp}</span>
@@ -1355,6 +1529,28 @@ function _hmPowerFlowRegister() {
           </div>
         </ha-card>
       `;
+    }
+
+    /**
+     * Is the device (as opposed to this browser) offline?
+     *
+     * The integration marks every entity `unavailable` once nothing has arrived
+     * for its staleness window, and a freshly started Home Assistant shows
+     * `unknown` until the first payload lands - both mean "no live reading".
+     * A *missing* entity must not be read as an offline device (older firmware,
+     * a hidden entity), hence the first existing one decides and nothing is
+     * concluded when none of them exist.
+     */
+    _offline() {
+      if (!this._hass) return false;
+      for (const suffix of ["soc", "system_pv_power", "pv_power", "energy_flow_today"]) {
+        const entityId = this._resolveEntity(suffix);
+        if (!entityId) continue;
+        const state = (this._hass.states || {})[entityId];
+        if (!state) continue;
+        return state.state === "unavailable" || state.state === "unknown";
+      }
+      return false;
     }
 
     /** The title block (heading + device id) can be hidden with `show_title`.
@@ -1378,48 +1574,6 @@ function _hmPowerFlowRegister() {
       }
       const unit = (state.attributes && state.attributes.unit_of_measurement) || "°C";
       return `${num(state.state).toFixed(0)}${unit}`;
-    }
-
-    /**
-     * RSSI shown in the top right corner: the same four-bar Wi-Fi icon the
-     * battery card uses, plus the raw dBm reading.  Hidden when the device
-     * reports no signal value, and switchable off with ``show_rssi: false``.
-     */
-    _signal(d) {
-      if (this._config.show_rssi === false) return null;
-      const rssi = d.rssi;
-      if (rssi === null || !Number.isFinite(rssi)) return null;
-
-      const bars = rssiBars(rssi);
-      const quality = bars === 4 ? this._t("excellent", "优秀")
-        : bars === 3 ? this._t("good", "良好")
-          : bars === 2 ? this._t("fair", "一般")
-            : this._t("weak", "较弱");
-
-      return html`
-        <div class="signal" title=${`${this._t("Wi-Fi signal", "Wi-Fi 信号")}: ${quality}`}>
-          ${this._untrusted(this._signalBars(bars))}
-          <span>${rssi.toFixed(0)} dBm</span>
-        </div>`;
-    }
-
-    /**
-     * The icon: four bars of increasing height. Geometry and colours match
-     * ``hoymiles-battery``'s `_signal()` exactly, so the same reading looks
-     * identical on both cards.
-     */
-    _signalBars(bars) {
-      const color = bars === 0
-        ? "var(--disabled-text-color, #b6bcc4)"
-        : "var(--primary-color)";
-      let out = "<svg class=\"bars\" width=\"22\" height=\"18\" viewBox=\"0 0 22 18\" "
-        + "xmlns=\"http://www.w3.org/2000/svg\" aria-hidden=\"true\">";
-      for (let i = 0; i < 4; i += 1) {
-        const h = 4 + i * 3.4;
-        out += `<rect x="${1 + i * 5}" y="${16 - h}" width="3.4" height="${h}" rx="1.4"`
-          + ` fill="${i < bars ? color : "var(--divider-color, #dcdfe4)"}"/>`;
-      }
-      return `${out}</svg>`;
     }
 
     /* --------------------------- the diagram --------------------------- */
@@ -1448,6 +1602,10 @@ function _hmPowerFlowRegister() {
       const mode = String((this._config || {}).grid_mode || "auto").toLowerCase();
       if (mode === "meter") return true;
       if (mode === "no_meter" || mode === "nometer") return false;
+      /* The device's own snapshot beats every guess: a unit that says there is
+         no meter cannot be showing a meter reading, and one that says there is
+         keeps its two separate nodes. */
+      if (typeof d.hasMeter === "boolean") return d.hasMeter;
       if (num(d.load) < -METER_PROOF_W) this._sawNegativeLoad = true;
       return !this._sawNegativeLoad;
     }
@@ -1462,6 +1620,17 @@ function _hmPowerFlowRegister() {
     _schematic(d) {
       const present = (v) => v !== null && v !== undefined && !Number.isNaN(num(v));
       const hasMeter = this._hasMeter(d);
+      /* Offline: no light travels along the wiring and the unit is drawn dim.
+         The routes still exist, so the connectors keep the shape of the last
+         good picture - the diagram is frozen, not emptied. */
+      const off = d.offline === true;
+      /* "Is this branch part of the picture?"  Offline every reading is empty -
+         the entities are unavailable - but the branch itself is still there, and
+         the picture is supposed to keep exactly the elements it had before the
+         unit went quiet.  So while offline the question is answered by the
+         hardware flags alone (a meter implies both a grid branch and a house
+         load); the values simply print a dash. */
+      const shown = (v) => present(v) || off;
 
        /* The wiring diagram: PV1 / storage run into the inverter's left side, the
          inverter's right side meets a junction on the right edge, and the
@@ -1484,14 +1653,80 @@ function _hmPowerFlowRegister() {
       const charging = num(d.battery) < 0;
       const trunk = num(d.pv) + num(d.pv2) + num(d.battery); // W into the junction
 
+      /* With no meter and neither optional branch, the merged node is the only
+         thing on the right.  Stacking it above the junction would leave an
+         empty column and a stray vertical stub, so it moves down onto the
+         trunk's own line instead: one horizontal run from the unit straight
+         into the node, which is how the vendor app draws a single-branch
+         system.  Everything else keeps the fan-out layout. */
+      const inline = !hasMeter && shown(d.load) && !d.showPv2 && !d.showPlug;
+
+      /* Which stage of the shared cycle a connector travels in.
+       *
+       * The diagram has two hubs: the unit in the middle and the junction on
+       * the right.  Inside one stage window every connector moves at the same
+       * time, and a stage only starts once the previous one has finished - so
+       * the picture always reads "all the inputs arrive together, then the
+       * trunk runs through, then everything leaves at once".
+       *
+       *   0  everything joining a hub      left node -> unit, and any right
+       *                                   branch flowing INTO the junction
+       *                                   (pv, pv2 producing; grid importing)
+       *   1  the trunk between the hubs
+       *   2  everything leaving a hub     unit -> battery (charging), and
+       *                                   junction -> grid / lamp / plug
+       *
+       * A right-hand branch that *leaves* the junction can only start once the
+       * energy is actually there, and that depends on which way the trunk is
+       * running:
+       *
+       *   trunk into the junction  -> the junction only fills up at the end of
+       *                               stage 1, so departures wait for stage 2
+       *   trunk out of the junction -> the junction is fed by its own arrivals
+       *                               in stage 0, so departures can set off in
+       *                               stage 1 *together with* the trunk, which is
+       *                               the "several outputs leave at once" case
+       *
+       * `reverse` already says the direction: on the right-hand side reversed =
+       * leaving the junction, on the left-hand side reversed = charging, i.e.
+       * leaving the unit.  The left-hand side has no such ambiguity - a
+       * departure there always needs the trunk to have arrived, so it is 2.
+       */
+      const trunkToJunction = trunk >= 0;
+      const stageLeft = (reverse) => (reverse ? 2 : 0);
+      const stageRight = (reverse) => {
+        if (!reverse) return 0;
+        return trunkToJunction ? 2 : 1;
+      };
+      const gridBack = hasMeter ? num(d.grid) < 0 : num(d.load) >= 0;
+
+      /* `sys_load_p` is not measured, it is derived on the device as
+         `grid + plug + pv2 - sp`.  A meter that reports a watt or two of
+         export with nothing generating therefore makes the load read
+         *negative* - and drawn as-is that sends the pulse out of the lamp and
+         back towards the unit, i.e. it looks like the load is generating.
+         A house load only consumes, so the drawing clamps it at zero; the raw
+         figure is left alone for everything else (in particular the merged
+         node, where the signed on-grid port power is meaningful). */
+      const draw = hasMeter && present(d.load)
+        ? Object.assign({}, d, { load: Math.max(0, num(d.load)) })
+        : d;
+
       const routes = [
         { id: "pv", d: "M104 142 V190 Q104 200 114 200 H283", power: d.pv,
-          color: COLORS.pv, reverse: num(d.pv) < 0 },
+          color: COLORS.pv, reverse: num(d.pv) < 0,
+          stage: stageLeft(num(d.pv) < 0) },
         { id: "battery", d: "M104 322 V274 Q104 264 114 264 H283", power: d.battery,
-          color: COLORS.battery, reverse: charging },
-        { id: "trunk", d: `M361 ${JUNCTION.y} H594`, power: trunk,
-          color: COLORS.pv, reverse: trunk < 0 },
-        {
+          color: COLORS.battery, reverse: charging,
+          stage: stageLeft(charging) },
+        /* The run stops 6 units short of the junction dot, or on the merged
+           node's ring when that node takes the junction's place. */
+        { id: "trunk",
+          d: `M361 ${JUNCTION.y} H${NODE_COL_R - (inline ? NODE_R : 6)}`,
+          power: trunk, color: COLORS.pv, reverse: trunk < 0, stage: 1 },
+      ];
+      if (!inline) {
+        routes.push({
           /* With a meter this branch is the meter's reading.  Without one there
              is nothing to measure except the on-grid port, which *is* the house
              connection - so the same branch carries the house instead, and the
@@ -1502,42 +1737,47 @@ function _hmPowerFlowRegister() {
           color: (hasMeter ? num(d.grid) >= 0 : num(d.load) >= 0)
             ? COLORS.grid
             : COLORS.grid_out,
-          reverse: hasMeter ? num(d.grid) < 0 : num(d.load) >= 0,
-        },
-      ];
-      if (present(d.pv2)) {
+          reverse: gridBack,
+          stage: stageRight(gridBack),
+        });
+      }
+      if (d.showPv2) {
         routes.push({ id: "pv2", d: PV2_ROUTE, power: d.pv2,
-          color: COLORS.pv6, reverse: num(d.pv2) < 0 });
+          color: COLORS.pv6, reverse: num(d.pv2) < 0,
+          stage: stageRight(num(d.pv2) < 0) });
       }
-      if (present(d.load) && hasMeter) {
-        routes.push({ id: "load", d: LAMP_ROUTE, power: d.load,
-          color: COLORS.load, reverse: num(d.load) >= 0 });
+      if (shown(d.load) && hasMeter) {
+        routes.push({ id: "load", d: LAMP_ROUTE, power: draw.load,
+          color: COLORS.load, reverse: num(draw.load) >= 0,
+          stage: stageRight(num(draw.load) >= 0) });
       }
-      if (present(d.smartPlug)) {
+      if (d.showPlug) {
         routes.push({ id: "plug", d: `M600 322 V${JUNCTION.y + 6}`,
-          power: d.smartPlug, color: COLORS.sp, reverse: num(d.smartPlug) >= 0 });
+          power: d.smartPlug, color: COLORS.sp, reverse: num(d.smartPlug) >= 0,
+          stage: stageRight(num(d.smartPlug) >= 0) });
       }
 
       const edges = routes.map((r) => `
         <path class="pf-edge" d="${r.d}" fill="none"
               vector-effect="non-scaling-stroke"/>`).join("");
 
-      const beams = this._beamPlan(routes).map(flowBeam).join("");
-
+      const beams = off ? "" : this._beamPlan(routes).map(flowBeam).join("");
       /* One icon per node and the unit in the middle.  A branch whose entity is
          absent is dropped (and its connector with it); a branch that exists but
          reads zero is still drawn, in its dim variant - exactly like the app. */
-      const nodes = this._nodes(d, {
-        pv2: present(d.pv2),
-        plug: present(d.smartPlug),
-        lamp: present(d.load) && hasMeter,
-        grid: present(d.grid) && hasMeter,
-        merged: present(d.load) && !hasMeter,
+      const nodes = this._nodes(draw, {
+        pv2: d.showPv2,
+        plug: d.showPlug,
+        lamp: shown(d.load) && hasMeter,
+        grid: shown(d.grid) && hasMeter,
+        merged: shown(d.load) && !hasMeter,
+        mergedInline: inline,
       });
 
       /* The unit in the middle works as soon as *anything* flows through it, so
          its artwork is coloured then and dim when the whole system is idle. */
-      const busy = [d.pv, d.pv2, d.grid, d.load, d.smartPlug, d.battery]
+      const busy = !off && [d.pv, d.showPv2 ? d.pv2 : null, d.grid, draw.load,
+        d.showPlug ? d.smartPlug : null, d.battery]
         .some((v) => present(v) && Math.abs(num(v)) >= MIN_FLOW);
 
       return `<svg viewBox="0 0 ${VB_W} ${VB_H}" preserveAspectRatio="xMidYMid meet"
@@ -1551,7 +1791,12 @@ function _hmPowerFlowRegister() {
         ${edges}
         ${beams}
         ${this._inverter(busy)}
-        <circle class="pf-junction" cx="${JUNCTION.x}" cy="${JUNCTION.y}" r="6"/>
+        ${/* The junction dot is where several branches meet.  With the merged
+             node sitting on that spot there is nothing to fan out, and the
+             dot would be hidden under the icon anyway. */
+          inline
+            ? ""
+            : `<circle class="pf-junction" cx="${JUNCTION.x}" cy="${JUNCTION.y}" r="6"/>`}
         ${nodes}
       </svg>`;
     }
@@ -1956,7 +2201,13 @@ function _hmPowerFlowRegister() {
      */
     _nodes(d, opts) {
       const t = (en, zh) => this._t(en, zh);
-      const working = (v) => Math.abs(num(v)) >= MIN_FLOW;
+      /* Offline: the layout is the last good one, but no reading may be shown
+         and no icon may claim activity - "no value" is the honest picture, and
+         the dim artwork is exactly what this card already uses for a branch
+         that is not doing anything. */
+      const off = d.offline === true;
+      const working = (v) => !off && Math.abs(num(v)) >= MIN_FLOW;
+      const fmt = (v) => (off ? "—" : v);
       const parts = [];
 
       const node = (x, y, icon, on, value, caption) => {
@@ -1973,39 +2224,49 @@ function _hmPowerFlowRegister() {
       };
 
       node(NODE_COL_L, NODE_ROW_TOP, "pv", working(d.pv),
-        fmtW(d.pv), t("Solar1", "光伏1"));
+        fmt(fmtW(d.pv)), t("Solar1", "光伏1"));
       node(NODE_COL_L, NODE_ROW_BOT, "battery", working(d.battery),
-        `${fmtW(d.battery)}${d.soc === null ? "" : `　${num(d.soc).toFixed(2)}%`}`,
+        fmt(`${fmtW(d.battery)}${d.soc === null ? "" : `　${num(d.soc).toFixed(2)}%`}`),
         t("Storage", "微储"));
 
       if (opts.pv2) {
         node(NODE_COL_M, NODE_ROW_TOP, "pv", working(d.pv2),
-          fmtW(d.pv2), t("Solar2", "光伏2"));
+          fmt(fmtW(d.pv2)), t("Solar2", "光伏2"));
       }
       if (opts.grid) {
         const g = num(d.grid);
         const importing = g > 0;
         // At ~0 W neither direction is true, so the node just says 电网.
-        const caption = Math.abs(g) < MIN_FLOW
+        const caption = off || Math.abs(g) < MIN_FLOW
           ? t("Grid", "电网")
           : (importing ? t("Grid in", "电网输入") : t("Grid out", "电网输出"));
         node(NODE_COL_R, NODE_ROW_TOP, "grid", working(d.grid),
-          fmtW(d.grid), caption);
+          fmt(fmtW(d.grid)), caption);
       }
       if (opts.lamp) {
         node(NODE_COL_M, NODE_ROW_BOT, "load", working(d.load),
-          fmtW(d.load), t("Load", "负载"));
+          fmt(fmtW(d.load)), t("Load", "负载"));
       }
       if (opts.merged) {
-        /* No meter: the grid branch is the house connection, so its node keeps
-           the grid slot and the grid artwork - the label says it covers the
-           load as well. */
-        node(NODE_COL_R, NODE_ROW_TOP, "grid", working(d.load),
-          fmtW(d.load), t("Grid & load", "电网&负载"));
+        /* No meter: the grid branch *is* the house connection, so the two
+           collapse into one node.  Its artwork is the vendor app's own icon
+           for that branch, provided as a PNG and baked into the icon table
+           like every other node (see PF_ICONS["gridload.on"]), so it sits on
+           the diagram with the same weight and rendering as the rest instead
+           of looking like hairline SVG next to them.
+           Regenerate with _preview/bake_user_icons.py + apply_merged_icons.py.
+
+           ``mergedInline`` puts it on the trunk's own line (no PV2, no smart
+           plug, no meter), otherwise it keeps the top of the right column.
+
+           Idle still uses the baked grey variant (``gridload.off``), which is
+           exactly how the other branches say "nothing happening here". */
+        node(NODE_COL_R, opts.mergedInline ? JUNCTION.y : NODE_ROW_TOP, "gridload",
+          working(d.load), fmt(fmtW(d.load)), t("Grid & load", "电网&负载"));
       }
       if (opts.plug) {
         node(NODE_COL_R, NODE_ROW_BOT, "plug", working(d.smartPlug),
-          fmtW(d.smartPlug), t("Smart plug", "智能插座"));
+          fmt(fmtW(d.smartPlug)), t("Smart plug", "智能插座"));
       }
 
       return parts.join("");
@@ -2137,11 +2398,6 @@ function _hmPowerFlowRegister() {
             <ha-switch .checked=${config.show_title !== false}
               @change=${this._toggle("show_title")}></ha-switch>
             <span>show_title (title and device SN)</span>
-          </label>
-          <label class="sw">
-            <ha-switch .checked=${config.show_rssi !== false}
-              @change=${this._toggle("show_rssi")}></ha-switch>
-            <span>show_rssi (signal icon)</span>
           </label>
         </div>
       `;
