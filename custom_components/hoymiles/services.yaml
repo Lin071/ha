@@ -303,3 +303,251 @@ get_power_ctrl:
       selector:
         text:
 
+set_meter_ctrl:
+  name: Set virtual meter setpoint (repeating)
+  description: >-
+    Write the virtual meter (protocol §11 / §12) and keep re-publishing the
+    object in Home Assistant. The firmware drops the value unless it is
+    refreshed at least once a minute, and it only takes effect while the EMS
+    mode is meter_ctrl. Stops on its own when Home Assistant restarts, and on
+    stop_meter_ctrl. At least one of value / power / eng_out / eng_in is needed;
+    the fields you leave out keep the value the device already holds.
+  fields:
+    device_id:
+      name: Device
+      description: Target device picked from the device registry. Alternative to Device ID.
+      required: false
+      selector:
+        device:
+          integration: hoymiles
+    dev_id:
+      name: Device ID
+      description: Device identifier, in the form client_prefix-SN. Optional when a device is selected.
+      required: false
+      example: "MSA-280520260806"
+      selector:
+        text:
+    value:
+      name: Setpoint
+      description: Virtual meter power in watt. Positive imports, negative exports. Same as power.
+      required: false
+      example: -800
+      selector:
+        number:
+          min: -5000
+          max: 5000
+          step: 0.1
+          mode: box
+    power:
+      name: Power
+      description: Virtual meter power in watt (protocol `power` field). Alias of Setpoint.
+      required: false
+      example: -800
+      selector:
+        number:
+          min: -5000
+          max: 5000
+          step: 0.1
+          mode: box
+    eng_out:
+      name: Output energy reading
+      description: >-
+        Cumulative energy the simulated meter reports as delivered to the grid,
+        in Wh. A reading, not a counter to add to.
+      required: false
+      example: 12345
+      selector:
+        number:
+          min: 0
+          max: 4294967295
+          step: 1
+          mode: box
+    eng_in:
+      name: Input energy reading
+      description: >-
+        Cumulative energy the simulated meter reports as taken from the grid, in
+        Wh. A reading, not a counter to add to.
+      required: false
+      example: 54321
+      selector:
+        number:
+          min: 0
+          max: 4294967295
+          step: 1
+          mode: box
+    interval:
+      name: Repeat every
+      description: Seconds between re-publishes. Keep it well below 60 s.
+      required: false
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 3600
+          step: 1
+          mode: box
+
+stop_meter_ctrl:
+  name: Stop virtual meter repeat
+  description: >-
+    Stop re-publishing the virtual meter setpoint. The device drops it within
+    about a minute.
+  fields:
+    device_id:
+      name: Device
+      description: Target device picked from the device registry. Alternative to Device ID.
+      required: false
+      selector:
+        device:
+          integration: hoymiles
+    dev_id:
+      name: Device ID
+      description: Device identifier, in the form client_prefix-SN. Optional when a device is selected.
+      required: false
+      example: "MSA-280520260806"
+      selector:
+        text:
+
+get_meter_ctrl:
+  name: Get virtual meter repeat
+  description: >-
+    Report whether the virtual meter setpoint is being re-published, which
+    value, at which interval and how many seconds are left.
+  fields:
+    device_id:
+      name: Device
+      description: Target device picked from the device registry. Alternative to Device ID.
+      required: false
+      selector:
+        device:
+          integration: hoymiles
+    dev_id:
+      name: Device ID
+      description: Device identifier, in the form client_prefix-SN. Optional when a device is selected.
+      required: false
+      example: "MSA-280520260806"
+      selector:
+        text:
+
+set_fine_ctrl:
+  name: Set fine control fields (repeating)
+  description: >-
+    Write one or more fields of the fine control object (protocol §42) and keep
+    re-publishing the whole object in Home Assistant. Only the fields you pass
+    are changed; the rest keep the value the repeat already holds. Requires the
+    EMS mode to be fine_ctrl.
+  fields:
+    device_id:
+      name: Device
+      description: Target device picked from the device registry. Alternative to Device ID.
+      required: false
+      selector:
+        device:
+          integration: hoymiles
+    dev_id:
+      name: Device ID
+      description: Device identifier, in the form client_prefix-SN. Optional when a device is selected.
+      required: false
+      example: "MSA-280520260806"
+      selector:
+        text:
+    grid_p:
+      name: Grid setpoint
+      description: >-
+        Grid setpoint in watt. Positive exports to the grid, negative imports.
+        Also accepted as grid_power_setpoint.
+      required: false
+      selector:
+        number:
+          min: -2500
+          max: 2500
+          step: 0.1
+          mode: box
+    pv_power:
+      name: PV limit
+      description: >-
+        PV output ceiling in watt. 0 stops PV output. Also accepted as
+        pv_power_limit.
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 2500
+          step: 1
+          mode: box
+    chg_off:
+      name: Forbid charging
+      description: >-
+        Turn on to make the device refuse to charge. Also accepted as
+        charge_forbid.
+      required: false
+      selector:
+        boolean:
+    dchg_off:
+      name: Forbid discharging
+      description: >-
+        Turn on to make the device refuse to discharge. Also accepted as
+        discharge_forbid.
+      required: false
+      selector:
+        boolean:
+    eps_relay:
+      name: Off-grid relay
+      description: On closes the relay (off-grid port live), off opens it.
+      required: false
+      selector:
+        boolean:
+    interval:
+      name: Repeat every
+      description: Seconds between re-publishes. Keep it well below 60 s.
+      required: false
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 3600
+          step: 1
+          mode: box
+
+stop_fine_ctrl:
+  name: Stop fine control repeat
+  description: >-
+    Stop re-publishing the fine control object. The device drops it within about
+    a minute.
+  fields:
+    device_id:
+      name: Device
+      description: Target device picked from the device registry. Alternative to Device ID.
+      required: false
+      selector:
+        device:
+          integration: hoymiles
+    dev_id:
+      name: Device ID
+      description: Device identifier, in the form client_prefix-SN. Optional when a device is selected.
+      required: false
+      example: "MSA-280520260806"
+      selector:
+        text:
+
+get_fine_ctrl:
+  name: Get fine control repeat
+  description: >-
+    Report whether the fine control object is being re-published, which fields
+    it carries, at which interval and how many seconds are left.
+  fields:
+    device_id:
+      name: Device
+      description: Target device picked from the device registry. Alternative to Device ID.
+      required: false
+      selector:
+        device:
+          integration: hoymiles
+    dev_id:
+      name: Device ID
+      description: Device identifier, in the form client_prefix-SN. Optional when a device is selected.
+      required: false
+      example: "MSA-280520260806"
+      selector:
+        text:
+
