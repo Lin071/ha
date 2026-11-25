@@ -245,14 +245,18 @@ function _hmSankeyRegister() {
         <path d="M12 2.9v2.5M12 18.6v2.5M2.9 12h2.5M18.6 12h2.5"/>
         <path d="M5.5 5.5 7.3 7.3M16.7 16.7l1.8 1.8M18.5 5.5 16.7 7.3M7.3 16.7l-1.8 1.8"/>
       </g>`,
-    /* A second, smaller sun: "another PV source".  No longer used - third-party
-       PV is folded into `pv` - but kept so an old dashboard that still passes
-       `icons.tp` has something to draw. */
-    tp: `<circle cx="10" cy="10" r="3.6" fill="#fff"/>
-      <g stroke="#fff" stroke-width="1.7" stroke-linecap="round">
-        <path d="M10 2v2M2 10h2M4.6 4.6 6 6M15.4 4.6 14 6M4.6 15.4 6 14"/>
+    /* A second, smaller sun with "3rd" in the corner: a PV source that is not
+       this unit's own MPPT (a neighbouring micro inverter on the AC side).
+       The corner badge used to be a plain white dot, which read as decoration;
+       three letters say which sun is the extra one without a legend.  The sun
+       is pulled into the top-left third so the letters can carry a font size
+       that survives the plate being drawn ~13 px tall on a laptop. */
+    tp: `<circle cx="8.4" cy="8.2" r="3.1" fill="#fff"/>
+      <g stroke="#fff" stroke-width="1.6" stroke-linecap="round">
+        <path d="M8.4 1.4v1.7M1.4 8.2h1.7M3.3 3.1 4.5 4.3M13.5 3.1 12.3 4.3M3.3 13.1 4.5 11.9"/>
       </g>
-      <circle cx="17.4" cy="17.4" r="3" fill="#fff"/>`,
+      <text x="22.8" y="21.3" text-anchor="end" font-size="9.6"
+        font-weight="700" fill="#fff" letter-spacing="-0.3">3rd</text>`,
     /* Battery with a bolt: energy is leaving the pack. */
     bat_out: `<rect x="2.6" y="6.4" width="14.6" height="11.2" rx="2.6"
         fill="none" stroke="#fff" stroke-width="1.9"/>
@@ -312,9 +316,12 @@ function _hmSankeyRegister() {
      brick next to the grey. */
   const SOURCES = [
     { id: "pv", side: "src", en: "PV", zh: "光伏供电", color: "#F5C342" },
+    /* Third-party PV sits directly under the unit's own PV: the two are the same
+       kind of source and reading them next to each other is how the picture is
+       read.  The order of this array is the order of the column. */
+    { id: "tp", side: "src", en: "Third-party PV", zh: "第三方光伏", color: "#E0A23C" },
     { id: "bat_out", side: "src", en: "Battery out", zh: "电池供电", color: "#45C08C" },
     { id: "grid_in", side: "src", en: "Grid in", zh: "电网供电", color: "#A9AEB3" },
-    { id: "tp", side: "src", en: "Third-party PV", zh: "第三方光伏", color: "#E0A23C" },
   ];
 
   const SINKS = [
