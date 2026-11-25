@@ -44,6 +44,12 @@
  *
  * e.g. self consumption = (发电量 − 上网电量) / 发电量.  The readout (big number)
  * still shows `entity`; only the arch and its percentage come from the ratio.
+ *
+ * When the rule cannot be written as one fraction - it branches, or it mixes
+ * two documents - point the arch at a percentage that is computed elsewhere:
+ *
+ *   percent_entity:    sensor.x_energy_flow_today   # value IS a share, 0..100
+ *   percent_attribute: self_rate_pct                # optional; state if omitted
  * ========================================================================== */
 
 function _hmGaugeRegister() {
@@ -90,9 +96,11 @@ function _hmGaugeRegister() {
    * on any card switches every card on the page at once, and the choice
    * survives a reload.
    *
-   * English is the default.  It deliberately does NOT follow the Home
-   * Assistant UI language any more: a dashboard is often shared, and the point
-   * of the dropdown is that the reader decides.
+   * The order is: the reader's own pick, then `language:` on the card, then the
+   * Home Assistant UI language, then English.  Following the UI language is
+   * what makes an unconfigured card match the page it sits on - the earlier
+   * "English unless picked" rule left the cards as the only English thing on a
+   * Chinese dashboard.
    * ------------------------------------------------------------------ */
   const LANG_KEY = "hoymiles.language";
   const LANG_EVENT = "hoymiles-language";
@@ -119,7 +127,12 @@ function _hmGaugeRegister() {
   }
 
   function hmLang(hass, config) {
-    return hmStored() || hmNormalise(config && config.language) || "en";
+    const locale = hass && hass.locale;
+    const ui = (locale && locale.language) || (hass && hass.language);
+    return hmStored()
+      || hmNormalise(config && config.language)
+      || hmNormalise(ui)
+      || "en";
   }
 
   /**
@@ -523,6 +536,28 @@ function _hmGaugeRegister() {
       return (state && state.attributes && state.attributes.unit_of_measurement) || "";
     }
 
+    /**
+     * The number and unit actually printed, which is not always the configured
+     * pair.
+     *
+     * The daily energy gauges are configured in kWh, and a device with one pack
+     * spends most of the morning below 1 kWh - which read as `0.46 kWh` /
+     * `0.02 kWh`, two decimals of noise where the interesting digit is the third.
+     * Anything under a kilowatt-hour is therefore shown in **Wh**, the unit the
+     * device actually reports in, and from 1 kWh up the figure stays in kWh. The
+     * threshold is on the value, not on the unit: `0.00 kWh` and `0 Wh` are the
+     * same reading, but only one of them tells you whether the number is small or
+     * the sensor is dead.
+     */
+    _display(value) {
+      const unit = this._unit();
+      if (value == null) return { text: "—", unit };
+      if (unit === "kWh" && Math.abs(value) < 1) {
+        return { text: group((value * 1000).toFixed(0)), unit: "Wh" };
+      }
+      return { text: group(value.toFixed(this._decimals())), unit };
+    }
+
     _max() {
       if (this._config.max != null) return num(this._config.max);
       const value = this._read();
@@ -537,12 +572,18 @@ function _hmGaugeRegister() {
      * A numeric state, or null when it is missing or unusable.  Deliberately not
      * `_read()`: that one applies `scale` for the readout, while a ratio mixes
      * entities whose units cancel out, so only the raw numbers belong here.
+     *
+     * `attribute` reads that attribute of the state instead of the state itself,
+     * which is how a computed percentage (`self_rate_pct`) is picked up from the
+     * sensor that carries the energy flows.
      */
-    _entityNumber(entityId) {
+    _entityNumber(entityId, attribute) {
       const state = this._hass && this._hass.states ? this._hass.states[entityId] : null;
       if (!state) return null;
-      const raw = String(state.state);
-      if (["unknown", "unavailable", ""].includes(raw)) return null;
+      const raw = attribute
+        ? String((state.attributes || {})[attribute])
+        : String(state.state);
+      if (["unknown", "unavailable", "undefined", "null", ""].includes(raw)) return null;
       const parsed = Number(raw);
       return Number.isFinite(parsed) ? parsed : null;
     }
@@ -556,6 +597,16 @@ function _hmGaugeRegister() {
      */
     _ratio() {
       const config = this._config || {};
+      /* A percentage that is computed elsewhere, in percent (0..100).  The
+         vendor's self-consumption rule mixes two documents and branches on the
+         export ratio, which no numerator/denominator pair can express, so the
+         integration publishes `self_rate_pct` as an attribute and the card only
+         has to scale it. */
+      if (config.percent_entity) {
+        const pct = this._entityNumber(config.percent_entity, config.percent_attribute);
+        if (pct == null) return null;
+        return clamp(pct / 100, 0, 1);
+      }
       if (!config.percent_numerator) return null;
       const numerator = this._entityNumber(config.percent_numerator);
       const denominator = config.percent_denominator
@@ -584,13 +635,12 @@ function _hmGaugeRegister() {
       // entity is briefly unknown after a restart, say) the arch shows "—"
       // rather than falling back to that meaningless percentage; the readout
       // above it keeps showing whatever it has.
-      const ratioWanted = !!this._config.percent_numerator;
+      const ratioWanted = !!(this._config.percent_numerator || this._config.percent_entity);
       const ratio = this._ratio();
       const dialHasValue = ratioWanted ? ratio != null : value != null;
       const frac = ratio != null ? ratio
         : (dialHasValue && value != null ? clamp((value - min) / (max - min || 1), 0, 1) : 0);
-      const shown = value == null ? "—" : group(value.toFixed(this._decimals()));
-      const unit = this._unit();
+      const shown = this._display(value);
       // `show_arc: false` drops the whole indicator: no arch, no percentage, no
       // empty space where they used to be.  Checked against `false` so an absent
       // option keeps the arch.
@@ -604,8 +654,10 @@ function _hmGaugeRegister() {
           </div>
           <div class="body">
             <div class="readout">
-              <span class="value">${shown}</span>
-              ${unit === "" || value == null ? "" : html`<span class="unit">${esc(unit)}</span>`}
+              <span class="value">${shown.text}</span>
+              ${shown.unit === "" || value == null
+                ? ""
+                : html`<span class="unit">${esc(shown.unit)}</span>`}
             </div>
             ${dial === "" ? "" : html`<div class="dial">${this._untrusted(dial)}</div>`}
           </div>
@@ -643,7 +695,15 @@ function _hmGaugeRegister() {
      */
     _arc(frac, hasValue = true) {
       const color = this._config.color || DEFAULT_COLOR;
-      const percent = Math.round(frac * 100);
+      /* Ratio mode keeps one decimal: the self-consumption rule is reported with
+         one decimal by the vendor app (88.6 %), and rounding it to 89 % made the
+         card disagree with the app on the very number it is showing. A plain
+         value/max arc stays a whole number - "50.0 %" of a made-up ceiling would
+         only pretend to that precision. */
+      const ratioMode = !!(this._config.percent_numerator || this._config.percent_entity);
+      const percent = ratioMode
+        ? (clamp(frac, 0, 1) * 100).toFixed(1)
+        : String(Math.round(frac * 100));
       const track = `<path d="${arcPath(0, 1, R_ARC)}" fill="none"`
         + ` stroke="var(--divider-color)" stroke-width="${ARC_STROKE}"`
         + ` stroke-linecap="round" opacity="0.45"/>`;
@@ -730,6 +790,12 @@ function _hmGaugeRegister() {
           <ha-textfield label="percent_denominator (optional, defaults to the numerator)"
             .value=${config.percent_denominator || ""}
             @change=${this._changed("percent_denominator")}></ha-textfield>
+          <ha-textfield label="percent_entity (optional: an entity whose value is already a percentage, 0..100)"
+            .value=${config.percent_entity || ""}
+            @change=${this._changed("percent_entity")}></ha-textfield>
+          <ha-textfield label="percent_attribute (optional: read this attribute instead of the state)"
+            .value=${config.percent_attribute || ""}
+            @change=${this._changed("percent_attribute")}></ha-textfield>
         </div>
       `;
     }

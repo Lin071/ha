@@ -89,9 +89,11 @@ function _hmDiagnosticsRegister() {
    * on any card switches every card on the page at once, and the choice
    * survives a reload.
    *
-   * English is the default.  It deliberately does NOT follow the Home
-   * Assistant UI language any more: a dashboard is often shared, and the point
-   * of the dropdown is that the reader decides.
+   * The order is: the reader's own pick, then `language:` on the card, then the
+   * Home Assistant UI language, then English.  Following the UI language is
+   * what makes an unconfigured card match the page it sits on - the earlier
+   * "English unless picked" rule left the cards as the only English thing on a
+   * Chinese dashboard.
    * ------------------------------------------------------------------ */
   const LANG_KEY = "hoymiles.language";
   const LANG_EVENT = "hoymiles-language";
@@ -118,7 +120,12 @@ function _hmDiagnosticsRegister() {
   }
 
   function hmLang(hass, config) {
-    return hmStored() || hmNormalise(config && config.language) || "en";
+    const locale = hass && hass.locale;
+    const ui = (locale && locale.language) || (hass && hass.language);
+    return hmStored()
+      || hmNormalise(config && config.language)
+      || hmNormalise(ui)
+      || "en";
   }
 
   /**

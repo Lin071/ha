@@ -7,9 +7,9 @@
  * The choice belongs to the reader, not to a card: it lives in a single
  * `localStorage` key and is announced with a single `window` event, so picking a
  * language anywhere switches every card of this integration at once and survives
- * a reload.  English is the default - a dashboard is often shared, hung on a
- * wall or screenshotted for someone else, so it deliberately does not follow the
- * Home Assistant UI language any more.
+ * a reload.  Until something is picked, the cards follow the Home Assistant UI
+ * language, so a Chinese dashboard does not get English cards; the last resort
+ * is English.
  *
  * The toolbar is Home Assistant's own element, several shadow roots away from
  * anything a card may touch, so this file reaches into it by hand:
@@ -22,6 +22,13 @@
  * before the add button.  Lit re-renders that row whenever the view changes, so
  * the switch is re-inserted from a `MutationObserver` and from Home Assistant's
  * `location-changed` event rather than being placed once.
+ *
+ * **One switch per toolbar.**  The micro-inverter package (`hoymiles_g2`) injects
+ * its own `hm-g2-lang-switch` for the same slot, because it also runs where no
+ * storage entry exists.  Both use the same `localStorage` key and the same
+ * `hoymiles-language` event, so `place()` steps aside when one is already there
+ * and only adds ours on an installation that has none - two identical dropdowns
+ * were the visible symptom.
  */
 
 (() => {
@@ -84,7 +91,12 @@
       option.textContent = label;
       select.append(option);
     }
-    select.value = hmStored() || "en";
+    /* Show the language in force. Nothing picked yet means the cards follow the
+       UI language, so the switch has to say that - showing "English" while
+       every card renders Chinese was the confusing part. */
+    select.value = hmStored()
+      || hmNormalise(document.documentElement.lang)
+      || "en";
     select.addEventListener("change", () => hmSetLang(select.value));
 
     /* A change made somewhere else - another tab, the console, a future card
@@ -150,7 +162,26 @@
     const found = findActionItems();
     if (!found) return false;
     ensureStyle(found.shadow);
-    if (found.items.querySelector(`.${SELECT_CLASS}`)) return true;
+
+    const ours = found.items.querySelector(`.${SELECT_CLASS}`);
+    /* Another Hoymiles package may already have put a language switch here - the
+       micro-inverter integration (``hoymiles_g2``) injects its own
+       ``hm-g2-lang-switch`` because it also runs on installations that have no
+       storage entry at all.  Both write the *same* ``localStorage`` key and fire
+       the same ``hoymiles-language`` event, so one control is enough: two
+       identical dropdowns side by side read as a bug.
+       Which one wins is decided by whoever got there first; if that was the other
+       package we withdraw, and if it is ever uninstalled the mutation observer
+       brings ours straight back. */
+    const foreign = found.items.querySelector(
+      'select[aria-label="Language"]:not(.' + SELECT_CLASS + ')',
+    );
+    if (foreign) {
+      if (ours) ours.remove();
+      return true;
+    }
+
+    if (ours) return true;
     found.items.prepend(buildSelect());
     return true;
   }
