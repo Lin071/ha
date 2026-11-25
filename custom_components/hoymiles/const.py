@@ -260,8 +260,30 @@ METER_FIELDS: Final = ("power", "eng_out", "eng_in")
 ALARM_MAX: Final = 20
 
 # Sankey field names, in the order they are drawn (protocol §45).
+#
+# The load side used to carry four edges only, and every watt that reached the
+# house was reported as one "load".  It now splits the same house into three
+# sinks - known load (EPS outlet + smart plug, i.e. what the unit can meter),
+# loss (inversion / charge / standby / heating) and unknown load (the remainder
+# it infers).  Nothing about the topic changed, only the field set:
+#
+#     pv_prod    e2l e2b e2g b2g tp2b tp2g                              (6)
+#     load_cons  efpv efb efg g2b  + known 4 + loss 4                   (12)
+#
+# ``efpv`` is the load side of ``e2l`` (the device reports both ends of the same
+# flow); it is kept in the tuple so the attribute survives, but never drawn - see
+# the card's FLOWS table.
 SANKEY_PV_PROD: Final = ("e2l", "e2b", "e2g", "b2g", "tp2b", "tp2g")
-SANKEY_LOAD_CONS: Final = ("efpv", "efb", "efg", "g2b")
+# The four "known load" edges (PV / grid / battery / third party -> known load).
+SANKEY_LOAD_KNOWN: Final = ("e2kl", "g2kl", "b2kl", "tp2kl")
+# The four "loss" edges (PV / grid / battery / third party -> loss).
+SANKEY_LOAD_LOSS: Final = ("e2loss", "g2loss", "b2loss", "tp2loss")
+SANKEY_LOAD_CONS: Final = (
+    "efpv",
+    "efb",
+    "efg",
+    "g2b",
+) + SANKEY_LOAD_KNOWN + SANKEY_LOAD_LOSS
 
 # How many days of energy-flow snapshots are kept on disk.
 #
