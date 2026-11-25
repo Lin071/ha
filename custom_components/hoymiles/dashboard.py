@@ -20,17 +20,21 @@ Nothing here is mandatory: the integration works fine without a dashboard.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 from typing import Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 from homeassistant.util import slugify
 
 from .const import (
     DASHBOARD_ICON,
     DASHBOARD_TITLE_PREFIX,
     DASHBOARD_URL_PREFIX,
+    DOMAIN,
+    model_has_pv,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -39,16 +43,59 @@ VIEW_ICON_SYSTEM = "mdi:home-analytics"
 VIEW_ICON_DEVICE = "mdi:home-battery"
 VIEW_ICON_CONTROL = "mdi:tune"
 
-# The energy-flow sankey is switched off for now and will come back later.
-# Kept as a flag rather than deleted so the card stays supported (and stays in
-# ``FRONTEND_ASSETS``) and turning it back on is one word: the config builder
-# simply stops emitting the section.
-SHOW_SANKEY = False
+# Path of the view that only a device with system-level readings of its own may
+# keep.  See `async_set_system_view`.
+SYSTEM_VIEW_PATH = "system"
+
+# Protocol V0.6.2 publishes the device's own daily energy flows, so the sankey
+# no longer has to estimate the routing from long-term statistics - it draws
+# exactly what the unit measured.  The card hides itself on a device without a
+# grid meter, which is why the section is always emitted.
+SHOW_SANKEY = True
 
 # Bump this whenever ``build_dashboard_config`` changes shape (a new view, a
 # renamed card, different colours).  Dashboards the user has not touched are
 # then rebuilt on the next setup; edited ones keep their layout.
-TEMPLATE_VERSION = 8
+#
+# 12: the system power chart carries the split grid / load curves (gated on
+#     ``has_meter``) next to the combined one.
+# 13: the PV-today tile reads the vendor's self-consumption rule (published as
+#     ``self_rate_pct`` on the energy-flow sensor) and totals PV as
+#     own + MAX(third-party, PV2).
+# 14: the system view is hidden on a slave unit (``device_role`` sensor), and
+#     the control view carries the virtual-meter HTTP help block.
+# 15: the Slave check points at the role sensor's **current** entity id (looked
+#     up in the entity registry) instead of the one derived from the device id.
+#     v14 hard-coded ``sensor.<slug>_device_role``, so a renamed device - whose
+#     entities all carry the new name prefix - had a condition on a nonexistent
+#     entity, i.e. a condition that is always false, i.e. no System tab at all.
+# 16: that client-side condition is gone again.  A Lovelace state condition is
+#     false for `unknown` / `unavailable`, so "not slave" silently meant "hide
+#     unless the role is known" - which hid the tab on every offline unit and
+#     every unit whose firmware does not publish `role`.  The view is now added
+#     and removed by the integration from the role the device reports; the
+#     template itself carries no condition at all.
+# 17: the three SOC scopes are named apart.  The system view plots `sys_soc`
+#     ("系统电量") and the device view's per-pack chart gained the device line,
+#     because "电池电量" alone left the user unable to tell which of the three
+#     was on screen.
+# 18: the system view keeps **only** `sys_soc`.  A system can be several devices
+#     in parallel, so this unit's own `soc` next to it only invited the same
+#     confusion; the device curve stays on the Device page, with the packs.
+# 19: the device line on the device view is marked `always`, so it is not counted
+#     as one of the battery packs - `count_entity: pack_count` had dropped 电池 1
+#     on a one-pack unit.
+# 20: the **system** power chart reads the `system_*` entities only.  It used the
+#     device level `pv_power` / `bat_power` / `grid_on_power`, i.e. this unit's
+#     own ports, which on a master that has slaves is not what the page is about
+#     (the battery curve in particular disagreed with `sys_bat_p` the moment a
+#     slave started charging).  The device view is unchanged - that page *is*
+#     this unit.
+# 21: the layout follows the **product model**.  A `HiBattery 4020 AC` has no PV
+#     input of its own, so the PV curves, the PV-by-port chart and the PV-today
+#     tile are not generated for it, and the cards that draw the hardware are
+#     told `show_pv: false`.
+TEMPLATE_VERSION = 21
 
 # Return values of ``async_create_device_dashboard``.
 RESULT_CREATED = "created"
@@ -76,8 +123,25 @@ def dashboard_url_path(dev_id: str) -> str:
 
 
 def dashboard_title(dev_id: str) -> str:
-    """Return the sidebar title of the device's dashboard."""
-    return f"{DASHBOARD_TITLE_PREFIX}{serial_of(dev_id)}"
+    """Return the sidebar title of the device's dashboard.
+
+    The title is the serial the device reports **with its client prefix**
+    (``MSA-280577777777``).  That is the string the RMI carries and the one the
+    user sees on the device itself; the bare digits cannot tell an ``MSA`` from
+    a ``MAW``.  An entry that reports digits only keeps the ``G3_`` marker, so
+    it is still recognisable among the other dashboards.
+    """
+    if "-" in dev_id:
+        return dev_id
+    return f"{DASHBOARD_TITLE_PREFIX}{dev_id}"
+
+
+# Protocol key -> entity id suffix, for the few entities the integration does
+# not create itself.  Home Assistant names a discovery entity after its
+# ``name``, and the firmware's name for §36 ``bat_p`` is "Battery Power".
+_ENTITY_SUFFIX_ALIASES = {
+    "bat_power": "battery_power",
+}
 
 
 def _entity_id(dev_id: str, suffix: str) -> str:
@@ -85,7 +149,17 @@ def _entity_id(dev_id: str, suffix: str) -> str:
 
     ``sensor.py`` builds its entity ids from ``slugify(dev_id)``, so
     ``MSA-280577777777`` becomes ``sensor.msa_280577777777_<suffix>``.
+
+    **Exception: the battery power entity comes from the firmware's own MQTT
+    discovery (§36 ``sensor/<dev_id>/bat_p/config``)**, and Home Assistant
+    derives its entity id from the payload's ``name`` (``"Battery Power"``), not
+    from the object id. That makes the id ``..._battery_power``, so the raw
+    suffix ``bat_power`` pointed at an entity that does not exist - the history
+    chart then dropped the battery curve (``skip_empty``) and the power chart
+    showed PV + grid only. The card also accepts either spelling, so an already
+    generated dashboard keeps working.
     """
+    suffix = _ENTITY_SUFFIX_ALIASES.get(suffix, suffix)
     return f"sensor.{slugify(dev_id)}_{suffix}"
 
 
@@ -117,32 +191,6 @@ _VIEW_TITLES = {
 
 def _view_title(key: str, lang: str) -> str:
     return _VIEW_TITLES[key].get(lang) or _VIEW_TITLES[key]["en"]
-
-
-# Every tab label the template has ever produced.  Used once, to notice a
-# dashboard whose only difference is that it was generated while the titles still
-# followed the interface language.
-_TITLES_EVER = {title for names in _VIEW_TITLES.values() for title in names.values()}
-
-
-def _titles_of(config: Any) -> tuple[str, ...]:
-    """The tab labels of a stored dashboard, in view order."""
-    views = config.get("views") if isinstance(config, dict) else None
-    if not isinstance(views, list):
-        return ()
-    return tuple(
-        view.get("title") or "" for view in views if isinstance(view, dict)
-    )
-
-
-def _titles_are_template_made(config: Any) -> bool:
-    """True when every tab label is one this module could have written.
-
-    A user who renamed a tab to their own words fails this test, which is what
-    keeps the one-shot migration below away from hand-edited dashboards.
-    """
-    titles = _titles_of(config)
-    return bool(titles) and all(title in _TITLES_EVER for title in titles)
 
 
 def _series(
@@ -212,15 +260,30 @@ def _gauge(
 # #22c55e / #4a90d9 / #22d3ee collapsed into one ribbon: the last two are 40
 # degrees apart and the lighter one vanished under the darker one at 32 % fill.)
 COLOR_PV = "#f59e0b"        # amber/yellow - production
-COLOR_BATTERY = "#22c55e"   # green        - charge / discharge, and SOC
+COLOR_PV2 = "#f97316"       # orange       - the second PV branch (grid-connected MI)
+COLOR_BATTERY = "#22c55e"   # green         - charge / discharge, and SOC
 COLOR_GRID = "#3b82f6"      # blue         - grid & load (system view)
 COLOR_SOC = COLOR_BATTERY   # battery SOC uses the battery colour
+
+# Three SOC levels can be on screen at once - the system (every unit in
+# parallel), one device (its own packs summed) and each pack's own BMS reading.
+# They are the same quantity at three scopes, so only the *scope* colour differs:
+# the system keeps the battery green, a single device is drawn in slate (the same
+# neutral the integration uses for "a part, not a flow"), and the packs keep
+# their own palette below.  Grey for the device line also means it never competes
+# with pack 1, which is green as well.
+COLOR_DEVICE_SOC = "#94a3b8"
 
 # The device view splits what the system view folds together, so it needs two
 # more slots: the on-grid port in slate grey, the off-grid (EPS) port in the same
 # blue the system view uses for the combined reading.
 COLOR_GRID_PORT = "#64748b"
 COLOR_OFFGRID = COLOR_GRID
+
+# With a grid meter the system chart splits the combined curve in two: the grid
+# itself in slate grey (a metered utility, not a colour of its own - the same
+# choice the sankey card makes) and the house load in blue.
+COLOR_LOAD = COLOR_GRID
 
 # Four-slot palette for the per-PV-port chart (yellow / green / grey / blue).
 COLOR_SERIES_4 = (COLOR_PV, COLOR_BATTERY, "#64748b", COLOR_GRID)
@@ -237,32 +300,107 @@ def _power_series(
     grid_name_zh: str,
     grid_name_de: str | None = None,
 ) -> list[dict[str, Any]]:
-    """PV / battery / grid curves shared by both power charts.
+    """The curves of the **system** power chart (§37 ``sys_*`` / §39).
 
-    The names carry no ``[+]/[-]`` suffix on purpose: the sign already says
-    which way the power flows, and the value is the magnitude of it. Spelling
-    that out made the legend wider than the chart and pushed the tooltip into
-    truncation ("To grid & load [+]/F").
+    This chart belongs to the System view, which describes the whole installation
+    - this unit plus every slave it aggregates.  Every curve therefore comes from
+    a ``system_*`` entity, i.e. the ``sys_*`` fields of the 1 s state or the
+    ``system/state`` snapshot.  The device level `pv_power` / `bat_power` /
+    `grid_on_power` look like the same numbers while every slave is idle and then
+    silently disagree the moment one of them charges, which is exactly the
+    confusion this page must not create.  The Device view keeps those.
 
-    When a grid meter is fitted the grid and the load stop being one number and
-    this list has to become four curves. That is a data change, not a card
-    change: give ``_power_series`` the two extra entities (see the recipe in
-    ``docs/CARDS.md``) instead of ``grid_on_power``.
+    Naming note: §37/§39 call ``sys_pv_p`` **系统离网微逆光伏功率** and
+    ``sys_pv2_p`` **系统并网微逆光伏功率** - the PV of micro inverters in the
+    network, not the storage units' own PV ports.  That is what the protocol
+    offers at system scope, so the chart draws those two branches as they are.
+
+    **With a grid meter the grid and the load are two different measurements**,
+    so the combined curve is replaced by the two of them.  Which pair is drawn is
+    decided by the card, not here: the template is written once and carries both,
+    gated on ``has_meter`` of the energy-flow sensor (``while`` / ``unless``).
+
+    Without a meter ``sys_grid_p`` stays 0 - there is nothing measuring the grid,
+    and ``sys_load_p`` carries the whole house consumption, which is the same
+    number the device reports for its on-grid port.  The combined curve is
+    therefore ``system_load_power``, not ``system_grid_power``.
+
+    **No per-model switch here.**  Even on an AC coupled unit (which has no MPPT
+    input of its own) this page can carry real PV: `sys_pv_p` is the PV of the
+    micro inverters in the *system*, so a 4020 AC that sits next to PV
+    micro inverters still reports production.  This is why the model only ever
+    trims the Device and Control pages.
     """
+    meter = {
+        "entity": _entity_id(dev_id, "energy_flow_today"),
+        "attribute": "has_meter",
+    }
+    # ``sys_pv2_p`` is published as 0 on every unit, even with no micro inverter
+    # attached, so it would be drawn as a flat line and add a legend entry that
+    # means nothing.  §32's ``has_solar2`` flag says whether the branch exists at
+    # all - the same flag the power-flow card uses for its PV2 node.
+    solar2 = {
+        "entity": _entity_id(dev_id, "energy_flow_today"),
+        "attribute": "has_solar2",
+    }
+    pv_series: list[dict[str, Any]] = [
+        _series(
+            _entity_id(dev_id, "system_pv_power"),
+            "PV power",
+            "光伏功率",
+            COLOR_PV,
+            "PV-Leistung",
+        ),
+        {
+            **_series(
+                _entity_id(dev_id, "system_pv2_power"),
+                "PV2 power",
+                "光伏2功率",
+                COLOR_PV2,
+                "PV2-Leistung",
+            ),
+            "while": solar2,
+        },
+    ]
     return [
+        *pv_series,
         _series(
-            _entity_id(dev_id, "pv_power"), "PV power", "光伏功率", COLOR_PV, "PV-Leistung"
+            _entity_id(dev_id, "system_battery_power"),
+            "Battery",
+            "电池",
+            COLOR_BATTERY,
+            "Batterie",
         ),
-        _series(
-            _entity_id(dev_id, "bat_power"), "Battery", "电池", COLOR_BATTERY, "Batterie"
-        ),
-        _series(
-            _entity_id(dev_id, "grid_on_power"),
-            grid_name_en,
-            grid_name_zh,
-            COLOR_GRID,
-            grid_name_de,
-        ),
+        {
+            **_series(
+                _entity_id(dev_id, "system_grid_power"),
+                "Grid",
+                "电网",
+                COLOR_GRID_PORT,
+                "Netz",
+            ),
+            "while": meter,
+        },
+        {
+            **_series(
+                _entity_id(dev_id, "system_load_power"),
+                "Load",
+                "用电功率",
+                COLOR_LOAD,
+                "Last",
+            ),
+            "while": meter,
+        },
+        {
+            **_series(
+                _entity_id(dev_id, "system_load_power"),
+                grid_name_en,
+                grid_name_zh,
+                COLOR_GRID,
+                grid_name_de,
+            ),
+            "unless": meter,
+        },
     ]
 
 
@@ -271,6 +409,10 @@ def _sankey_section(dev_id: str) -> list[dict[str, Any]]:
 
     Returned as a list so the caller can spread it into its ``sections`` and
     the layout stays identical whether or not the card is emitted.
+
+    No model-dependent switch is needed here: the card drops every node whose
+    flows add up to zero, so an AC coupled unit (whose PV readings are a hard 0)
+    simply never draws a PV source.
     """
     if not SHOW_SANKEY:
         return []
@@ -279,7 +421,9 @@ def _sankey_section(dev_id: str) -> list[dict[str, Any]]:
             {
                 "type": "custom:hoymiles-energy-sankey",
                 "dev_id": dev_id,
-                "title": _label("Energy flow", "能量流", "Energiefluss"),
+                "title": _label(
+                    "Energy flow", "能量流", "Energiefluss"
+                ),
                 # No icon: the card draws a full sankey diagram right below the
                 # title, so a glyph there was one symbol too many - it repeated
                 # "this is a flow" next to the flow itself.
@@ -289,7 +433,48 @@ def _sankey_section(dev_id: str) -> list[dict[str, Any]]:
     ]
 
 
-def build_dashboard_config(dev_id: str, lang: str = "en") -> dict[str, Any]:
+def _alarm_card(dev_id: str) -> dict[str, Any]:
+    """The active-alarm list (protocol V0.6.2 §27).
+
+    It sits next to the device illustration on the Device page: an alarm is
+    something you want to see while looking at the hardware, not a detail
+    hidden at the bottom of a history page.  The card keeps its own scroll area,
+    so the device can report up to 20 without stretching the page.
+
+    The card collapses itself when the device reports no alarms (it sets
+    ``hidden`` on its own element, which makes Home Assistant hide the wrapper),
+    so the illustration gets the whole row instead of being squeezed to half of
+    it beside a box that would only say "no alarms".
+    """
+    return {
+        "type": "custom:hoymiles-alarms",
+        "dev_id": dev_id,
+        "title": _label("Active alarms", "当前告警", "Aktive Alarme"),
+    }
+
+
+def _model_of(hass: HomeAssistant, dev_id: str) -> str | None:
+    """The product model from the device registry, or ``None`` when unknown.
+
+    ``discovery_override`` backfills the model the firmware announces in its MQTT
+    discovery payload, so by the time a dashboard is generated (or regenerated)
+    this is normally filled in.  ``None`` stays a valid answer: the layout then
+    keeps every curve, and ``_async_apply_model`` regenerates the dashboard once
+    the model arrives.
+    """
+    try:
+        registry = dr.async_get(hass)
+    except Exception:  # noqa: BLE001 - a missing registry must not break setup
+        return None
+    entry = registry.async_get_device(identifiers={(DOMAIN, dev_id)})
+    if entry is not None and entry.model:
+        return entry.model
+    return None
+
+
+def build_dashboard_config(
+    dev_id: str, lang: str = "en", model: str | None = None
+) -> dict[str, Any]:
     """Return the Lovelace config for one device.
 
     A plain ``dict`` rather than YAML: the Lovelace storage format is JSON and
@@ -302,17 +487,48 @@ def build_dashboard_config(dev_id: str, lang: str = "en") -> dict[str, Any]:
     ``lang`` only affects the **view titles**: a Lovelace view title is a plain
     string rather than a language map, and nothing on the client can rewrite it
     when the dropdown changes, so the titles stay English.
+
+    ``model`` is the product model from the device registry.  It is the only
+    thing that can tell an AC coupled unit (no PV input at all, PV comes from
+    micro inverters on the AC side) from one with an MPPT input: the firmware
+    publishes every PV entity on every model, so the AC unit's PV readings are a
+    hard 0 rather than missing.  ``None`` means "not known yet" and keeps every
+    curve - hiding a real branch is worse than drawing a flat line, and the
+    dashboard is regenerated once the model has been backfilled.
     """
+    has_pv = model_has_pv(model)
     pv_today = _entity_id(dev_id, "system_pv_energy_today")
     slug = slugify(dev_id)
     sync_system = f"{slug}-system"
     sync_device = f"{slug}-device"
 
+    # ⚠️ The **System** page deliberately keeps every PV widget, whatever the
+    # model is: that page describes the whole installation, and an AC coupled
+    # storage unit can perfectly well sit next to PV micro inverters whose
+    # production the master aggregates.  Only the Device and Control pages -
+    # which describe *this unit's own hardware* - follow the model.
+
     system_view = {
         "title": _view_title("system", lang),
-        "path": "system",
+        "path": SYSTEM_VIEW_PATH,
         "icon": VIEW_ICON_SYSTEM,
         "type": "sections",
+        # A **slave** has no system page: every number on it (`system/state`,
+        # the energy flows, the system power readings) is measured by the master
+        # and published on the master's topics, so the page would show dashes
+        # from top to bottom.
+        #
+        # ⚠️ The tab is NOT hidden with a view-level `visible` condition.
+        # That was v14, and it was a trap: a Lovelace state condition evaluates
+        # to **false** for an entity whose state is `unknown` or `unavailable`,
+        # so the condition `state_not: slave` did not mean "hide only slaves" -
+        # it hid the tab on every unit that had not reported its role yet (an
+        # offline device, older firmware without a `role` field, or the seconds
+        # after a restart), i.e. on most devices, always.
+        #
+        # The view is added and removed by `async_set_system_view` instead, from
+        # the role the unit actually publishes in `event/state`.  Not knowing the
+        # role therefore keeps the page, which is the safe direction.
         "max_columns": 4,
         "show_icon_and_title": True,
         "sections": [
@@ -346,11 +562,19 @@ def build_dashboard_config(dev_id: str, lang: str = "en") -> dict[str, Any]:
                                     "今日发电",
                                     "panel",
                                     "PV heute",
-                                    label=_label("Self-consumption", "自用率", "Eigenverbrauch"),
-                                    percent_numerator=pv_today,
-                                    percent_subtract=_entity_id(
-                                        dev_id, "grid_on_energy_out_today"
+                                    label=_label(
+                                        "Self-consumption rate",
+                                        "自发自用率",
+                                        "Eigenverbrauchsquote",
                                     ),
+                                    # The vendor's self-consumption rule branches
+                                    # on the export ratio and mixes §45's flows
+                                    # with `system/state`'s PV2 production, so it
+                                    # cannot be written as one fraction.  The
+                                    # integration computes it and exposes
+                                    # `self_rate_pct`; the arc only scales it.
+                                    percent_entity=_entity_id(dev_id, "energy_flow_today"),
+                                    percent_attribute="self_rate_pct",
                                 ),
                                 {
                                     "type": "grid",
@@ -418,15 +642,23 @@ def build_dashboard_config(dev_id: str, lang: str = "en") -> dict[str, Any]:
                             # flattened a 90 W idle evening into a hairline.
                         },
                         {
-                            "title": _label("Battery SOC", "电池电量", "Batteriestand"),
+                            # Only the system reading belongs here.  This page
+                            # describes the whole system, which may be several
+                            # devices in parallel, so plotting this unit's own
+                            # `soc` next to it invited exactly the confusion this
+                            # naming was meant to remove.  The device curve lives
+                            # on the Device page, where the packs are.
+                            "title": _label(
+                                "System SOC", "系统电量", "System-Batteriestand"
+                            ),
                             "series": [
                                 _series(
-                                    _entity_id(dev_id, "soc"),
-                                    "Battery SOC",
-                                    "电池电量",
+                                    _entity_id(dev_id, "system_soc"),
+                                    "System SOC",
+                                    "系统电量",
                                     COLOR_SOC,
-                                    "Batteriestand",
-                                )
+                                    "System-Batteriestand",
+                                ),
                             ],
                             "unit": "%",
                             "height": 250,
@@ -451,28 +683,73 @@ def build_dashboard_config(dev_id: str, lang: str = "en") -> dict[str, Any]:
         "sections": [
             _section(
                 {
-                    "type": "custom:hoymiles-battery",
-                    "dev_id": dev_id,
-                    "max_width": 620,
-                    "show_history": False,
+                    # The illustration and the alarm list share the top row: the
+                    # Device page is where you look at the hardware, and an
+                    # alarm is a fact about that hardware. Side by side also
+                    # keeps the page short - stacking them pushed every history
+                    # chart below the fold.
+                    #
+                    # A horizontal stack rather than a 2-column grid: the alarm
+                    # card hides itself when there is nothing to report, and only
+                    # a flex row hands the freed width to the illustration.  A
+                    # grid keeps its columns whatever happens and leaves half the
+                    # row blank - which is exactly what it looked like.
+                    "type": "horizontal-stack",
                     "grid_options": {"columns": "full"},
+                    "cards": [
+                        {
+                            "type": "custom:hoymiles-battery",
+                            "dev_id": dev_id,
+                            "max_width": 620,
+                            "show_history": False,
+                            # The illustration draws the PV corner (sun, "PV"
+                            # caption, its readout) and the PV inflow; on an AC
+                            # coupled unit that branch does not exist, so the
+                            # card is told to leave it out instead of showing a
+                            # permanent 0 W port.
+                            **({} if has_pv else {"show_pv": False}),
+                        },
+                        _alarm_card(dev_id),
+                    ],
                 }
             ),
             _section(
                 _history(
-                    "Battery level",
-                    "各电池包电量",
+                    "Device and pack SOC",
+                    "设备 / 各电池包电量",
                     [
-                        _series(
-                            _entity_id(dev_id, f"pack_{idx}_soc"),
-                            f"Battery {idx}",
-                            f"电池 {idx}",
-                            color,
-                            f"Batterie {idx}",
-                        )
-                        for idx, color in enumerate(COLOR_PACKS, start=1)
+                        # The device total goes first and in slate: it is the
+                        # summary of the curves under it, not one of them.  A pack
+                        # that is far below it is the thing worth noticing, and
+                        # that is only visible when both are on one axis.
+                        #
+                        # `always` keeps it out of the pack count below: the pane
+                        # declares `count_entity: pack_count`, and a series that
+                        # merely describes the device must not be counted as one
+                        # of the packs - that mistake hid 电池 1 on a one-pack
+                        # unit.
+                        {
+                            **_series(
+                                _entity_id(dev_id, "soc"),
+                                "This device",
+                                "设备电量",
+                                COLOR_DEVICE_SOC,
+                                "Dieses Gerät",
+                            ),
+                            "always": True,
+                        },
+                        *[
+                            _series(
+                                _entity_id(dev_id, f"pack_{idx}_soc"),
+                                f"Battery {idx}",
+                                f"电池 {idx}",
+                                color,
+                                f"Batterie {idx}",
+                            )
+                            for idx, color in enumerate(COLOR_PACKS, start=1)
+                        ],
                     ],
-                    "Ladezustand der Pakete",
+                    "Geräte- und Modulstand",
                     unit="%",
                     height=300,
                     symmetric=False,
@@ -491,7 +768,11 @@ def build_dashboard_config(dev_id: str, lang: str = "en") -> dict[str, Any]:
                     # curves next to a power-flow card that drew one module.
                     count_entity=_entity_id(dev_id, "pack_count"),
                 ),
-                _history(
+                # A unit with no PV input has no per-port PV chart at all: its
+                # pv*_power entities stay `unknown` for ever, so the card would
+                # draw an empty frame with a legend of four ports that do not
+                # exist.  Spread conditionally so the section keeps its shape.
+                *([_history(
                     "PV power by port",
                     "各光伏端口功率",
                     [
@@ -514,7 +795,7 @@ def build_dashboard_config(dev_id: str, lang: str = "en") -> dict[str, Any]:
                     # Only the ports that exist report; unused ones are dropped
                     # by the card rather than drawn as a 0 W line.
                     skip_empty=True,
-                ),
+                )] if has_pv else []),
             ),
             _section(
                 _history(
@@ -526,13 +807,16 @@ def build_dashboard_config(dev_id: str, lang: str = "en") -> dict[str, Any]:
                     # measurements. The system view instead folds the ports into
                     # one "Grid & load" reading.
                     [
-                        _series(
+                        # No PV input: no PV curve.  The port would read a hard
+                        # 0 W all year, which is a legend entry that lies about
+                        # the hardware.
+                        *([_series(
                             _entity_id(dev_id, "pv_power"),
                             "PV power",
                             "光伏功率",
                             COLOR_PV,
                             "PV-Leistung",
-                        ),
+                        )] if has_pv else []),
                         _series(
                             _entity_id(dev_id, "bat_power"),
                             "Battery",
@@ -902,6 +1186,156 @@ async def _async_item_id(hass: HomeAssistant, dashboard: Any, url_path: str) -> 
     return slugify(url_path)
 
 
+async def _async_write_entry_title(
+    hass: HomeAssistant, url_path: str, title: str
+) -> None:
+    """Persist a new sidebar title straight into the dashboards registry file.
+
+    Last resort for ``_async_rename_entry``: the registry file is what the
+    sidebar is built from at the next start, so the name is right even when the
+    ``lovelace/dashboards/update`` command cannot be reached.
+    """
+    try:
+        from homeassistant.helpers.storage import Store  # noqa: PLC0415
+    except ImportError:  # pragma: no cover
+        return
+
+    store = Store(hass, 1, "lovelace_dashboards")
+    try:
+        data = await store.async_load()
+    except Exception:  # noqa: BLE001 - an unreadable registry is left alone
+        return
+    if not isinstance(data, dict):
+        return
+    payload = data.get("data")
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return
+
+    changed = False
+    for item in items:
+        if not isinstance(item, dict) or item.get("url_path") != url_path:
+            continue
+        if item.get("title") == title:
+            return
+        item["title"] = title
+        changed = True
+    if not changed:
+        return
+
+    try:
+        await store.async_save(data)
+        _LOGGER.info("Renamed the dashboard entry %s to %s", url_path, title)
+    except Exception:  # noqa: BLE001 - the title is cosmetic
+        _LOGGER.debug("Unable to rename %s", url_path, exc_info=True)
+
+
+def _live_entry(collection: Any, item_id: str) -> dict[str, Any] | None:
+    """Return the item the running Lovelace collection holds for ``item_id``.
+
+    The persisted file and the in-memory collection can disagree - writing the
+    file behind the collection's back is exactly how a rename gets lost on the
+    next save - so the *live* item is what a rename has to be compared with.
+    """
+    getter = getattr(collection, "async_items", None)
+    if getter is None:
+        return None
+    try:
+        for entry in getter():
+            if isinstance(entry, dict) and entry.get("id") == item_id:
+                return entry
+    except Exception:  # noqa: BLE001 - an unknown API shape is not fatal
+        return None
+    return None
+
+
+async def _async_rename_entry(hass: HomeAssistant, url_path: str, title: str) -> None:
+    """Give an existing dashboard the sidebar title its device serial implies.
+
+    The dashboard entry is created once and never rewritten - that is what keeps
+    a user's own edits - but the **title** is derived, not configured.  A
+    release that used the bare digits (``G3_280577777777``) would therefore pin
+    that name forever, while the device reports ``MSA-280577777777``.
+
+    The field is updated through the dashboards storage collection, which is
+    the same path the frontend uses and which fires the listener that relabels
+    the sidebar panel without a restart.  ``async_update_item`` replaces the
+    item, so the current one is merged rather than sending a bare title.
+    """
+    item = next(
+        (
+            entry
+            for entry in await _async_registry_items(hass)
+            if entry.get("url_path") == url_path
+        ),
+        None,
+    )
+    collection = _dashboards_collection(hass)
+
+    item_id = item.get("id") if isinstance(item, dict) else None
+    if not isinstance(item_id, str) or not item_id:
+        item_id = await _async_item_id(
+            hass, (_dashboards(hass) or {}).get(url_path), url_path
+        )
+
+    live = _live_entry(collection, item_id) if collection is not None else None
+    if item is None and live is None and url_path not in (_dashboards(hass) or {}):
+        # Nothing exists yet: the create path is about to set the right title.
+        return
+    if (live or item or {}).get("title") == title:
+        return
+
+    if collection is not None and (live is not None or item is not None):
+        merged = {**(live or item or {}), "id": item_id, "title": title}
+        try:
+            result = collection.async_update_item(item_id, merged)
+            if inspect.isawaitable(result):
+                await result
+            _LOGGER.info("Renamed the dashboard %s to %s", url_path, title)
+            return
+        except Exception:  # noqa: BLE001 - fall back to the command below
+            _LOGGER.debug(
+                "dashboards collection refused the rename of %s",
+                url_path,
+                exc_info=True,
+            )
+
+    try:
+        from homeassistant.components import websocket_api  # noqa: PLC0415
+
+        handlers = hass.data.get(websocket_api.DOMAIN)
+        entry = handlers.get("lovelace/dashboards/update") if handlers else None
+    except ImportError:  # pragma: no cover
+        entry = None
+
+    handler = None
+    if callable(entry):
+        handler = entry
+    elif isinstance(entry, tuple):
+        handler = next((part for part in entry if callable(part)), None)
+
+    if handler is not None:
+        connection = _StubConnection()
+        message = {
+            "id": 1,
+            "type": "lovelace/dashboards/update",
+            "dashboard_id": item_id,
+            "title": title,
+        }
+        try:
+            result = handler(hass, connection, message)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # noqa: BLE001 - fall through to the registry file
+            _LOGGER.debug("lovelace/dashboards/update failed", exc_info=True)
+            connection.error = ("unknown_error", "update failed")
+        if connection.error is None:
+            _LOGGER.info("Renamed the dashboard %s to %s", url_path, title)
+            return
+
+    await _async_write_entry_title(hass, url_path, title)
+
+
 async def _async_has_config(hass: HomeAssistant, dashboard: Any, url_path: str) -> bool:
     """Return whether the dashboard already has a usable config on disk."""
     try:
@@ -977,9 +1411,11 @@ async def _async_read_config(
 def _config_hash(config: dict[str, Any] | None) -> str:
     """Fingerprint a dashboard config, independent of key order.
 
-    Used to tell "the user has not touched this" from "the user made it their
-    own": the moment anything in the layout changes by hand the hash stops
-    matching what was generated, and the template upgrade backs off.
+    Recorded with every dashboard this module writes, so the meta file says
+    which build produced the one on disk.  It is **not** what decides an
+    upgrade: a re-serialised file, a reordered key or a changed colour would
+    all look like a hand edit through a hash (see
+    ``_template_owns_layout``).
     """
     blob = json.dumps(config if isinstance(config, dict) else {}, sort_keys=True,
                       separators=(",", ":"), default=str)
@@ -989,12 +1425,9 @@ def _config_hash(config: dict[str, Any] | None) -> str:
 def _known_hashes(record: dict[str, Any]) -> list[str]:
     """Every hash this integration is known to have written for a device.
 
-    One hash is not enough: a dashboard can legitimately differ from the latest
-    generated config without anyone having edited it - an interrupted write, a
-    rebuild by an older version of this module, or a Lovelace round-trip that
-    reordered nothing but rewrote the file.  Each of those used to look exactly
-    like a hand edit and permanently opted the dashboard out of upgrades, which
-    is how one device kept the old emoji icons while its neighbours moved on.
+    Kept as a short history next to the record: it answers "did an older build
+    of this module write this?" when someone debugs a dashboard, and it is what
+    the bounded ``config_hashes`` list in the meta file is for.
     """
     hashes: list[str] = []
     listed = record.get("config_hashes")
@@ -1056,64 +1489,70 @@ async def _async_record_template(
         _LOGGER.debug("Unable to save the dashboard template meta", exc_info=True)
 
 
-def _card_signature(card: Any) -> str:
-    """Shape of one card: its type, plus the shape of the cards inside it."""
-    if not isinstance(card, dict):
-        return "?"
-    kind = str(card.get("type") or "")
-    nested = card.get("cards")
-    if isinstance(nested, list) and nested:
-        return kind + "(" + ",".join(_card_signature(c) for c in nested) + ")"
-    return kind
+def _layout_kinds(config: Any) -> set[str]:
+    """Every view path and card type one dashboard contains.
 
-
-def _structure_signature(config: dict[str, Any] | None) -> str:
-    """Shape of a whole dashboard, ignoring every value.
-
-    This is what separates a *template* change from a *cosmetic* edit: a new or
-    removed view, or a card added inside a section, changes the signature, while
-    recolouring a curve, renaming it, or switching a boolean does not.  It is
-    only used to adopt dashboards that predate ``TEMPLATE_VERSION`` - once a
-    dashboard has been recorded, the exact content hash decides.
+    This is the question an upgrade has to answer: *could the bundled template
+    have produced this layout?*  Card **types**, not values - a template release
+    adds or removes cards, while recolouring a curve or pointing a gauge at
+    another entity does not make the dashboard someone else's work.
     """
+    kinds: set[str] = set()
     if not isinstance(config, dict):
-        return ""
-    parts: list[str] = []
+        return kinds
+    stack: list[Any] = []
     for view in config.get("views") or []:
         if not isinstance(view, dict):
             continue
-        body = view.get("cards")
-        if not isinstance(body, list):
-            body = view.get("sections")
-        cards = body if isinstance(body, list) else []
-        parts.append(
-            str(view.get("path") or "") + "[" + ",".join(_card_signature(c) for c in cards) + "]"
-        )
-    return "|".join(parts)
+        kinds.add(f"view:{view.get('path') or ''}")
+        for key in ("cards", "sections"):
+            body = view.get(key)
+            if isinstance(body, list):
+                stack.extend(body)
+    while stack:
+        card = stack.pop()
+        if not isinstance(card, dict):
+            continue
+        kinds.add(str(card.get("type") or "?"))
+        nested = card.get("cards")
+        if isinstance(nested, list):
+            stack.extend(nested)
+    return kinds
+
+
+def _template_owns_layout(stored: Any, expected: dict[str, Any]) -> bool:
+    """Return True when the stored dashboard draws nothing the template does not.
+
+    The template only ever adds or removes **its own** cards, so a stored layout
+    whose views and card types are a subset of what the current template
+    generates is an older generation of it.  Anything extra - an extra tab, a
+    hand-added card, or a card this release removed - means the user has made the
+    dashboard their own, and it is left alone.
+    """
+    return _layout_kinds(stored) <= _layout_kinds(expected)
 
 
 async def async_upgrade_dashboard_template(
     hass: HomeAssistant, dev_id: str
 ) -> str | None:
-    """Rebuild an untouched dashboard that was generated by an older template.
+    """Bring a generated dashboard up to the bundled template.
 
-    Returns the result of the rebuild, or None when nothing was done.  Four
-    outcomes:
+    The dashboard this integration writes is a **template**, not a document: it
+    is regenerated when ``TEMPLATE_VERSION`` moves on, so every device keeps the
+    layout the release ships and a new card reaches dashboards that already
+    exist.  The decision is structural:
 
-    * the stored config matches a config this integration wrote for the device
-      (any recorded generation, not just the newest) and the template has moved
-      on -> rebuild it,
-    * the stored config matches nothing we ever wrote -> it was edited by hand,
-      so remember that and never check again,
-    * it was flagged as hand-edited before this module kept a hash history, but
-      its shape still matches the template -> the flag predates the check, so it
-      is rebuilt once and recorded properly,
-    * no record at all but the shape still matches the current template -> the
-      dashboard is simply up to date, record it and stop,
-    * no record and a different shape -> it was generated by an older template,
-      rebuild it.  Shape, not content, because a dashboard from before the
-      versioning had no way of recording "I was generated": recolouring a curve
-      must not count as a hand edit, while a missing view is a template change.
+    * the stored layout contains only views and card types the template
+      generates -> it is an older generation of it, so rebuild it when the
+      version moved on;
+    * the stored layout contains something the template never generates -> the
+      user has made it their own, so it is left alone and recorded as opted out.
+
+    Comparing *structure* instead of the serialised bytes is what makes that
+    work.  A Lovelace round-trip, a reordered key or a changed colour used to
+    look exactly like a hand edit, and one false positive opted a dashboard out
+    of every later upgrade for good - which is how a device kept a template from
+    two releases ago while its neighbours moved on.
     """
     url_path = dashboard_url_path(dev_id)
     dashboards = _dashboards(hass) or {}
@@ -1125,26 +1564,32 @@ async def async_upgrade_dashboard_template(
     if not isinstance(stored, dict) or not stored.get("views"):
         return None  # the empty case is handled by the create path
 
+    expected = build_dashboard_config(dev_id, model=_model_of(hass, dev_id))
     meta = await _async_meta(hass)
     record = meta.get(dev_id) if isinstance(meta.get(dev_id), dict) else None
 
-    if record is None:
-        expected = build_dashboard_config(dev_id)
-        if _structure_signature(stored) == _structure_signature(expected):
-            # Same layout as the bundled template - nothing to bring forward.
-            if stored == expected:
-                await _async_record_template(hass, dev_id, stored)
-                return None
-            # Structurally identical but values differ: the user has customised
-            # it, so adopt it as-is and treat it as opted out of upgrades.
+    if not _template_owns_layout(stored, expected):
+        # A tab or a card the template never draws: the user built this page.
+        if record is None:
             await _async_record_template(hass, dev_id, stored, auto_update=False)
-            _LOGGER.info(
-                "Dashboard %s keeps its customised layout (template v%s)",
-                url_path,
-                TEMPLATE_VERSION,
-            )
-            return None
+        elif record.get("auto_update") is not False:
+            meta[dev_id] = {**record, "auto_update": False}
+            try:
+                from homeassistant.helpers.storage import Store  # noqa: PLC0415
 
+                await Store(hass, 1, _META_KEY).async_save({"entries": meta})
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("Unable to record the edit for %s", url_path, exc_info=True)
+        _LOGGER.debug("Dashboard %s was customised, leaving it alone", url_path)
+        return None
+
+    if record is None:
+        # Generated before this module kept bookkeeping.  The layout is ours, so
+        # adopt it; identical content means nothing to do, different content
+        # means it came from an older template.
+        if stored == expected:
+            await _async_record_template(hass, dev_id, stored)
+            return None
         _LOGGER.info(
             "Dashboard %s was built by an older template, rebuilding it with v%s",
             url_path,
@@ -1152,81 +1597,51 @@ async def async_upgrade_dashboard_template(
         )
         return await async_create_device_dashboard(hass, dev_id, overwrite=True)
 
-    if record.get("auto_update") is False:
-        # Records written before ``config_hashes`` existed carried a single hash,
-        # so a legitimate write by an older build of this module (or a
-        # round-trip through Lovelace that re-serialised the file) looked
-        # exactly like a hand edit and opted the dashboard out for good.  One
-        # device still had the old emoji icons because of that.
-        #
-        # Those records cannot be re-evaluated against the history they never
-        # kept, but they can be re-evaluated against the shape: a dashboard the
-        # user really did customise gets its record rewritten with history by
-        # the branch below (or by the adopt path), so this can only ever fire
-        # once per device and never on a dashboard that has a history.
-        if "config_hashes" in record:
-            # One migration still has to reach these records: the tab labels
-            # used to follow the Home Assistant interface language and are now
-            # English, because nothing on the client can rewrite a view title
-            # when the reader changes the language in a card.  A dashboard whose
-            # only difference is the wording of its tabs is not a customised
-            # dashboard, and leaving it alone would show Chinese tabs next to
-            # English cards.
-            version = record.get("template_version")
-            expected = build_dashboard_config(dev_id)
-            if (
-                isinstance(version, int)
-                and version < TEMPLATE_VERSION
-                and _titles_of(stored) != _titles_of(expected)
-                and _titles_are_template_made(stored)
-                and _structure_signature(stored) == _structure_signature(expected)
-            ):
-                _LOGGER.info(
-                    "Dashboard %s kept the old view titles; rebuilding with v%s",
-                    url_path,
-                    TEMPLATE_VERSION,
-                )
-                return await async_create_device_dashboard(hass, dev_id, overwrite=True)
-            return None
-        version = record.get("template_version")
-        if not isinstance(version, int) or version >= TEMPLATE_VERSION:
-            return None
-        expected = build_dashboard_config(dev_id)
-        if _structure_signature(stored) != _structure_signature(expected):
-            return None
+    version = record.get("template_version")
+    version_ok = isinstance(version, int) and version >= TEMPLATE_VERSION
+    if version_ok and record.get("config_hash") == _config_hash(expected):
+        return None
+
+    if version_ok:
+        # Same template generation, different content: a **fact the template is
+        # built from** changed.  The product model is the usual one - it arrives
+        # from the firmware's discovery payload a moment after setup, and it
+        # decides whether this unit has PV curves at all.  The dashboard would
+        # otherwise keep whatever was generated while the model was still null.
         _LOGGER.info(
-            "Dashboard %s was flagged before hash history existed; rebuilding with v%s",
+            "Dashboard %s no longer matches what the template generates "
+            "(device model or capabilities changed), rebuilding it",
             url_path,
+        )
+    else:
+        _LOGGER.info(
+            "Dashboard %s still uses template v%s, rebuilding it with v%s",
+            url_path,
+            version,
             TEMPLATE_VERSION,
         )
-        return await async_create_device_dashboard(hass, dev_id, overwrite=True)
-
-    stored_hash = _config_hash(stored)
-    if stored_hash not in _known_hashes(record):
-        # Something changed the layout outside this module.  Respect it.
-        _LOGGER.info(
-            "Dashboard %s was edited by hand, leaving its layout alone", url_path
-        )
-        meta[dev_id] = {**record, "auto_update": False}
-        try:
-            from homeassistant.helpers.storage import Store  # noqa: PLC0415
-
-            await Store(hass, 1, _META_KEY).async_save({"entries": meta})
-        except Exception:  # noqa: BLE001
-            _LOGGER.debug("Unable to record the edit for %s", url_path, exc_info=True)
-        return None
-
-    version = record.get("template_version")
-    if isinstance(version, int) and version >= TEMPLATE_VERSION:
-        return None
-
-    _LOGGER.info(
-        "Dashboard %s still uses template v%s, rebuilding it with v%s",
-        url_path,
-        version,
-        TEMPLATE_VERSION,
-    )
     return await async_create_device_dashboard(hass, dev_id, overwrite=True)
+
+
+def _device_allows_system_view(hass: HomeAssistant, dev_id: str) -> bool:
+    """Whether this unit may keep the System view, per the role it reports.
+
+    Looked up through ``hass.data`` rather than by importing the coordinator:
+    ``coordinator.py`` imports this module, so the dependency has to stay one
+    way.  ``True`` when nothing is known (no entry, still loading, role not
+    reported yet) - not knowing the role must never hide the page.
+    """
+    try:
+        for entry in hass.data.get(DOMAIN, {}).values():
+            if not isinstance(entry, dict) or entry.get("dev_id") != dev_id:
+                continue
+            coordinator = entry.get("coordinator")
+            keep = getattr(coordinator, "system_view_keep", None)
+            if isinstance(keep, bool):
+                return keep
+    except Exception:  # noqa: BLE001 - a tab must never break setup
+        _LOGGER.debug("Unable to read the role of %s", dev_id, exc_info=True)
+    return True
 
 
 async def async_create_device_dashboard(
@@ -1250,6 +1665,15 @@ async def async_create_device_dashboard(
             "Lovelace is not set up, skipping the dashboard for %s", dev_id
         )
         return RESULT_UNAVAILABLE
+
+    # Rename before the "already exists" shortcut below: an existing dashboard
+    # is returned early, and a release that titled it after the bare digits
+    # would otherwise keep that name forever.  Best effort - a sidebar label
+    # must never break a setup.
+    try:
+        await _async_rename_entry(hass, url_path, title)
+    except Exception:  # noqa: BLE001
+        _LOGGER.debug("Unable to rename %s", url_path, exc_info=True)
 
     existed = url_path in dashboards
     current = dashboards.get(url_path) if existed else None
@@ -1279,7 +1703,21 @@ async def async_create_device_dashboard(
             "Dashboard %s has no config object, writing the file directly", url_path
         )
 
-    config = build_dashboard_config(dev_id)
+    config = build_dashboard_config(dev_id, model=_model_of(hass, dev_id))
+    # A **slave** has no system level readings of its own, so the bundled
+    # System view is written out without it.  Doing it here covers every caller
+    # (setup, the `create_dashboard` service, the options flow and a template
+    # rebuild), which is what a hard-coded `keep=True` after the write got wrong.
+    if not _device_allows_system_view(hass, dev_id):
+        config = {
+            **config,
+            "views": [
+                view
+                for view in config.get("views", [])
+                if not (isinstance(view, dict)
+                        and view.get("path") == SYSTEM_VIEW_PATH)
+            ],
+        }
     if dashboard is not None:
         try:
             await dashboard.async_save(config)
@@ -1323,13 +1761,146 @@ def device_dashboard_exists(hass: HomeAssistant, dev_id: str) -> bool:
     return dashboard_url_path(dev_id) in dashboards
 
 
+# ---------------------------------------------------------------------------
+# Slave units have no System view
+# ---------------------------------------------------------------------------
+def _is_role_condition(visible: Any) -> bool:
+    """Is this the ``visible`` list an older template used to hide the tab?
+
+    v14/v15 emitted exactly one ``state`` condition on the role sensor.  It has
+    to be recognised to be removed: the condition is **always false** for a unit
+    that has not reported its role yet, so leaving one behind keeps the tab
+    hidden forever.
+    """
+    if not isinstance(visible, list) or len(visible) != 1:
+        return False
+    condition = visible[0]
+    if not isinstance(condition, dict) or condition.get("condition") != "state":
+        return False
+    return str(condition.get("entity") or "").endswith("_device_role")
+
+
+async def async_set_system_view(
+    hass: HomeAssistant, dev_id: str, keep: bool
+) -> bool:
+    """Add or remove the System view, following the role the unit reports.
+
+    ``keep`` is ``role != "slave"``.  The decision is made here, in Python,
+    rather than by a Lovelace ``visible`` condition, because such a condition
+    cannot express "not a slave" once the state is `unknown` or `unavailable`:
+    the frontend refuses to evaluate a state condition for those, so the tab
+    disappears on every unit that never publishes `role` (older firmware) or is
+    simply offline.  That turned a "hide it on slaves" request into "hide it
+    everywhere".
+
+    Three things happen on every setup, in this order:
+
+    1. a leftover condition from v14/v15 is stripped - always, even on a
+       dashboard the user has customised, because it is a bug this integration
+       put there;
+    2. the System view is removed when the unit is a slave;
+    3. when it is not a slave and the view is missing, the bundled one is put
+       back in front.
+
+    Steps 2 and 3 are skipped for a dashboard the user has made their own
+    (``auto_update: false``), with one exception: if the unit is a slave, the
+    removal still happens, because that page would only show dashes.
+
+    Returns whether the stored config was rewritten.
+    """
+    url_path = dashboard_url_path(dev_id)
+    dashboard = (_dashboards(hass) or {}).get(url_path)
+    if dashboard is None:
+        return False
+
+    stored = await _async_read_config(hass, dashboard, url_path)
+    if not isinstance(stored, dict) or not isinstance(stored.get("views"), list):
+        return False
+    views: list[Any] = stored["views"]
+
+    meta = await _async_meta(hass)
+    record = meta.get(dev_id) if isinstance(meta.get(dev_id), dict) else None
+    customised = bool(record and record.get("auto_update") is False)
+
+    template_view = build_dashboard_config(
+        dev_id, model=_model_of(hass, dev_id)
+    )["views"][0]
+    index = next(
+        (
+            i
+            for i, view in enumerate(views)
+            if isinstance(view, dict) and view.get("path") == SYSTEM_VIEW_PATH
+        ),
+        None,
+    )
+    changed = False
+
+    # 1. Drop the stale condition (v14/v15), whatever the role is.
+    if index is not None:
+        view = views[index]
+        if _is_role_condition(view.get("visible")):
+            view.pop("visible", None)
+            changed = True
+            _LOGGER.info(
+                "Removed the always-false Slave condition from the System view of %s",
+                url_path,
+            )
+
+    if keep:
+        # 3. Put the view back.  Only when it is missing, so a user who reordered
+        #    their tabs keeps that order.
+        if index is None and not customised:
+            views.insert(0, template_view)
+            changed = True
+            _LOGGER.info("Restored the System view on %s", url_path)
+    elif index is not None:
+        # 2. Remove it - but only when the view is still the bundled one.  A view
+        #    the user has added cards to is their work, and stripping it would
+        #    lose it for good.
+        ours = _template_owns_layout(
+            {"views": [views[index]]}, {"views": [template_view]}
+        )
+        if ours:
+            views.pop(index)
+            changed = True
+            _LOGGER.info("Removed the System view from %s (the unit is a slave)", url_path)
+        else:
+            _LOGGER.debug(
+                "System view of %s was customised, leaving it in place", url_path
+            )
+
+    if not changed:
+        return False
+
+    try:
+        await dashboard.async_save(stored)
+    except Exception:  # noqa: BLE001 - e.g. a YAML mode dashboard
+        _LOGGER.warning("Lovelace rejected the dashboard %s", url_path, exc_info=True)
+        return False
+    if not await _async_write_config(hass, dashboard, url_path, stored):
+        return False
+    try:
+        await dashboard.async_load(force=True)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - the file is the source of truth
+        _LOGGER.debug("Unable to reload %s after the view change", url_path, exc_info=True)
+
+    # Keep the recorded fingerprint in step with what is on disk, otherwise the
+    # next template bump would read the file as a hand edit.
+    await _async_record_template(
+        hass, dev_id, stored, auto_update=not customised
+    )
+    return True
+
+
 __all__ = [
     "RESULT_CREATED",
     "RESULT_EXISTS",
     "RESULT_UNAVAILABLE",
     "RESULT_UPDATED",
+    "SYSTEM_VIEW_PATH",
     "TEMPLATE_VERSION",
     "async_create_device_dashboard",
+    "async_set_system_view",
     "async_upgrade_dashboard_template",
     "build_dashboard_config",
     "dashboard_title",
