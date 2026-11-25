@@ -1450,15 +1450,18 @@ function _hmPowerFlowRegister() {
         .signal .bars { display: block; width: 22px; height: 18px; flex: none; }
         .chip { display: inline-flex; align-items: center; gap: 6px;
                 font-size: 14px; color: var(--primary-text-color); }
-        /* The role chip: only a master or a slave shows one (see _roleChip),
-           so it is coloured quietly - it explains the drawing, it is not a
-           warning.  No backtick characters in here: this whole block is a
-           template literal, so a stray one would end the string early. */
+        /* The role chip: every role the firmware reports gets one (see
+           _roleChip), so it is coloured quietly - it states a fact, it is not
+           a warning.  A stand-alone unit is the quietest of the three because
+           it is also the commonest.  No backtick characters in here: this
+           whole block is a template literal, so a stray one would end the
+           string early. */
         .role { font-size: 12.5px; line-height: 1; padding: 4px 8px;
                 border-radius: 999px; border: 1px solid currentColor;
-                font-weight: 500; opacity: 0.8; }
+                font-weight: 500; opacity: 0.8; white-space: nowrap; }
         .role.master { color: var(--primary-color); }
         .role.slave { color: var(--secondary-text-color); }
+        .role.single { color: var(--secondary-text-color); opacity: 0.55; }
         .wrap { display: flex; justify-content: center; position: relative;
                 /* The drawing fills the cell unless a "max_width" caps it, and
                    a cap (when there is one) leaves it centred.  On the Device
@@ -1851,6 +1854,14 @@ function _hmPowerFlowRegister() {
            system totals, so they are part of the key as well - all of them, so
            a 4-input unit redraws when its third or fourth port starts. */
         d.pvPorts.map(wkey).join(","),
+        /* Except that a unit which mirrors one physical string onto two inputs
+           (the 1650 does) is drawn from the *summed* total instead, and a sum
+           changes when either addend does - including the case where both
+           ports move by equal and opposite amounts and every individual
+           `pvPorts` value above stays put.  Without this the 1650's PV node
+           froze on the first total it drew, which is the 「PV 数值显示很慢」
+           report: the number was there, the diagram just never repainted. */
+        wkey(d.pvTotal),
         d.soc === null || d.soc === undefined ? "x" : num(d.soc).toFixed(2),
         d.status, d.rssi, d.packs,
         /* The role still changes the drawing: `solar2` decides whether a second
@@ -2265,7 +2276,26 @@ function _hmPowerFlowRegister() {
          A body with several inputs is unaffected: `pv_total_power` is only
          consulted for the single-port layout, where `pv1_power` and `pv2_power`
          have no separate nodes to be drawn on. */
-      const pvTotal = this._read("pv_total_power", null);
+      /* `pv_total_power` is the integration's own sum over the ports, so it is
+         used whenever it resolves.  When it does not - the entity was removed
+         by the capability reconciliation, or this is an older dashboard whose
+         card config predates it - the ports are added up here instead, which is
+         the same arithmetic on the same readings.  Without the fallback the
+         split layout printed `pvPorts[0]` alone, i.e. **one** of the two strings
+         the body reports, which is the 「PV端口数值不对」 report: the number was
+         there, it just was not the sum.
+         `sumPorts` returns `null` when no port reported at all, so an absent
+         reading still prints `—` rather than a confident `0`. */
+      const sumPorts = (ports) => {
+        let total = null;
+        for (const port of ports) {
+          if (port === null || port === undefined) continue;
+          total = (total ?? 0) + port;
+        }
+        return total;
+      };
+      const pvTotal = this._read("pv_total_power", null)
+        ?? sumPorts(pvPorts);
       /* The household side of the meter, and the smart plug beside it.  Both are
          drawn on the system schematic no matter what §32 says about this unit's
          installation (see `_svgSystem`): the schematic shows the house the unit
@@ -2586,22 +2616,38 @@ function _hmPowerFlowRegister() {
      * still records the fact, because the role does change the Device tab (a
      * micro-inverter in a master/slave pair reports its own ports, not the
      * system totals) and because knowing which unit carries the meter is useful
-     * when comparing the two tabs.  Nothing is shown for a stand-alone unit
-     * (the overwhelming majority, and `—` would just be noise) and nothing is
-     * shown when the firmware has not said, because an empty chip is worse than
-     * no chip.
+     * when comparing the two tabs.
+     *
+     * Every role the firmware reports draws a chip, `single` included.  That
+     * one used to be suppressed: a stand-alone unit is the commonest case, so
+     * the chip was meant to stay out of the way.  In practice "no chip" then
+     * meant two very different things - "this unit is on its own" and "the
+     * firmware has not said yet" - and a unit that switched from master to
+     * stand-alone looked like the indicator had been removed.  Only a missing
+     * role (no `event/state` yet, or an older firmware without the topic)
+     * draws nothing, so an empty header still means "unknown" and nothing
+     * else.
      */
     _roleChip(d) {
       const role = d.role;
-      if (!role || role === "single") return null;
-      const master = role === "master";
-      const text = master ? this._t("Master", "主机") : this._t("Slave", "从机");
-      const hint = master
-        ? this._t("This unit carries the system meter",
-          "本机承担系统电表计量")
-        : this._t("Follows the master; its own ports are drawn on the device tab",
-          "跟随主机，本机端口见设备页");
-      return html`<div class="role ${master ? "master" : "slave"}" title=${hint}>${text}</div>`;
+      if (!role) return null;
+      const labels = {
+        master: ["Master", "主机"],
+        slave: ["Slave", "从机"],
+        single: ["Stand-alone", "单机"],
+      };
+      const hints = {
+        master: ["This unit carries the system meter",
+          "本机承担系统电表计量"],
+        slave: ["Follows the master; its own ports are drawn on the device tab",
+          "跟随主机，本机端口见设备页"],
+        single: ["Not part of a master/slave pair",
+          "未与主机配对，独立运行"],
+      };
+      const pair = labels[role] || labels.single;
+      const hint = hints[role] || hints.single;
+      return html`<div class="role ${role}" title=${this._t(hint[0], hint[1])}>${
+        this._t(pair[0], pair[1])}</div>`;
     }
 
     /**

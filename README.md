@@ -1,4 +1,10 @@
-# Hoymiles Official for Home Assistant
+# Hoymiles Official for Home Assistant — **BETA (Internal)**
+
+> [!WARNING]
+> **Internal beta / test channel.** This repository is for R&D and QA only.
+> It is **not** listed in HACS and is **not** intended for end users.
+> End users should install the released integration via HACS search (**Hoymiles Official**).
+> Versions here may be unstable, incompatible with your firmware, or changed without notice.
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz)
 [![Home Assistant](https://img.shields.io/badge/Home%20Assistant-2023.8%2B-41BDF5.svg)](https://www.home-assistant.io)
@@ -76,20 +82,20 @@ that mirror the layout of the Hoymiles app.
 
 ## Installation
 
-### Option A — HACS (recommended)
+> [!IMPORTANT]
+> This is the **beta** repository. It is **not** discoverable through HACS search.
+> You must add it as a **custom repository** using the URL below.
+
+### Option A — HACS custom repository (for QA / test team)
 
 1. Open **HACS → Integrations**
-2. Search for **Hoymiles Official** and click **Download**
-3. **Restart Home Assistant Core completely** (not just "Reload config entry")
+2. Click **⋮ (top right) → Custom repositories**
+3. Repository: `https://github.com/hoymiles-ha/ha_beta`, category **Integration**
+4. Click **Add**, then search for **Hoymiles Official (Beta)** and click **Download**
+5. **Restart Home Assistant Core completely** (not just "Reload config entry")
 
 > Why a full restart: the newly downloaded Python modules have to be re-imported.
 > Reloading the config entry alone will not load new code.
-
-> If the search does not find it yet (HACS caches the catalog and only refreshes
-> every 48 hours), add it once as a custom repository:
-> **HACS → Integrations → ⋮ (top right) → Custom repositories**,
-> repository `https://github.com/hoymiles-ha/ha`, category **Integration**, then
-> search for **Hoymiles Official** and click **Download**.
 
 ### Option B — Manual
 

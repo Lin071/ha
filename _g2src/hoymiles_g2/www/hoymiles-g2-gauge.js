@@ -157,6 +157,51 @@ function _hmGaugeRegister() {
   }
 
   /* ------------------------------------------------------------------ *
+   * Entity id resolution
+   *
+   * This card used to read `hass.states[config.entity]` and nothing else, on
+   * the assumption that the dashboard was generated with the id Home Assistant
+   * derived.  That assumption fails in two very common cases - HA numbers a
+   * colliding id (`..._2`) instead of failing, and renaming either the entity
+   * or the device rewrites the whole id - and the failure is silent: the tile
+   * prints 「—」 next to a schematic that found the same device without any
+   * trouble.  That is the 今日发电 / 总发电量 report.
+   *
+   * So the id is resolved the way `hoymiles-g2-power-flow` resolves its own,
+   * only simpler, because a gauge names exactly one sensor: the configured id,
+   * then the same id with HA's numbering suffix, then - when the card config
+   * carries the description `key` - any registered entity of the same device
+   * whose normalized name or translation key is that key, or whose id ends in
+   * it.  The last pass is what still works after a rename, because the serial
+   * and the description key both survive one.
+   * ------------------------------------------------------------------ */
+
+  function slug(id) {
+    return String(id).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  }
+
+  /** Collapse to alphanumerics so `pack_1_soc` and `pack1_soc` compare equal. */
+  function norm(name) {
+    return String(name == null ? "" : name).toLowerCase().replace(/[^a-z0-9]+/g, "");
+  }
+
+  /** Drop the `_2` / `_3` … HA appends to a colliding entity id. */
+  function stripAuditSuffix(value) {
+    const text = String(value == null ? "" : value);
+    const at = text.lastIndexOf("_");
+    if (at <= 0) return text;
+    const tail = text.slice(at + 1);
+    if (!/^[0-9]+$/.test(tail) || /^0+$/.test(tail)) return text;
+    return text.slice(0, at);
+  }
+
+  /** True when a state object holds something a readout can print. */
+  function stateUsable(state) {
+    if (!state) return false;
+    return !["", "unknown", "unavailable", "none"].includes(String(state.state));
+  }
+
+  /* ------------------------------------------------------------------ *
    * Head artwork.
    *
    * `icon` used to be an emoji and nothing else.  The vendor app draws a few of
@@ -366,6 +411,9 @@ function _hmGaugeRegister() {
       super();
       this._hass = null;
       this._config = null;
+      this._resolved = null;
+      this._resolvedMiss = null;
+      this._deviceIdsCache = null;
     }
 
     static getConfigElement() {
@@ -441,6 +489,11 @@ function _hmGaugeRegister() {
         throw new Error("hoymiles-g2-gauge: 'entity' is required");
       }
       this._config = { ...config };
+      /* A new config may name a different entity, and the device id can change
+         with it, so both memoised answers are dropped. */
+      this._resolved = null;
+      this._resolvedMiss = null;
+      this._deviceIdsCache = null;
     }
 
     set hass(hass) {
@@ -491,9 +544,167 @@ connectedCallback() {
       return hmText(value, this._lang());
     }
 
+    /**
+     * The `entity_id` this card should read.
+     *
+     * `config.entity` wins whenever it holds a printable value, which is the
+     * normal case and costs nothing.  Only when it does not - because the id was
+     * written from a convention and the real one differs - does the ladder below
+     * run, and it is scoped to `config.dev_id`: a tail-only match across the
+     * whole state machine would happily return another unit's sensor, and one
+     * inverter's kWh shown on another inverter's tile is worse than 「—」.
+     */
+    _id() {
+      const config = this._config || {};
+      const configured = config.entity;
+      const hass = this._hass;
+      if (!hass || !hass.states) return configured;
+      if (stateUsable(hass.states[configured])) return configured;
+
+      const cached = this._resolved;
+      if (cached && stateUsable(hass.states[cached])) return cached;
+
+      /* A gauge whose sensor genuinely does not exist (a per-port tile on a
+         unit with fewer inputs, say) would otherwise rescan every state on
+         every render.  The state count is a cheap proxy for "something has been
+         added since the last miss", so a sensor that shows up later is still
+         picked up on the first push that mentions it. */
+      const count = Object.keys(hass.states).length;
+      if (this._resolvedMiss === count) return configured;
+
+      let found = config.key && config.dev_id ? this._scan(config.key) : null;
+      if (!found && !hass.states[configured]
+        && !(hass.entities && hass.entities[configured])) {
+        /* The id is not merely empty - nothing by that name exists at all, which
+           is what a renamed device leaves behind.  A unique suffix match is then
+           safe enough, and `_tailMatch` insists on uniqueness. */
+        found = this._tailMatch(configured);
+      }
+      this._resolvedMiss = null;
+      if (found) {
+        this._resolved = found;
+      } else {
+        this._resolvedMiss = count;
+      }
+      return found || configured;
+    }
+
+    /** Find this device's `key` sensor through the same ladder `power-flow` uses. */
+    _scan(key) {
+      const hass = this._hass;
+      const serial = String((this._config && this._config.dev_id) || "");
+      const dev = slug(serial);
+      const wanted = norm(key);
+      let found = null;
+      const consider = (entityId) => {
+        if (!stateUsable(hass.states[entityId])) return;
+        if (!found || entityId.length < found.length) found = entityId;
+      };
+
+      /* 1. The convention, when it happens to be right. */
+      const conventional = `sensor.${dev}_${key}`;
+      if (hass.states[conventional]) consider(conventional);
+
+      /* 2. Same device, same key, id it did not end up with - an edited name, or
+         HA's `_2` for a collision. */
+      const prefix = `sensor.${dev}`;
+      if (!found && dev) {
+        for (const entityId of Object.keys(hass.states)) {
+          if (!entityId.startsWith(prefix)) continue;
+          const tail = entityId.slice(prefix.length + 1);
+          if (norm(tail) !== wanted && norm(stripAuditSuffix(tail)) !== wanted) continue;
+          consider(entityId);
+        }
+      }
+
+      /* 3. A renamed device: the slug prefix is gone but the serial never is, so
+         only the part after the serial is compared. */
+      if (!found && serial) {
+        const marker = norm(serial);
+        for (const entityId of Object.keys(hass.states)) {
+          const flat = norm(entityId);
+          const at = flat.indexOf(marker);
+          if (at < 0) continue;
+          if (norm(flat.slice(at + marker.length)) !== wanted) continue;
+          consider(entityId);
+        }
+      }
+
+      /* 4. Nothing about the id survives: fall back to the registry name, still
+         scoped to this unit's devices. */
+      if (!found && hass.entities) {
+        const deviceIds = this._deviceIds(serial);
+        if (deviceIds.size) {
+          for (const [entityId, entry] of Object.entries(hass.entities)) {
+            if (!entry || !entityId.startsWith("sensor.")) continue;
+            if (!deviceIds.has(entry.device_id)) continue;
+            if (norm(stripAuditSuffix(entry.name)) !== wanted
+              && norm(stripAuditSuffix(entry.translation_key)) !== wanted) continue;
+            consider(entityId);
+          }
+        }
+      }
+
+      return found;
+    }
+
+    /** Registry device ids whose identifier carries `serial`, resolved once. */
+    _deviceIds(serial) {
+      if (this._deviceIdsCache) return this._deviceIdsCache;
+      const out = new Set();
+      const devices = (this._hass && this._hass.devices) || {};
+      if (!serial) {
+        this._deviceIdsCache = out;
+        return out;
+      }
+      for (const [deviceId, device] of Object.entries(devices)) {
+        if (!device) continue;
+        for (const pair of device.identifiers || []) {
+          if (Array.isArray(pair) && String(pair[1]) === serial) {
+            out.add(deviceId);
+            break;
+          }
+        }
+      }
+      this._deviceIdsCache = out;
+      return out;
+    }
+
+    /**
+     * The one live entity whose id ends with `entityId`'s key tail.
+     *
+     * Only called when nothing exists under the configured id at all, and only
+     * accepts an unambiguous answer: two candidates means the tail is too generic
+     * to identify anything, so 「—」 is the honest output.  The trailing segment
+     * alone is never used - `soc` would match `system_soc` and half the tile
+     * vocabulary with it.
+     */
+    _tailMatch(entityId) {
+      const hass = this._hass;
+      const text = String(entityId || "");
+      if (!hass || !hass.states || !text.startsWith("sensor.")) return null;
+      const parts = text.slice("sensor.".length).split("_").filter(Boolean);
+      for (let take = parts.length; take >= 2; take -= 1) {
+        const wanted = norm(parts.slice(parts.length - take).join("_"));
+        if (!wanted) continue;
+        let match = null;
+        let count = 0;
+        for (const candidate of Object.keys(hass.states)) {
+          if (!candidate.startsWith("sensor.")) continue;
+          if (!norm(candidate).endsWith(wanted)) continue;
+          if (!stateUsable(hass.states[candidate])) continue;
+          count += 1;
+          if (!match || candidate.length < match.length) match = candidate;
+        }
+        if (count === 1) return match;
+        if (count > 1) return null;
+      }
+      return null;
+    }
+
     _read() {
-      const entityId = this._config.entity;
-      const state = this._hass && this._hass.states ? this._hass.states[entityId] : null;
+      const state = this._hass && this._hass.states
+        ? this._hass.states[this._id()] : null;
       if (!state || ["unknown", "unavailable", ""].includes(String(state.state))) {
         return null;
       }
@@ -508,7 +719,7 @@ connectedCallback() {
     _unit() {
       if (this._config.unit) return this._config.unit;
       const state = this._hass && this._hass.states
-        ? this._hass.states[this._config.entity] : null;
+        ? this._hass.states[this._id()] : null;
       return (state && state.attributes && state.attributes.unit_of_measurement) || "";
     }
 
@@ -528,7 +739,13 @@ connectedCallback() {
      * entities whose units cancel out, so only the raw numbers belong here.
      */
     _entityNumber(entityId) {
-      const state = this._hass && this._hass.states ? this._hass.states[entityId] : null;
+      let id = entityId;
+      const hass = this._hass;
+      if (hass && hass.states && !stateUsable(hass.states[id])) {
+        const tail = this._tailMatch(id);
+        if (tail) id = tail;
+      }
+      const state = hass && hass.states ? hass.states[id] : null;
       if (!state) return null;
       const raw = String(state.state);
       if (["unknown", "unavailable", ""].includes(raw)) return null;
@@ -563,7 +780,7 @@ connectedCallback() {
     render() {
       if (!this._config) return html``;
       const value = this._read();
-      const name = this._text(this._config.name) || this._config.entity;
+      const name = this._text(this._config.name) || this._id();
       const icon = this._config.icon == null ? "" : String(this._config.icon);
       const min = this._config.min == null ? 0 : num(this._config.min);
       const max = Math.max(this._max(), 1e-9);

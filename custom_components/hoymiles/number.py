@@ -54,6 +54,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    CONF_DEV_ID,
     DOMAIN,
     FAN_LEVEL_MAX,
     FAN_LEVEL_MIN,
@@ -99,6 +100,7 @@ from .const import (
     SRC_METER_META,
     SRC_PHASE_HOUSE_IN_META,
     SRC_PHASE_INPUT_META,
+    device_family,
 )
 from .coordinator import HoymilesCoordinator
 from .discovery_override import FirmwareDiscoveryPatcher
@@ -493,10 +495,22 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the numbers, adding the optional ones as they are announced."""
+    """Set up the numbers, adding the optional ones as they are announced.
+
+    Forwarded platforms resolve against the integration root package, so an
+    inverter entry arrives here too; ``inverter/number.py`` is never imported by
+    Home Assistant itself.
+    """
+    dev_id: str = entry.data.get(CONF_DEV_ID, "")
+    if device_family(dev_id) == "inverter":
+        from .inverter import number as _inverter_number  # noqa: PLC0415
+
+        await _inverter_number.async_setup_entry(hass, entry, async_add_entities)
+        return
+
     coordinator: HoymilesCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
     patcher: FirmwareDiscoveryPatcher = hass.data[DOMAIN][entry.entry_id]["patcher"]
-    dev_id: str = hass.data[DOMAIN][entry.entry_id]["dev_id"]
+    dev_id = hass.data[DOMAIN][entry.entry_id]["dev_id"]
 
     # Entities that need no capability are created straight away.
     async_add_entities(

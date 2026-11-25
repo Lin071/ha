@@ -16,7 +16,7 @@ from homeassistant.helpers.selector import (
 )
 
 from . import mqtt_util
-from .const import CONF_CREATE_DASHBOARD, CONF_DEV_ID, DOMAIN, NAME
+from .const import CONF_CREATE_DASHBOARD, CONF_DEV_ID, DOMAIN, NAME, device_family
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -33,7 +33,20 @@ class HoymilesConfigFlow(ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: ConfigEntry) -> Any:
-        """Return the TOU configuration wizard."""
+        """Return the configure wizard that fits this device's family.
+
+        The storage family keeps the TOU wizard it has always had.  A micro
+        inverter has no TOU plan, so it gets the inverter wizard instead (the
+        optional charts of its Device view).
+        """
+        dev_id = str(config_entry.data.get(CONF_DEV_ID, ""))
+        if device_family(dev_id) == "inverter":
+            from .inverter.options_flow import (  # noqa: PLC0415
+                HoymilesOptionsFlow as InverterOptionsFlow,
+            )
+
+            return InverterOptionsFlow()
+
         from .options_flow import HoymilesOptionsFlow  # noqa: PLC0415
 
         return HoymilesOptionsFlow()
@@ -55,7 +68,7 @@ class HoymilesConfigFlow(ConfigFlow, domain=DOMAIN):
                 return await self.async_step_dashboard()
 
         if not self._discovered:
-            self._discovered = await mqtt_util.async_discover_dev_ids(self.hass)
+            self._discovered = await self._async_discover()
             _LOGGER.debug("Discovered Hoymiles devices: %s", self._discovered)
 
         configured = {
@@ -85,6 +98,35 @@ class HoymilesConfigFlow(ConfigFlow, domain=DOMAIN):
                 "count": str(len(options)),
             },
         )
+
+    async def _async_discover(self) -> list[str]:
+        """Collect candidate device ids, family by family.
+
+        The two families have a different notion of "reachable", and mixing them
+        would change the storage picker for no reason:
+
+        * a **storage** unit is offered from its retained discovery config, which
+          is what this flow has always done;
+        * a **micro inverter** is only offered while its per-second
+          ``quick/state`` stream is running, so an unplugged inverter drops out
+          of the picker instead of lingering there forever on a retained config.
+        """
+        from .const import is_inverter_dev_id  # noqa: PLC0415
+        from .inverter import mqtt_util as inverter_mqtt_util  # noqa: PLC0415
+
+        storage = [
+            dev_id
+            for dev_id in await mqtt_util.async_discover_dev_ids(self.hass)
+            if not is_inverter_dev_id(dev_id)
+        ]
+        inverters = await inverter_mqtt_util.async_discover_dev_ids(self.hass)
+
+        # A live storage unit shows up in both lists; keep the first occurrence.
+        merged: list[str] = []
+        for dev_id in storage + inverters:
+            if dev_id not in merged:
+                merged.append(dev_id)
+        return merged
 
     async def async_step_dashboard(
         self, user_input: dict[str, Any] | None = None

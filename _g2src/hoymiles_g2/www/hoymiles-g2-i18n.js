@@ -203,9 +203,11 @@
     "Host": "Master",
     "Master": "Master",
     "Slave": "Slave",
+    "Stand-alone": "Einzelgerät",
     "This unit carries the system meter": "Dieses Gerät trägt den Systemzähler",
     "Follows the master; its own ports are drawn on the device tab":
       "Folgt dem Master; die eigenen Anschlüsse werden auf der Geräte-Registerkarte gezeichnet",
+    "Not part of a master/slave pair": "Nicht mit einem Master gekoppelt",
     "Load Mon": "Mo laden",
     "Wi-Fi Signal": "WLAN-Signal",
 
