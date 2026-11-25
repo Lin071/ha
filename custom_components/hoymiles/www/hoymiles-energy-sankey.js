@@ -535,6 +535,11 @@ function _hmSankeyRegister() {
     if (!n) return { scale: 0, minH: MIN_NODE_H };
     const usable = Math.max(8, avail - (n - 1) * GAP);
     const minH = Math.min(MIN_NODE_H, usable / n);
+    /* Every node at zero: the diagram is a legend of where energy can go, so
+       the boxes are stretched to fill the column evenly instead of huddling at
+       the top.  The doubling loop below would otherwise run its full 80 rounds
+       against a zero sum. */
+    if (!values.some((v) => v > 0)) return { scale: 0, minH: usable / n };
     const sum = (s) => values.reduce((acc, v) => acc + Math.max(minH, v * s), 0);
     let lo = 0;
     let hi = Math.max(1e-6, usable / Math.max(1e-9, Math.min(...values)));
@@ -1431,14 +1436,15 @@ function _hmSankeyRegister() {
         total += value;
       }
 
-      const srcs = SOURCES
-        .map((d) => ({ ...d, value: srcValue[d.id] || 0 }))
-        .filter((d) => d.value > EPS);
-      const snks = SINKS
-        .map((d) => ({ ...d, value: snkValue[d.id] || 0 }))
-        .filter((d) => d.value > EPS);
+      /* Every node is drawn, even at 0 Wh.  The picture is also a legend of
+         where energy *can* go, and a column that disappeared the moment the
+         battery went idle (or the sun set) read as a broken diagram rather
+         than as a quiet one.  A zero node keeps the minimum height and simply
+         carries no ribbon - the loop below skips values at or below EPS. */
+      const srcs = SOURCES.map((d) => ({ ...d, value: srcValue[d.id] || 0 }));
+      const snks = SINKS.map((d) => ({ ...d, value: snkValue[d.id] || 0 }));
 
-      if (total <= EPS || !srcs.length || !snks.length) {
+      if (!srcs.length || !snks.length) {
         return { empty: true, total: 0 };
       }
 
