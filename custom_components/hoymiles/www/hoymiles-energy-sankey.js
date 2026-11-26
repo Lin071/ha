@@ -15,14 +15,13 @@
  *     load_cons  efpv pv -> load (same as e2l)
  *                efb  battery -> load     efg  grid -> load
  *                g2b  grid -> battery
- *                e2kl g2kl b2kl tp2kl      -> known load
- *                e2loss g2loss b2loss tp2loss -> loss
  *
- * The house is three sinks, not one: **known load** (what the unit can meter -
- * the EPS outlet and a smart plug), **loss** (inversion, charge/discharge,
- * standby, heating) and **unknown load** (the remainder it infers).  They are
- * drawn side by side and never merged, because "the house used 6 kWh" and
- * "the machine wasted 1.5 kWh of it" are different statements.
+ * The house is one sink (**load**).  A later firmware revision added `*kl` and
+ * `*loss` edges that split it into three; they are not drawn, because the
+ * diagram is the documented ten-field one: four sources on the left (PV,
+ * third-party PV, battery out, grid in) and three sinks on the right (load,
+ * battery in, grid out).  Both columns are always drawn, even when a flow is
+ * zero - the picture doubles as the legend of where energy can go.
  *
  * The integration decodes that into the `Energy Flow Today` sensor, and this
  * card draws those numbers.  Nothing is estimated and nothing is read from the
@@ -53,12 +52,12 @@
  * grid flows would all be zero and the picture would claim the unit never
  * imports or exports.  The dashboard layout is built with that in mind.
  *
- * Layout: a direct source -> sink sankey.  Four sources on the left (PV, battery
- * out, grid in, third-party PV), five sinks on the right (battery in, grid out,
- * unknown load, known load, loss), and a ribbon for every flow the device
- * reported.  Battery and grid therefore appear twice, once per direction: the
- * device measures them as two separate flows and one box cannot be both a source
- * and a sink of the same diagram.
+ * Layout: a direct source -> sink sankey.  Four sources on the left (PV,
+ * third-party PV, battery out, grid in), three sinks on the right (load,
+ * battery in, grid out), and a ribbon for every flow the device reported.
+ * Battery and grid therefore appear twice, once per direction: the device
+ * measures them as two separate flows and one box cannot be both a source and
+ * a sink of the same diagram.
  *
  * Interaction: click a ribbon to highlight that single flow, or click a node
  * box to highlight every ribbon that touches it.  Pure view state - the
@@ -279,41 +278,24 @@ function _hmSankeyRegister() {
       <path d="M5.7 10.5v8.5a1.2 1.2 0 0 0 1.2 1.2h10.2a1.2 1.2 0 0 0 1.2-1.2v-8.5"
         fill="none" stroke="#fff" stroke-width="1.9" stroke-linejoin="round"/>
       <rect x="10.1" y="13.2" width="3.8" height="4.4" rx=".7" fill="#fff"/>`,
-    /* A plug: the energy the unit can meter itself (EPS outlet, smart plug).
-       A house would be ambiguous next to `load`, and this is exactly what the
-       vendor app means by "known load". */
-    kl: `<path d="M9 2.9v4.2M15 2.9v4.2" stroke="#fff" stroke-width="1.9"
-        stroke-linecap="round"/>
-      <path d="M6.5 7.1h11v2.3a5.5 5.5 0 0 1-11 0z" fill="#fff"/>
-      <path d="M12 15v2.8a3.2 3.2 0 0 0 3.2 3.2h2.4" fill="none" stroke="#fff"
-        stroke-width="1.9" stroke-linecap="round"/>`,
-    /* A flame: the part of the energy that became heat instead of work. */
-    loss: `<path d="M12 2.7c3.5 3.3 5.7 6 5.7 9.2a5.7 5.7 0 0 1-11.4 0
-        c0-2.1 1-3.6 2.3-5 .1 1.7.8 2.6 1.8 2.6 1.2 0 2-1.3 1.6-6.8z"
-        fill="#fff"/>`,
   };
 
   /** Fallback glyph, so an unknown node id is never invisible. */
   const GLYPH_FALLBACK = `<circle cx="12" cy="12" r="4" fill="#fff"/>`;
 
   /* ------------------------------------------------------------------ *
-   * Node model — four sources on the left, five sinks on the right.
+   * Node model — four sources on the left, three sinks on the right.
    *
    * Battery and grid appear on both sides on purpose: "battery out" is
    * discharge and "battery in" is charge, and one node cannot be both a
-   * source and a sink of the same diagram.  The house is split three ways for
-   * the same reason the device splits it: energy that was metered (known load),
-   * energy that was wasted in the conversion (loss) and the remainder the unit
-   * can only infer (unknown load).
+   * source and a sink of the same diagram.
    * ------------------------------------------------------------------ */
   /* Colors follow the reference the user supplied: PV is yellow, battery is
      green (two shades, so charge and discharge stay apart), the grid is grey
      (it is a metered utility, not a colour of its own) and the load is blue.
      The node text is dark (#111), which stays legible on all four.
-     The three nodes added when the load side was split reuse those families so
-     the picture does not turn into a colour chart: third-party PV is a deeper
-     amber next to the yellow, known load a teal next to the blue, loss a muted
-     brick next to the grey. */
+     Third-party PV is a deeper amber next to the yellow, so the two suns stay
+     distinguishable without turning the picture into a colour chart. */
   const SOURCES = [
     { id: "pv", side: "src", en: "PV", zh: "光伏供电", color: "#F5C342" },
     /* Third-party PV sits directly under the unit's own PV: the two are the same
@@ -325,47 +307,37 @@ function _hmSankeyRegister() {
   ];
 
   const SINKS = [
-    { id: "load", side: "snk", en: "Unknown load", zh: "未知负载", color: "#2E90D6" },
-    { id: "kl", side: "snk", en: "Known load", zh: "已知负载", color: "#1D9BB8" },
-    { id: "loss", side: "snk", en: "Loss", zh: "损耗", color: "#B4746A" },
+    { id: "load", side: "snk", en: "Load", zh: "负载", color: "#2E90D6" },
     { id: "bat_in", side: "snk", en: "Battery in", zh: "存入电池", color: "#22C55E" },
     { id: "grid_out", side: "snk", en: "Grid out", zh: "馈入电网", color: "#8F959B" },
   ];
 
   /* ------------------------------------------------------------------ *
-   * The seventeen flows the device reports, and the sensor attribute each one
-   * arrives in.  `e2l` and `efpv` are the same quantity seen from the two
-   * sides of the topic; the production side (`e2l`) is used, so no flow is
+   * The nine flows the documented document carries, and the sensor attribute
+   * each one arrives in.  `e2l` and `efpv` are the same quantity seen from the
+   * two sides of the topic; the production side (`e2l`) is used, so no flow is
    * counted twice - `efpv` is deliberately absent below.
    *
    * The id is `<group>_<field>`: `_readingsFromPayload` splits it back into the
    * wire group and field.  `tp2b` / `tp2g` keep the `pv_` prefix because they
-   * live in `pv_prod`, even though they now leave the **third-party** node.
+   * live in `pv_prod`, even though they leave the **third-party** node.
    * ------------------------------------------------------------------ */
   const FLOWS = [
-    /* PV side: 3 old edges + 2 into the separated sinks. */
+    /* PV side. */
     { id: "pv_e2l", from: "pv", to: "load" },
     { id: "pv_e2b", from: "pv", to: "bat_in" },
     { id: "pv_e2g", from: "pv", to: "grid_out" },
-    { id: "load_e2kl", from: "pv", to: "kl" },
-    { id: "load_e2loss", from: "pv", to: "loss" },
-    /* Third-party PV is its own source now - the vendor app shows it as one,
-       and folding it into `pv` hid the fact that the unit's own MPPT produced
-       nothing while a neighbouring inverter did. */
+    /* Third-party PV is its own source: folding it into `pv` hid the fact that
+       the unit's own MPPT produced nothing while a neighbouring inverter did. */
     { id: "pv_tp2b", from: "tp", to: "bat_in" },
     { id: "pv_tp2g", from: "tp", to: "grid_out" },
-    { id: "load_tp2kl", from: "tp", to: "kl" },
-    { id: "load_tp2loss", from: "tp", to: "loss" },
-    /* Battery out (discharge). */
+    /* Battery out (discharge) and grid in.  These two are read from the load
+       group: the device publishes them as "what fed the house", not as part of
+       the PV side. */
     { id: "pv_b2g", from: "bat_out", to: "grid_out" },
     { id: "load_efb", from: "bat_out", to: "load" },
-    { id: "load_b2kl", from: "bat_out", to: "kl" },
-    { id: "load_b2loss", from: "bat_out", to: "loss" },
-    /* Grid in. */
     { id: "load_efg", from: "grid_in", to: "load" },
     { id: "load_g2b", from: "grid_in", to: "bat_in" },
-    { id: "load_g2kl", from: "grid_in", to: "kl" },
-    { id: "load_g2loss", from: "grid_in", to: "loss" },
   ];
 
   /* Below this a flow is noise, not a ribbon (kWh).  Shared by `_buildGraph`
@@ -868,7 +840,7 @@ function _hmSankeyRegister() {
      *
      * Called from the `hass` setter, which Home Assistant fires for *every*
      * state change on the page, so the cheap signature check comes first: a
-     * diagram is only rebuilt when one of the seventeen flows, the meter flag, the
+     * diagram is only rebuilt when one of the nine flows, the meter flag, the
      * entity, the selected day or the language actually changed.
      *
      * Two sources, one picture:
@@ -1017,7 +989,7 @@ function _hmSankeyRegister() {
     }
 
     /**
-     * Today's seventeen flows, or ``null`` when the entity is not reporting.
+     * Today's nine flows, or ``null`` when the entity is not reporting.
      *
      * `unavailable` / `unknown` only mean "no live reading right now" - they no
      * longer mean "nothing to show", because the archive keeps the last one.
@@ -1030,7 +1002,7 @@ function _hmSankeyRegister() {
       return this._readingsFromAttrs(state.attributes || {});
     }
 
-    /** The seventeen flows, read from the sensor attributes (today). */
+    /** The nine flows, read from the sensor attributes (today). */
     _readingsFromAttrs(attrs) {
       const readings = {};
       for (const flow of FLOWS) readings[flow.id] = num(attrs[flow.id]) / WH_PER_KWH;
@@ -1038,7 +1010,7 @@ function _hmSankeyRegister() {
     }
 
     /**
-     * The seventeen flows, read from an archived `sankey/state` payload.
+     * The nine flows, read from an archived `sankey/state` payload.
      *
      * The archive stores the device's own document (`pv_prod` / `load_cons`),
      * not the sensor attributes, so one payload keeps its wire meaning and the
@@ -1074,7 +1046,7 @@ function _hmSankeyRegister() {
     /**
      * The key the archive fetch is throttled on.
      *
-     * It carries the seventeen flows (so any device publish refetches) plus
+     * It carries the nine flows (so any device publish refetches) plus
      * `history_days`, the size of the integration's archive.  That second part
      * matters on a cold start: the card may fetch before the integration has
      * finished backfilling from the recorder, and without this it would keep its
@@ -1416,7 +1388,7 @@ function _hmSankeyRegister() {
     /* ---------------------------- graph layout --------------------------- */
 
     /**
-     * Lay out the diagram from the seventeen measurements.
+     * Lay out the diagram from the nine measurements.
      *
      * A node's height is the sum of the flows that touch it, so both columns
      * always add up to the same total: the device reports both ends of every

@@ -54,8 +54,6 @@ from .const import (
     MANUFACTURER,
     ROLE_MASTER_SINGLE,
     SANKEY_LOAD_CONS,
-    SANKEY_LOAD_KNOWN,
-    SANKEY_LOAD_LOSS,
     SANKEY_PV_PROD,
     SRC_ALARM,
     SRC_DEVICE,
@@ -125,21 +123,18 @@ def s(field: str, default: Any = None) -> Callable[[dict], Any]:
 
 
 # ``system/state`` counts only the unit's own PV ports.  Protocol §45 reports
-# the third-party PV energy as flows of its own - into the battery (``tp2b``),
-# out to the grid (``tp2g``), into the known load (``tp2kl``) and into the loss
-# (``tp2loss``).  There is no ``tp2l``, so the third-party energy that reached
-# the *unknown* load is not in those numbers; ``system/state`` carries that
-# port's own production as ``pv2_e`` instead.
+# the third-party PV energy as flows of its own - into the battery (``tp2b``)
+# and out to the grid (``tp2g``).  There is no ``tp2l``, so the third-party
+# energy that reached the load is not in those numbers; ``system/state``
+# carries that port's own production as ``pv2_e`` instead.
 #
-# Hence the rule the dashboard shows (spec from the vendor app), with the
-# ``*kl`` / ``*loss`` edges added when §45 grew the two extra sinks:
+# Hence the rule the dashboard shows (spec from the vendor app):
 #
-#     own        = e2b + e2g + e2l + e2kl + e2loss
-#     third      = tp2b + tp2g + tp2kl + tp2loss
+#     own        = e2b + e2g + e2l
+#     third      = tp2b + tp2g
 #     total      = own + MAX(third, PV2)
 #     grid_rate  = (b2g + e2g + tp2g) / total
-#     grid_rate >  1 : self_rate = (e2b + tp2b + e2l + e2kl + e2loss
-#                                  + pv2_to_load) / total
+#     grid_rate >  1 : self_rate = (e2b + tp2b + e2l + pv2_to_load) / total
 #     grid_rate <= 1 : self_rate = 1 - grid_rate
 #
 # ``grid_rate`` counts **everything that left through the meter**, so the
@@ -153,14 +148,12 @@ def s(field: str, default: Any = None) -> Callable[[dict], Any]:
 # can miss the part consumed directly, and the reported production can lag.  A
 # unit with no third-party input has both at 0 and the total is just its own
 # production, so the same formula serves both hardware variants.
-THIRD_PARTY_PV_FLOWS: Final = ("tp2b", "tp2g", "tp2kl", "tp2loss")
-# The PV side's own edges.  Since §45 was extended the production side is split
-# across **two** groups: the edges into battery / grid / unknown load stayed in
-# ``pv_prod``, while the two that reach the newly separated sinks - ``e2kl``
-# (known load) and ``e2loss`` (loss) - are published under ``load_cons``.  A sum
-# over "everything the PV side produced" therefore has to look in both, which is
-# what :func:`_flows_sum` is for.
-PV_OWN_FLOWS: Final = ("e2b", "e2g", "e2l", "e2kl", "e2loss")
+THIRD_PARTY_PV_FLOWS: Final = ("tp2b", "tp2g")
+# The PV side's own edges, as the documented document carries them.  A later
+# firmware revision added two more edges per side (``e2kl`` / ``e2loss`` and
+# their third-party twins) that split the house into three sinks; the diagrams
+# draw one load node, so those are ignored on purpose - see ``const.py``.
+PV_OWN_FLOWS: Final = ("e2l", "e2b", "e2g")
 
 
 def _sankey_groups(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -323,11 +316,6 @@ def self_consumption(
             float(pv.get("e2b") or 0)
             + float(pv.get("tp2b") or 0)
             + float(pv.get("e2l") or 0)
-            # The two edges into the separated sinks are "kept" as well: they
-            # did not leave through the meter, which is what this branch
-            # measures.  Leaving them out would under-report by exactly the
-            # loss the extended §45 started publishing.
-            + _flows_sum(flows, ("e2kl", "e2loss"))
             + pv2_to_load
         )
         self_rate = consumed / total
@@ -1472,24 +1460,15 @@ class HoymilesEnergyFlowSensor(
     def native_value(self) -> int | None:
         """Today's total consumption in Wh.
 
-        The device splits the house into three sinks, and all three are energy
-        that was consumed: the load it could meter (``*kl``), the loss it could
-        not put to use (``*loss``) and the remainder it inferred (``efpv`` /
-        ``efb`` / ``efg``).  Adding only the last group - which is what the card
-        did before §45 grew the other two - reported a number that kept dropping
-        relative to the vendor app as soon as a unit started metering its EPS
-        outlet or a smart plug.
+        The three ``load_cons`` edges are the whole house in the documented
+        document: PV to load (``efpv``), battery to load (``efb``) and grid to
+        load (``efg``).  Energy that went into the battery is not counted here -
+        it is not consumed until it comes back out.
         """
         if not isinstance(self.coordinator.data.get(SRC_SANKEY), dict):
             return None
         load = self._flows["load_cons"]
-        return (
-            load["efpv"]
-            + load["efb"]
-            + load["efg"]
-            + sum(load[field] for field in SANKEY_LOAD_KNOWN)
-            + sum(load[field] for field in SANKEY_LOAD_LOSS)
-        )
+        return load["efpv"] + load["efb"] + load["efg"]
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -1497,41 +1476,17 @@ class HoymilesEnergyFlowSensor(
         pv = flows["pv_prod"]
         load = flows["load_cons"]
 
-        # The three sinks of the house.  The card draws one node for each, so the
-        # sums live here rather than being recomputed in JavaScript from four
-        # attributes apiece.
-        unknown_load = load["efpv"] + load["efb"] + load["efg"]
-        known_load = sum(load[field] for field in SANKEY_LOAD_KNOWN)
-        loss_load = sum(load[field] for field in SANKEY_LOAD_LOSS)
-
         attributes: dict[str, Any] = {
             **{f"pv_{key}": value for key, value in pv.items()},
             **{f"load_{key}": value for key, value in load.items()},
             # Totals the diagram needs and a template would otherwise recompute.
-            # ``pv_production`` is the unit's own PV side: the three edges that
-            # stayed in ``pv_prod`` plus the two that now reach the known-load and
-            # loss sinks (they were published under ``load_cons``).
-            "pv_production": pv["e2l"]
-            + pv["e2b"]
-            + pv["e2g"]
-            + load["e2kl"]
-            + load["e2loss"],
-            "third_party_production": pv["tp2b"]
-            + pv["tp2g"]
-            + load["tp2kl"]
-            + load["tp2loss"],
-            "unknown_load": unknown_load,
-            "known_load": known_load,
-            "loss_load": loss_load,
-            # Total consumption: what the house and the conversion lost.
-            "consumption": unknown_load + known_load + loss_load,
-            "grid_import": load["efg"]
-            + load["g2b"]
-            + load["g2kl"]
-            + load["g2loss"],
+            "pv_production": pv["e2l"] + pv["e2b"] + pv["e2g"],
+            "third_party_production": pv["tp2b"] + pv["tp2g"],
+            "consumption": load["efpv"] + load["efb"] + load["efg"],
+            "grid_import": load["efg"] + load["g2b"],
             "grid_export": pv["e2g"] + pv["b2g"] + pv["tp2g"],
             "battery_in": pv["e2b"] + pv["tp2b"] + load["g2b"],
-            "battery_out": pv["b2g"] + load["efb"] + load["b2kl"] + load["b2loss"],
+            "battery_out": pv["b2g"] + load["efb"],
         }
         # The day's PV production and self-consumption, per the vendor rule (see
         # ``self_consumption``).  Exposed here rather than derived in a card
