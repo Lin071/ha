@@ -6566,15 +6566,28 @@ function _hmControlRegister() {
               + "eng_out / eng_in 是虚拟电表上报的累计读数。每次通过校验的更新都会立即"
               + "下发给设备并持续重发，因此外部电表不必自己顶着 1 分钟的租约。",
             )}</div>
+            <div class="vm-sub">${this._t(
+              "Send the key in an X-Hoymiles-Key header (or as ?key=). Tap the "
+              + "key or the curl line to select all of it.",
+              "密钥放在 X-Hoymiles-Key 请求头里（也可以写成 ?key=）。"
+              + "点一下密钥或命令行会全选，方便手动复制。",
+            )}</div>
             <code class="vm-url">POST ${info.url}</code>
             <div class="vm-row">
-              <code class="vm-key">${info.header}: ${info.key}</code>
-              <button class="btn small" @click=${() => this._copyVm()}>${this._t("Copy", "复制")}</button>
+              <code class="vm-key" title=${this._t("Click to select all", "点击全选")}
+                @click=${this._selectAll}>${info.header}: ${info.key}</code>
+              <button class="btn small"
+                @click=${() => this._copyKey()}>${this._t("Copy key", "复制密钥")}</button>
               <button class="btn small danger"
                 @click=${() => this._rotateVm()}>${this._t("New key", "换新密钥")}</button>
             </div>
             <div class="vm-range">${range}</div>
-            <pre>${info.example_curl}</pre>
+            <div class="vm-row">
+              <span class="vm-sub" style="margin:0">${this._t("curl", "命令行示例")}</span>
+              <button class="btn small"
+                @click=${() => this._copyCurl()}>${this._t("Copy curl", "复制 curl")}</button>
+            </div>
+            <pre @click=${this._selectAll}>${info.example_curl}</pre>
           </div>
         </details>`;
     }
@@ -6611,18 +6624,85 @@ function _hmControlRegister() {
       if (this.isConnected) this.requestUpdate();
     }
 
-    async _copyVm() {
+    /**
+     * Copy text, falling back to the old `execCommand` path.
+     *
+     * `navigator.clipboard` **does not exist** unless the page is a secure
+     * context, and this integration is normally opened over plain HTTP on the
+     * LAN (`http://192.168.31.99:8123`), so the modern API throws instead of
+     * copying.  The hidden-textarea fallback is therefore the path that
+     * actually runs; it is deprecated but every current browser still supports
+     * it outside a secure context.
+     *
+     * Returns whether anything was actually copied, so the caller can show the
+     * value instead of lying with a "copied" toast.
+     */
+    async _copyText(text, okMessage) {
+      if (!text) return false;
+      if (navigator.clipboard && window.isSecureContext) {
+        try {
+          await navigator.clipboard.writeText(text);
+          this._showToast(okMessage);
+          return true;
+        } catch (err) {
+          /* Denied permission (or no user gesture): fall through. */
+        }
+      }
+      try {
+        const area = document.createElement("textarea");
+        area.value = text;
+        area.setAttribute("readonly", "");
+        area.style.cssText = "position:fixed;top:-1000px;left:-1000px;opacity:0;";
+        document.body.appendChild(area);
+        area.select();
+        area.setSelectionRange(0, text.length);
+        const done = document.execCommand("copy");
+        document.body.removeChild(area);
+        if (done) {
+          this._showToast(okMessage);
+          return true;
+        }
+      } catch (err) {
+        /* Nothing else to try. */
+      }
+      return false;
+    }
+
+    /** Select the whole text of the element that was clicked. */
+    _selectAll(event) {
+      const node = event && event.currentTarget;
+      if (!node) return;
+      try {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+      } catch (err) {
+        /* Selection is a convenience; never break the card over it. */
+      }
+    }
+
+    async _copyKey() {
       const info = this._vmInfo;
       if (!info) return;
-      try {
-        await navigator.clipboard.writeText(info.example_curl);
-        this._showToast(this._t("curl command copied.", "已复制 curl 命令。"));
-      } catch (err) {
-        /* Clipboard access needs a secure context (HTTPS or localhost). Plain
-           HTTP on the LAN refuses, so fall back to showing the text rather than
-           pretending the copy worked. */
-        this._showToast(info.example_curl, true);
-      }
+      const done = await this._copyText(
+        info.key,
+        this._t("Key copied.", "已复制密钥。"),
+      );
+      /* No clipboard at all: show the key on its own so it can be typed or
+         selected by hand, instead of a toast that claims it worked. */
+      if (!done) this._showToast(info.key, true);
+    }
+
+    async _copyCurl() {
+      const info = this._vmInfo;
+      if (!info) return;
+      const done = await this._copyText(
+        info.example_curl,
+        this._t("curl command copied.", "已复制 curl 命令。"),
+      );
+      if (!done) this._showToast(info.example_curl, true);
     }
 
     async _rotateVm() {
