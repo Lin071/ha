@@ -157,6 +157,21 @@ function _hmControlRegister() {
     "s": "s",
     "Send all": "Alle senden",
     "Takes about a minute": "Dauert etwa eine Minute",
+    "Open the off-grid relay?": "Off-Grid-Relais \u00f6ffnen?",
+    ["Once opened, the relay stays locked for a while before it accepts "
+      + "`close` again: about 10 minutes the first time, and 10 minutes "
+      + "longer each further time (20, 30\u2026). The off-grid port has no "
+      + "output during that wait."]:
+      "Nach dem \u00d6ffnen bleibt das Relais eine Weile gesperrt, bevor es "
+      + "`close` wieder annimmt: beim ersten Mal etwa 10 Minuten, und jedes "
+      + "weitere Mal 10 Minuten l\u00e4nger (20, 30\u2026). Der Inselausgang "
+      + "hat in dieser Zeit keine Ausgabe.",
+    "Got it": "Verstanden",
+    "Cancelled - the relay stays closed.": "Abgebrochen - das Relais bleibt geschlossen.",
+    ["The relay is now locked - it will accept close again in about "
+      + "10 minutes at the earliest."]:
+      "Das Relais ist jetzt gesperrt und nimmt fr\u00fchestens in etwa "
+      + "10 Minuten wieder `close` an.",
   };
 
   /** Map any Home Assistant language tag to one of the three card languages. */
@@ -6310,9 +6325,17 @@ function _hmControlRegister() {
           key: "eps_relay",
           subEn: "on = relay closed, port live",
           subZh: "开启 = 端口有输出",
+          /* Opening it costs a lock-out, so that direction is questioned; closing
+             it is the way back and stays one click. */
+          guard: () => this._confirmRelayOpen(),
           /* §41 wants the strings `close` / `open`, not a boolean. */
           write: (on) => this._writeFine(
             "eps_relay", on ? "close" : "open", "Off-grid relay", "离网继电器",
+            on ? "" : this._t(
+              "The relay is now locked - it will accept close again in about "
+              + "10 minutes at the earliest.",
+              "继电器已锁定，最早约 10 分钟后才会接受重新吸合。",
+            ),
           ),
         }));
       }
@@ -6329,7 +6352,7 @@ function _hmControlRegister() {
     }
 
     /** One tile of the §42 switch row: icon, name, rule and the switch. */
-    _fineSwitchTile({ icon, en, zh, key, subEn, subZh, write }) {
+    _fineSwitchTile({ icon, en, zh, key, subEn, subZh, write, guard }) {
       const state = this._state(key, "switch");
       const on = !!state && String(state.state) === "on";
       return html`
@@ -6338,8 +6361,59 @@ function _hmControlRegister() {
           <span class="ft">${this._t(en, zh)}</span>
           <span class="fss">${this._t(subEn, subZh)}</span>
           <ha-switch .checked=${on}
-            @change=${(e) => write(e.target.checked)}></ha-switch>
+            @change=${async (event) => {
+              /* The switch on screen already moved by the time this runs, so a
+                 declined question has to put the knob back by hand - otherwise
+                 the tile would claim a state the device never got. */
+              const knob = event.currentTarget;
+              const next = knob.checked === true;
+              if (guard && !next && on) {
+                const ok = await guard();
+                if (!ok) {
+                  knob.checked = on;
+                  return;
+                }
+              }
+              write(next);
+            }}></ha-switch>
         </div>`;
+    }
+
+    /**
+     * Ask before opening the off-grid relay (§42).
+     *
+     * The firmware locks the relay after it opens: it refuses `close` for a
+     * while, and every further open during the day adds another step to that
+     * wait. Nothing in `fine_ctrl` reports the lock or how long is left (the
+     * group describes `eps_relay` and nothing else), so the card cannot count
+     * down - it can only warn, which is exactly what the question is for.
+     * Worded as a rule rather than a number: a guessed "20 min" would be wrong
+     * the moment somebody opens the relay from the app instead.
+     */
+    async _confirmRelayOpen() {
+      const ok = await this._askConfirm({
+        title: this._t(
+          "Open the off-grid relay?", "断开离网继电器？",
+        ),
+        message: this._t(
+          "Once opened, the relay stays locked for a while before it accepts "
+          + "`close` again: about 10 minutes the first time, and 10 minutes "
+          + "longer each further time (20, 30…). The off-grid port has no "
+          + "output during that wait.",
+          "断开后，继电器会锁定一段时间才接受重新吸合：第一次约 10 分钟，"
+          + "之后每再断开一次就再加 10 分钟（20 分钟、30 分钟…）。"
+          + "锁定期间离网端口没有输出。",
+        ),
+        confirmText: this._t("Got it", "知道了"),
+        cancelText: this._t("Cancel", "取消"),
+      });
+      if (!ok) {
+        this._showToast(this._t(
+          "Cancelled - the relay stays closed.",
+          "已取消，继电器保持吸合。",
+        ));
+      }
+      return ok;
     }
 
     /** §11 / §12: the virtual meter power setpoint (object payload, one field). */
@@ -6844,7 +6918,7 @@ function _hmControlRegister() {
      * where the click was made, not in a toast that disappears before the
      * device has even acknowledged the command.
      */
-    _writeFine(field, value, en, zh) {
+    _writeFine(field, value, en, zh, note) {
       const label = this._t(en, zh);
       const on = value === true || value === "close";
       const show = this._t(on ? "on" : "off", on ? "开启" : "关闭");
@@ -6858,10 +6932,12 @@ function _hmControlRegister() {
              by the next tick - the forbid flag would silently switch itself off. */
           await this._sendFineField(field, value, label, { silent: true });
           this._busySet(0, "done");
-          this._busyDone(this._t(
-            `${label}: ${show} sent. The switch follows what the device reports.`,
-            `${label}：已下发 ${show}。开关状态以设备回报为准。`,
-          ));
+          this._busyDone(
+            this._t(
+              `${label}: ${show} sent. The switch follows what the device reports.`,
+              `${label}：已下发 ${show}。开关状态以设备回报为准。`,
+            ) + (note ? " " + note : ""),
+          );
         },
       });
     }
