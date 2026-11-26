@@ -243,6 +243,108 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._sankey_cached_at: datetime | None = None
         # ``{YYYY-MM-DD: {"payload", "saved_at", "flags"}}``, local dates.
         self._sankey_days: dict[str, dict[str, Any]] = {}
+        # ``{YYYY-MM-DD: {area: {field: number}}}`` - the value each
+        # "today" counter had when Home Assistant first saw it that day, so the
+        # entities can report a difference instead of a raw cumulative.
+        #
+        # The device means these numbers to be daily totals and clears them at
+        # 00:00, which makes "the number itself" the natural answer - and is why
+        # this was never needed before.  A unit that came back from a bench test
+        # with 82 kWh already in its PV / third-party counters shows why the
+        # raw value cannot be trusted: the same document reported 82.6 kWh of
+        # export while the unit's own grid meter had counted 19 Wh for the day.
+        # Keeping a zero point turns a counter that was never cleared into the
+        # difference since it was first seen, which is the same thing on a unit
+        # that does clear it (its first reading of the day is ~0).
+        self._day_zero: dict[str, dict[str, dict[str, float]]] = {}
+        self._day_zero_dirty = False
+
+    # ------------------------------------------------------------------
+    # cumulative "today" counters
+    # ------------------------------------------------------------------
+    def _today_zero_point(self) -> dict[str, dict[str, float]]:
+        """Today's zero point, created on first use and pruned with the archive."""
+        day = dt_util.now().date().isoformat()
+        basis = self._day_zero.get(day)
+        if isinstance(basis, dict):
+            return basis
+        basis = {}
+        self._day_zero[day] = basis
+        for expired in sorted(self._day_zero)[:-SANKEY_HISTORY_DAYS]:
+            self._day_zero.pop(expired, None)
+        self._day_zero_dirty = True
+        return basis
+
+    def _net_counter(self, area: str, field: str, value: Any) -> int | None:
+        """``value`` as a difference from today's zero point.
+
+        A counter that goes **backwards** was cleared by the device (a reboot, or
+        a firmware that does clear it at midnight while this run already recorded
+        a zero point): the reading itself is then the new baseline and the
+        answer is 0, so the next report is a correct difference again instead of
+        a negative one clamped to zero for the rest of the day.
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        amount = float(value)
+        today = self._today_zero_point()
+        area_basis = today.get(area)
+        if not isinstance(area_basis, dict):
+            area_basis = {}
+            today[area] = area_basis
+        base = area_basis.get(field)
+        if not isinstance(base, (int, float)) or amount < base:
+            area_basis[field] = amount
+            self._day_zero_dirty = True
+            base = amount
+        return int(max(0.0, amount - float(base)))
+
+    def _schedule_day_zero_save(self) -> None:
+        """Persist the zero point, at most once per message."""
+        if not self._day_zero_dirty:
+            return
+        self._day_zero_dirty = False
+        self.hass.async_create_task(self._async_write_sankey_store())
+
+    def _net_sankey(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Subtract today's zero point from one ``sankey/state`` document."""
+        out: dict[str, Any] = {}
+        for group, values in payload.items():
+            if not isinstance(values, dict):
+                out[group] = values
+                continue
+            out[group] = {
+                field: (
+                    value
+                    if (net := self._net_counter(group, field, value)) is None
+                    else net
+                )
+                for field, value in values.items()
+            }
+        self._schedule_day_zero_save()
+        return out
+
+    def _net_system(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Same for the day counters in ``system/state``.
+
+        Only ``pv_e`` / ``pv2_e`` are touched: they are the two the dashboard
+        reads as "PV today", they are cumulative, and - on a unit whose counters
+        were never cleared - they carry the same wrong number as the sankey.
+        Everything else on that topic is a live reading, not a total.
+        """
+        out = dict(payload)
+        changed = False
+        for field in ("pv_e", "pv2_e"):
+            if field not in payload:
+                continue
+            net = self._net_counter("system", field, payload[field])
+            if net is None:
+                continue
+            out[field] = net
+            changed = True
+        if changed:
+            self._schedule_day_zero_save()
+        return out
 
     # ------------------------------------------------------------------
     # availability
@@ -994,6 +1096,21 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             cached = None
         if isinstance(cached, dict):
             self._sankey_days = self._decode_sankey_days(cached)
+            zero = cached.get("zero")
+            if isinstance(zero, dict):
+                self._day_zero = {
+                    str(day): {
+                        str(area): {
+                            str(field): float(value)
+                            for field, value in values.items()
+                            if isinstance(value, (int, float))
+                        }
+                        for area, values in areas.items()
+                        if isinstance(values, dict)
+                    }
+                    for day, areas in zero.items()
+                    if isinstance(areas, dict)
+                }
             flags = cached.get("flags")
             if isinstance(flags, dict):
                 self._last_flags = {
@@ -1130,6 +1247,9 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "payload": payload if isinstance(payload, dict) else {},
                 "saved_at": saved_at,
                 "days": self._sankey_days,
+                # The zero point of every cumulative reading, so a restart in the
+                # middle of the day does not take today's numbers back to zero.
+                "zero": self._day_zero,
                 # Which optional hardware this unit has, as last reported.  The
                 # diagrams read it back through `_event_flag` while the device is
                 # silent, so an offline unit keeps the nodes it really has.
@@ -1686,6 +1806,15 @@ decisive.
             # themselves to unavailable in the same pass.
             if key in (SRC_EVENT, SRC_SYSTEM):
                 self._note_role(payload, key)
+
+            # Two topics carry cumulative "today" counters; both are published
+            # as differences from today's zero point so a counter the device
+            # never cleared cannot fill the dashboard with a bench-test number
+            # (see ``_today_zero_point``).
+            if key == SRC_SANKEY:
+                payload = self._net_sankey(payload)
+            elif key == SRC_SYSTEM:
+                payload = self._net_system(payload)
 
             data = dict(self.data)
             data[key] = payload
