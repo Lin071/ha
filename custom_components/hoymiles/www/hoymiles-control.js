@@ -4726,6 +4726,14 @@ function _hmControlRegister() {
               "当前设备已离线，待设备恢复在线后可继续下发控制。",
             )}</span>
           </div>` : ""}
+          ${this._capsBlank() ? html`<div class="offline-note">
+            <span class="oi">${this._icon("faders", 16)}</span>
+            <span>${this._t(
+              "The device announced a new profile, so the old controls were "
+              + "cleared. Waiting for it to publish the controls it supports now.",
+              "设备已重新上报能力，旧的控制项已清空，正在等待它发布当前支持的控制项。",
+            )}</span>
+          </div>` : ""}
           <div class="board">
             ${this._powerCard()}
             ${this._socCard()}
@@ -5915,6 +5923,11 @@ function _hmControlRegister() {
     }
 
     /* -------------------------- V0.6.2 rows -------------------------- */
+
+    /** True while the device has described itself but nothing is claimed yet. */
+    _capsBlank() {
+      return !!this._caps && this._caps.keys.size === 0;
+    }
 
     /**
      * True when this unit announced that capability.

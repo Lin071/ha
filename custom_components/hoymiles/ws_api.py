@@ -145,7 +145,7 @@ def ws_device_info(
         # when its capability is in here: the entities themselves outlive a role
         # change (nothing deletes them), so "does the entity exist" kept showing
         # cards the device had stopped accepting commands for.
-        "caps": sorted(patcher.capabilities) if patcher is not None else [],
+        "caps": sorted(patcher.card_capabilities) if patcher is not None else [],
         "caps_epoch": patcher.capability_epoch if patcher is not None else 0,
         "caps_ready": patcher.capability_ready if patcher is not None else False,
     })

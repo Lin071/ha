@@ -76,7 +76,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Callable
+from typing import Any, Callable, Final
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
@@ -128,6 +128,15 @@ PatchFn = Callable[[str, dict[str, Any]], bool]
 #
 # Keys are the discovery object name, e.g. ``fan_mode``.
 CapabilityListener = Callable[[frozenset[str]], None]
+
+# The device and the discovery payloads spell the same capability differently:
+# ``supported_topics`` calls the on/off control ``switch_ctrl``, while a four
+# level discovery topic (``switch/<dev_id>/config``) carries no object id at all
+# and is recorded as ``switch``.  Both have to answer to one name, or a card
+# would hide itself although the unit listed the feature.
+CAP_ALIAS: Final = {
+    "switch_ctrl": "switch",
+}
 
 # Discovery objects whose firmware entity is replaced by integration entities.
 #
@@ -420,9 +429,13 @@ class FirmwareDiscoveryPatcher:
         # "claim" while it is being applied).  Used to avoid re-applying the
         # same value on every single discovery message.
         self._model: str | None = None
-        # Optional discovery objects this device announced, see the note above
-        # ``SUPERSEDED_DISCOVERY_OBJECTS``.
+        # Everything this device ever announced, never wiped: the entity
+        # platforms read it to decide which entities to create, and a platform
+        # cannot take an entity back.
         self._capabilities: set[str] = set()
+        # What the Control page may draw.  Wiped whenever the unit describes a
+        # new profile - see ``_forget_capabilities``.
+        self._card_caps: set[str] = set()
         self._capability_listeners: list[CapabilityListener] = []
         # Bumped whenever the list changes, so a card can tell "still the same"
         # from "this was rebuilt just now".
@@ -473,6 +486,18 @@ class FirmwareDiscoveryPatcher:
         """Has the unit described itself yet (``attributes`` received)?"""
         return self._capability_ready
 
+    @property
+    def card_capabilities(self) -> frozenset[str]:
+        """What the Control page may draw.
+
+        Before the unit has described itself the union is the answer, so a device
+        that has been quiet since Home Assistant started keeps its cards.  After
+        that this is the list the wipe/rebuild cycle maintains.
+        """
+        if self._capability_ready:
+            return frozenset(self._card_caps)
+        return frozenset(self._capabilities)
+
     @callback
     def async_add_capability_listener(self, listener: CapabilityListener) -> Callable[[], None]:
         """Call ``listener`` with the full set whenever a new object appears.
@@ -498,10 +523,6 @@ class FirmwareDiscoveryPatcher:
         Deleted (superseded / legacy) objects never reach here, because they are
         handled before the capability bookkeeping.
         """
-        if self._live_only and retained:
-            # The unit has described itself and this payload is broker history
-            # from an earlier profile - see ``_live_only``.
-            return
         parts = path.split("/")
         if len(parts) < 2:
             return
@@ -511,14 +532,31 @@ class FirmwareDiscoveryPatcher:
             # id - the component itself is the feature, and ``switch`` is what
             # the card checks to decide whether the on/off tile exists.
             name = parts[0]
-        self._note_capability(name)
+        self._note_capability(name, retained)
 
     @callback
-    def _note_capability(self, name: str) -> None:
-        """Add one capability and hand the new snapshot to the listeners."""
-        if not name or name in self._capabilities:
+    def _note_capability(self, name: str, retained: bool = False) -> None:
+        """Add one capability; ``retained`` decides whether the card sees it.
+
+        ``_capabilities`` is the union of everything ever announced and is never
+        wiped - the entity platforms read it to decide which entities to create,
+        and a platform cannot take an entity back.  ``_card_caps`` is what the
+        Control page may draw; it is wiped whenever the unit describes a new
+        profile, and after that only a **fresh** publication may refill it.
+        """
+        if not name:
             return
-        self._capabilities.add(name)
+        changed = False
+        if name not in self._capabilities:
+            self._capabilities.add(name)
+            changed = True
+        if not (self._live_only and retained) and name not in self._card_caps:
+            # A retained payload read after the wipe is history from the profile
+            # the unit just left - see ``_live_only``.
+            self._card_caps.add(name)
+            changed = True
+        if not changed:
+            return
         self._capability_epoch += 1
         snapshot = frozenset(self._capabilities)
         for listener in list(self._capability_listeners):
@@ -526,45 +564,42 @@ class FirmwareDiscoveryPatcher:
 
     @callback
     def _forget_capabilities(self) -> None:
-        """Wipe the whole list: the unit is about to describe a new profile.
+        """Wipe what the Control page may draw.
 
-        Everything is dropped and **only live publications** may rebuild it.  The
-        two copies of the list matter here:
-
-          * the card follows the list, so it loses every card at once and only
-            gets back the ones the unit announces again;
-          * the entity platforms also follow it, so an entity whose ``meta`` the
-            unit never republishes is simply not created for this profile.
+        Only ``_card_caps`` is dropped: the entity platforms keep the union they
+        already used, because everything they created stays created.  After this
+        the list is refilled from the unit's own ``supported_topics`` map and
+        from the messages it publishes next, never from what the broker kept.
         """
         self._live_only = True
+        self._card_caps.clear()
         self._capability_epoch += 1
-        changed = bool(self._capabilities)
-        self._capabilities.clear()
-        if not changed:
-            return
-        empty = frozenset()
-        for listener in list(self._capability_listeners):
-            listener(empty)
 
     @callback
     def _on_attributes_message(self, msg: Any) -> None:
-        """The unit described itself: wipe, then wait for it to speak again.
+        """The unit described itself: wipe the Control page, then rebuild.
 
-        Two things happen here and nothing else:
+        This is the moment to forget everything: the message says "this is what
+        I am right now", so every card the page drew before it describes the
+        profile the unit just left.  Two things rebuild the list afterwards and
+        nothing else does:
 
-          * a **profile change** - the first message ever seen, or a
-            ``supported_topics`` key set that differs from the previous one -
-            wipes the capability list.  A unit that switches protocol or role
-            republishes this topic with a different map, and everything learned
-            before it describes the profile it just left;
-          * a repeat of the same map changes nothing, because this topic is
-            retained and republished, and wiping on every repeat would make the
-            Control page blink.
+          * the ``supported_topics`` map in this very message - the vendor's own
+            inventory.  It is the only place a few controls are ever named:
+            ``ems_mode``, ``switch_ctrl``, ``reboot``, ``power_ctrl``,
+            ``meter_ctrl`` and the TOU topics are never republished as a live
+            discovery config, so a live-only rebuild would hide their cards on a
+            unit that still accepts them;
+          * every config / ``meta`` the unit publishes from now on (``retain``
+            cleared).  This is where the fan, heater, fine-control, virtual
+            meter and the three limit groups come from - none of them appears in
+            the map, not even on a unit that has all of them.
 
-        After the wipe the list is rebuilt only from what the unit publishes
-        from then on (e.g. it republishes ``reboot/config`` when the new profile
-        still accepts a reboot), so what the page shows is the new profile and
-        not a merge of both.
+        A repeat of the same map does **not** wipe.  Measured on MSA-280519991122
+        and MSA-280520261113: the topic is re-announced every ~14 s for ever, and
+        each announcement is followed by only six configs and three ``meta``
+        groups - so wiping on every copy would blank half the page twelve times a
+        minute.
         """
         text = mqtt_util.payload_to_text(msg.payload)
         if text is None:
@@ -579,20 +614,26 @@ class FirmwareDiscoveryPatcher:
         if not isinstance(topics, dict) or not topics:
             return
 
-        keys = frozenset(str(key) for key in topics)
+        names = {CAP_ALIAS.get(str(key), str(key)) for key in topics}
+        desc = payload.get("entity_desc")
+        if isinstance(desc, dict):
+            names.update(CAP_ALIAS.get(str(key), str(key)) for key in desc)
+
         previous = self._attributes
-        self._attributes = keys
+        self._attributes = frozenset(names)
         self._capability_ready = True
-        if previous == keys:
+        if previous == self._attributes and self._live_only:
             return
 
         _LOGGER.info(
-            "Capabilities of %s wiped: the unit described a new profile (%d topics: %s)",
+            "Capabilities of %s rebuilt from attributes (%d): %s",
             self.dev_id,
-            len(keys),
-            ", ".join(sorted(keys)),
+            len(names),
+            ", ".join(sorted(names)),
         )
         self._forget_capabilities()
+        for name in sorted(names):
+            self._note_capability(name)
 
     @callback
     def _on_group_meta_message(self, msg: Any) -> None:
@@ -608,11 +649,9 @@ class FirmwareDiscoveryPatcher:
         """
         if not msg.payload:
             return
-        if self._live_only and getattr(msg, "retain", False):
-            return
         parts = msg.topic.split("/")
         if len(parts) >= 4:
-            self._note_capability(parts[-2])
+            self._note_capability(parts[-2], bool(getattr(msg, "retain", False)))
 
     async def async_setup(self) -> None:
         """Subscribe to the discovery topics of this device.
