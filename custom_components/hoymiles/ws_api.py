@@ -60,6 +60,17 @@ def _coordinator(hass: HomeAssistant, dev_id: str) -> HoymilesCoordinator | None
     return None
 
 
+@callback
+def _patcher(hass: HomeAssistant, dev_id: str) -> Any | None:
+    """Find the discovery patcher of one device - it owns the capability list."""
+    for value in hass.data.get(DOMAIN, {}).values():
+        if not isinstance(value, dict):
+            continue
+        if value.get("dev_id") == dev_id:
+            return value.get("patcher")
+    return None
+
+
 @websocket_api.websocket_command({
     vol.Required("type"): "hoymiles/sankey/history",
     vol.Required("dev_id"): str,
@@ -114,6 +125,7 @@ def ws_device_info(
     for a device that has been switched off for days.
     """
     coordinator = _coordinator(hass, msg["dev_id"])
+    patcher = _patcher(hass, msg["dev_id"])
     if coordinator is None:
         connection.send_result(msg["id"], {
             "dev_id": msg["dev_id"],
@@ -129,6 +141,13 @@ def ws_device_info(
         "has_meter": coordinator.has_meter,
         "has_pv2": coordinator.has_pv2,
         "has_plug": coordinator.has_plug,
+        # What this unit says it can control.  The Control page draws a card only
+        # when its capability is in here: the entities themselves outlive a role
+        # change (nothing deletes them), so "does the entity exist" kept showing
+        # cards the device had stopped accepting commands for.
+        "caps": sorted(patcher.capabilities) if patcher is not None else [],
+        "caps_epoch": patcher.capability_epoch if patcher is not None else 0,
+        "caps_ready": patcher.capability_ready if patcher is not None else False,
     })
 
 

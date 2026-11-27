@@ -90,7 +90,6 @@ from .const import (
     PV_POWER_MAX,
     PV_POWER_MIN,
     ROLE_ANY,
-    ROLE_MASTER_ONLY,
     ROLE_MASTER_SINGLE,
     ROLE_MULTIPHASE_MASTER,
     SRC_FAN_META,
@@ -629,18 +628,17 @@ class HoymilesNumber(
 
         §23/§24 (per phase output ceiling), §27/§28 (per phase input limit) and
         §31/§32 (per phase house input limit) are 仅多相主机.  §11/§12 (virtual
-        meter) and §25/§26 (input ceiling) are 主机和单机.  §29/§30 (feed-in
-        limit, a ``meta`` group since V0.6.7) is **仅主机**.  Everything else
-        this platform owns - fan (§37/§38), heater (§39/§40), fine control
-        (§13/§14) - is 不限.
+        meter), §25/§26 (input ceiling) and §29/§30 (feed-in limit, a ``meta``
+        group since V0.6.7) are 主机和单机 - V0.6.7 dropped the 仅主机 wording
+        §29/§30 carried in V0.6.6, so a stand-alone unit gets the group too.
+        Everything else this platform owns - fan (§37/§38), heater (§39/§40),
+        fine control (§13/§14) - is 不限.
         """
         group = self.entity_description.group
         if group in ("phase", "phase_input", "phase_house_in"):
             return ROLE_MULTIPHASE_MASTER
-        if group == "meter":
+        if group in ("meter", "feed"):
             return ROLE_MASTER_SINGLE
-        if group == "feed":
-            return ROLE_MASTER_ONLY
         return ROLE_ANY
 
     # --- heater: the same number means watts or degrees -------------------

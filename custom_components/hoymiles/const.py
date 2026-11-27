@@ -123,6 +123,18 @@ T_PHASE_HOUSE_IN_SET: Final = "homeassistant/number/{dev_id}/phase_house_in_powe
 T_FEED_POWER_META: Final = "homeassistant/{dev_id}/feed_power/meta"
 T_FEED_POWER_SET: Final = "homeassistant/number/{dev_id}/feed_power/set"
 
+# The device's own inventory of what it can control.  One retained JSON object
+# with a ``supported_topics`` map that lists every control topic the unit really
+# implements, plus ``entity_desc``.  The firmware republishes it whenever the
+# role changes, which makes it the one reliable "forget the old list" signal:
+# a config that arrived before the role changed describes the old role.
+T_ATTRIBUTES: Final = "homeassistant/sensor/{dev_id}/attributes"
+
+# Every optional control group that is described by a ``meta`` topic rather than
+# by its own discovery config (see the note above ``T_FAN_META``).  The group
+# name is the middle segment, which is also the capability name.
+T_GROUP_META: Final = "homeassistant/{dev_id}/{group}/meta"
+
 # The device announces which optional controls it has by publishing a discovery
 # config for them (protocol §33, §35, §37, §39, §41, §43).  The set of config
 # topics that actually arrived is therefore the capability list, and unlike a
@@ -384,30 +396,45 @@ EMS_MODES: Final = [
     EMS_MODE_METER,
 ]
 
-# What a **slave** may select.  V0.6.6 opened §7/§8 itself to 角色: 不限 (so the
-# picker is offered to every unit), but the two modes a slave can legitimately
-# run are still the two whose *set topics* are not tied to the system level: it
-# regulates on its own (`general`, the default) or it follows the device level
-# precise control block (`fine_ctrl`, §13/§14).  `mqtt_ctrl` (§9/§10),
-# `tou_plan` (§15-§20) and `meter_ctrl` (§11/§12) all write system level
-# setpoints that belong to the master, so a slave is never offered them.
+# Which role each mode is shown for.
 #
-# §7 also narrows the list by **hardware**: when a `HiFlow` / `HiFlow Pro` is
-# part of the system only `general` / `tou_plan` / `meter_ctrl` are supported
-# (`mqtt_ctrl` and `fine_ctrl` are not).  Those units are served by the separate
-# `hoymiles_g2` integration, so no filter is applied here.
-EMS_MODES_SLAVE: Final = (EMS_MODE_GENERAL, EMS_MODE_FINE_CTRL)
+# The protocol text (§7) lists a fixed five option set and adds a supporting note
+# per option; on top of that the **product rule** decided here is:
+#
+#   general     every role
+#   mqtt_ctrl   master, single      (§9/§10 是 主机和单机)
+#   fine_ctrl   **single only**     (§13/§14 精准控制按产品定义只在单机开放)
+#   tou_plan    master, single      (§15-§20 是 主机和单机)
+#   meter_ctrl  master, single      (§11/§12 是 主机和单机)
+#
+# `fine_ctrl` is the exception to the 角色: 不限 line of §13/§14: the precise
+# control block is a single-unit feature, so it is not offered on a master
+# (where the system level modes own the setpoints) nor on a slave.
+#
+# This table is only about what the **UI offers** (and what the service
+# validates).  The retained discovery payload keeps the protocol's five options
+# - see ``discovery_override.FirmwareDiscoveryPatcher._apply_role_filters``.
+EMS_MODES_SLAVE: Final = (EMS_MODE_GENERAL,)
+
+# The option tuple an **earlier build** wrote into the retained payload for a
+# slave.  Its only remaining use is recognising that shortened list so it can be
+# restored to the protocol's five (the firmware publishes discovery once, on
+# connect, so nothing else would ever put the missing modes back).
+EMS_MODES_LEGACY_SLAVE: Final = (EMS_MODE_GENERAL, EMS_MODE_FINE_CTRL)
 
 
 def ems_modes_for_role(role: str | None) -> tuple[str, ...]:
     """The EMS modes a unit with this role may select.
 
     ``None`` (nothing heard yet) allows everything: a restart must not blank the
-    picker before the retained state event lands.
+    picker before the retained state event lands.  The table itself sits further
+    down, next to the ``ROLE_*`` constants it is keyed by.
     """
-    if role == ROLE_SLAVE:
-        return EMS_MODES_SLAVE
-    return tuple(EMS_MODES)
+    if role is None:
+        return tuple(EMS_MODES)
+    return EMS_MODES_BY_ROLE.get(role, tuple(EMS_MODES))
+
+
 # The two modes whose setpoints are a lease: they must be refreshed at least
 # once a minute or the device falls back to self-consumption (§14, §42).
 EMS_MODES_LEASE: Final = (EMS_MODE_MQTT_CTRL, EMS_MODE_FINE_CTRL)
@@ -415,23 +442,24 @@ EMS_MODES_LEASE: Final = (EMS_MODE_MQTT_CTRL, EMS_MODE_FINE_CTRL)
 # ---------------------------------------------------------------------------
 # Device role (§32 ``role``) and the scopes the document allows
 # ---------------------------------------------------------------------------
-# Every topic carries a 角色 line.  Four values appear (V0.6.6 adds the last):
+# Every topic carries a 角色 line.  Three values appear in V0.6.7:
 #
 #   · 角色: 不限                -> ROLE_ANY
 #   · 角色: 主机和单机          -> ROLE_MASTER_SINGLE   (a **slave** has none of it)
 #   · 角色: 仅多相主机          -> ROLE_MULTIPHASE_MASTER
-#   · 角色: 仅主机              -> ROLE_MASTER_ONLY     (a single unit has none of it)
+#
+# V0.6.6 also had 「仅主机」; V0.6.7 promoted the only two topics that carried it
+# (§29/§30 feed-in) to 主机和单机, so ROLE_MASTER_ONLY is now unused.
 #
 # A slave therefore has no system level power control (§9/§10), no virtual meter
 # (§11/§12), no TOU plan (§15-§20), no output / input / per-phase ceiling
-# (§21-§32) and no ``system/state`` (§45) of its own - those all belong to the
+# (§21/§32) and no ``system/state`` (§45) of its own - those all belong to the
 # master and are published on the master's topics.
 #
-# V0.6.6 moved the EMS mode picker (§7/§8) from 主机和单机 to **不限**; what a
-# unit may actually *run* is unchanged - ``mqtt_ctrl`` / ``fine_ctrl`` /
-# ``meter_ctrl`` are still 主机和单机 for the setpoint they write, which is why
-# the picker's options are filtered per role instead of the whole select being
-# unavailable (see ``EMS_MODES_SLAVE``).
+# §7/§8 (the EMS mode picker) are 角色: 不限, and `mqtt_ctrl` / `tou_plan` /
+# `meter_ctrl` are 主机和单机; on top of that `fine_ctrl` is a **single-unit**
+# feature by product definition.  A slave is therefore offered `general` only.
+# See ``EMS_MODES_BY_ROLE``.
 #
 # The role is reported in ``event/state`` (retained), so it is known within a
 # second of start-up.  ``None`` (nothing heard yet) deliberately allows
@@ -441,6 +469,22 @@ ROLE_SINGLE: Final = "single"
 ROLE_MASTER: Final = "master"
 ROLE_SLAVE: Final = "slave"
 
+# The EMS mode set per role (see the table above ``EMS_MODES_SLAVE``):
+#
+#   master       general, mqtt_ctrl, tou_plan, meter_ctrl   (fine_ctrl is 单机)
+#   single       every mode - the only role that gets `fine_ctrl`
+#   slave        general
+EMS_MODES_BY_ROLE: Final = {
+    ROLE_MASTER: (
+        EMS_MODE_GENERAL,
+        EMS_MODE_MQTT_CTRL,
+        EMS_MODE_TOU,
+        EMS_MODE_METER,
+    ),
+    ROLE_SINGLE: tuple(EMS_MODES),
+    ROLE_SLAVE: EMS_MODES_SLAVE,
+}
+
 ROLE_ANY: Final = "any"
 ROLE_MASTER_SINGLE: Final = "master_single"
 ROLE_MULTIPHASE_MASTER: Final = "multiphase_master"
@@ -448,9 +492,12 @@ ROLE_MASTER_ONLY: Final = "master_only"
 
 # Human readable reason, used by the entities and the cards.
 ROLE_SCOPE_LABEL: Final = {
-    ROLE_MASTER_SINGLE: "主机和单机",  # §9-§12, §15-§22, §25, §26, §45
+    ROLE_MASTER_SINGLE: "主机和单机",  # §9-§12, §15-§22, §25, §26, §29, §30, §45
     ROLE_MULTIPHASE_MASTER: "仅多相主机",  # §23, §24, §27, §28, §31, §32
-    ROLE_MASTER_ONLY: "仅主机",  # §29, §30
+    # V0.6.7 has no 仅主机 topic left: §29/§30 moved from 仅主机 to 主机和单机.
+    # The scope is kept because `discovery_override` and the coordinator still
+    # understand it, but nothing is gated on it.
+    ROLE_MASTER_ONLY: "仅主机",
 }
 
 # ---------------------------------------------------------------------------
@@ -482,10 +529,9 @@ FIRMWARE_ROLE_GATED: Final = {
     # group now, created by number.py / switch.py), so it is no longer gated
     # here.  A retained config from an older firmware is deleted instead - see
     # ``discovery_override.SUPERSEDED_DISCOVERY_OBJECTS``.
-    # §7 / §8 the EMS mode picker is **not** gated as a whole: V0.6.6 defines it
-    # as 角色: 不限, and a slave still selects `general` / `fine_ctrl`, so only
-    # its *options* are narrowed (see `EMS_MODES_SLAVE` and
-    # `discovery_override._patch_ems_mode`).
+    # §7 / §8 the EMS mode picker is **not** gated as a whole: the select stays
+    # available and only its *options* are narrowed by role (see
+    # ``EMS_MODES_BY_ROLE`` and `discovery_override._patch_ems_mode`).
 }
 
 # ---------------------------------------------------------------------------

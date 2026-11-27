@@ -214,6 +214,27 @@ function _hmPowerFlowRegister() {
    * ------------------------------------------------------------------ */
   const VB_W = 700;
   const VB_H = 470;
+
+  /* What "the device is offline" is decided from.
+
+     **Any one** of these carrying a reading proves the unit is talking:
+     `quick/state` updates soc / pv_power / battery_status every second, while
+     `device/state` (rssi, battery_temperature) and `system/state` (system_*)
+     arrive every five minutes.  The old rule let the *first existing* entity
+     decide, so one `unknown` entity (a role gated sensor on a slave, or a stale
+     duplicate discovery on the same SN) froze the whole diagram while the unit
+     kept reporting.  Silence has to be collective. */
+  const OFFLINE_PROBES = [
+    "soc",
+    "pv_power",
+    "battery_status",
+    "battery_temperature",
+    "rssi",
+    "system_pv_power",
+    "system_soc",
+    "grid_on_power",
+  ];
+  const OFFLINE_AFTER_MS = 150000;
   /* W; below this a branch is drawn as idle.  1 W, not 5: a smart plug with
      something on standby really does report ~2 W, and at the old threshold
      that live branch was drawn grey and without a streak - it looked like a
@@ -1254,10 +1275,21 @@ function _hmPowerFlowRegister() {
       const hass = this._hass;
       if (!hass || !hass.states) return null;
 
-      const cached = this._cache.get(cacheKey);
-      if (cached && hass.states[cached]) return cached;
-
       const dev = slug(this._dev());
+      const own = `${domain}.${dev}`;
+      const cached = this._cache.get(cacheKey);
+      if (cached && hass.states[cached]) {
+        /* Never let a match on a **neighbouring** prefix stick: the same numeric
+           SN can appear under two prefixes (a stale duplicate discovery payload
+           beside the live one), and this card may render before the live one
+           arrives. */
+        if (cached.startsWith(own)
+          || !Object.keys(hass.states).some((id) => id.startsWith(own))) {
+          return cached;
+        }
+        this._cache.delete(cacheKey);
+      }
+
       const conventional = `${domain}.${dev}_${suffix}`;
       let found = hass.states[conventional] ? conventional : null;
 
@@ -1543,14 +1575,22 @@ function _hmPowerFlowRegister() {
      */
     _offline() {
       if (!this._hass) return false;
-      for (const suffix of ["soc", "system_pv_power", "pv_power", "energy_flow_today"]) {
+      const now = Date.now();
+      let seen = 0;
+      for (const suffix of OFFLINE_PROBES) {
         const entityId = this._resolveEntity(suffix);
         if (!entityId) continue;
         const state = (this._hass.states || {})[entityId];
         if (!state) continue;
-        return state.state === "unavailable" || state.state === "unknown";
+        seen += 1;
+        const value = String(state.state);
+        if (value !== "" && value !== "unknown" && value !== "unavailable") {
+          return false;
+        }
+        const stamp = Date.parse(state.last_reported || state.last_updated || "");
+        if (Number.isFinite(stamp) && now - stamp <= OFFLINE_AFTER_MS) return false;
       }
-      return false;
+      return seen > 0;
     }
 
     /** The title block (heading + device id) can be hidden with `show_title`.

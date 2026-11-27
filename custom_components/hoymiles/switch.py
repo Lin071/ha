@@ -31,7 +31,7 @@ from .const import (
     DOMAIN,
     MANUFACTURER,
     ROLE_ANY,
-    ROLE_MASTER_ONLY,
+    ROLE_MASTER_SINGLE,
     ROLE_MULTIPHASE_MASTER,
     SRC_FEED_META,
     SRC_FINE_META,
@@ -209,15 +209,16 @@ class HoymilesSwitch(CoordinatorEntity[HoymilesCoordinator], SwitchEntity):
     def _role_scope(self) -> str:
         """The 角色 line of the topic this switch writes.
 
-        §13/§14 (fine control) are 角色: 不限; §29/§30 (feed-in) are **仅主机**;
-        §31/§32 (per phase house input) are **仅多相主机**.  The entity is created
-        from the meta topic the device only publishes for a role that may use it,
-        but the role can change while the entry stays loaded, so the gate is
-        checked here as well.
+        §13/§14 (fine control) are 角色: 不限; §29/§30 (feed-in) are 主机和单机 in
+        V0.6.7 (the 仅主机 wording of V0.6.6 is gone, so a stand-alone unit may
+        use the group as well); §31/§32 (per phase house input) are
+        **仅多相主机**.  The entity is created from the meta topic the device only
+        publishes for a role that may use it, but the role can change while the
+        entry stays loaded, so the gate is checked here as well.
         """
         kind = self.entity_description.kind
         if kind == "feed":
-            return ROLE_MASTER_ONLY
+            return ROLE_MASTER_SINGLE
         if kind == "house":
             return ROLE_MULTIPHASE_MASTER
         return ROLE_ANY

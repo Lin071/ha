@@ -204,6 +204,28 @@ function _hmBatteryRegister() {
   const VB_W = 620;
   const PACK_MAX = 4;
 
+  /* What "the device is offline" is decided from.
+
+     **Any one** of these carrying a reading proves the unit is talking:
+     `quick/state` updates soc / pv_power / battery_status every second, while
+     `device/state` (rssi, battery_temperature) and `system/state` (system_*)
+     arrive every five minutes.  The old rule let the *first existing* entity
+     decide, so one `unknown` / `unavailable` entity - a role gated sensor on a
+     slave, or a stale duplicate discovery payload an older firmware left on the
+     same SN - greyed out a perfectly healthy unit.  Silence has to be
+     collective. */
+  const OFFLINE_PROBES = [
+    "soc",
+    "pv_power",
+    "battery_status",
+    "battery_temperature",
+    "rssi",
+    "system_pv_power",
+    "system_soc",
+    "grid_on_power",
+  ];
+  const OFFLINE_AFTER_MS = 150000;
+
   /* Entity ids the firmware names differently from the protocol field.
    *
    * `bat_p` (§43) is published with the name "Battery Power" by the newer
@@ -1560,6 +1582,22 @@ function _hmBatteryRegister() {
            head band states the fact instead of just losing its signal meter. */
         .hsig.off .hsig-v { color: var(--error-color, #db4437);
                             font-weight: 600; }
+        /* Device role (section 46 "role", the value the latest state event
+           carries).  A small tinted pill to the left of the signal meter: it
+           answers "what is this unit in the system" before the reader has to
+           work it out from which tabs and controls exist.  Colour carries the
+           meaning as well as the word, so the three roles stay distinguishable
+           at a glance. */
+        .hrole { display: inline-flex; align-items: center; justify-content: center;
+                 height: 20px; padding: 0 8px; border-radius: 10px;
+                 font-size: 11.5px; font-weight: 600; white-space: nowrap;
+                 border: 1px solid transparent; }
+        .hrole.master { color: #1d4ed8; background: rgba(37, 99, 235, 0.12);
+                        border-color: rgba(37, 99, 235, 0.34); }
+        .hrole.single { color: #15803d; background: rgba(22, 163, 74, 0.13);
+                        border-color: rgba(22, 163, 74, 0.34); }
+        .hrole.slave { color: #b45309; background: rgba(245, 158, 11, 0.15);
+                       border-color: rgba(245, 158, 11, 0.36); }
         .wrap { display: flex; justify-content: center;
                 /* max_width caps the illustration, and the dashboard column is
                    usually wider than that - without auto margins the leftover
@@ -1895,10 +1933,21 @@ function _hmBatteryRegister() {
       if (!hass || !hass.states) return null;
 
       const cacheKey = `${domain}:${suffix}`;
-      const cached = this._cache.get(cacheKey);
-      if (cached && hass.states[cached]) return cached;
-
       const dev = slug(this._dev());
+      const own = `${domain}.${dev}`;
+      const cached = this._cache.get(cacheKey);
+      if (cached && hass.states[cached]) {
+        /* Never let a match on a **neighbouring** prefix stick: the same numeric
+           SN can appear under two prefixes (a stale duplicate discovery payload
+           beside the live one), and this card may render before the live one
+           arrives. */
+        if (cached.startsWith(own)
+          || !Object.keys(hass.states).some((id) => id.startsWith(own))) {
+          return cached;
+        }
+        this._cache.delete(cacheKey);
+      }
+
       const conventional = `${domain}.${dev}_${suffix}`;
       let found = hass.states[conventional] ? conventional : null;
 
@@ -2002,22 +2051,31 @@ function _hmBatteryRegister() {
     /**
      * Is the device itself offline?
      *
-     * Same rule as the control card: the integration marks the fast topics'
-     * entities `unavailable` once nothing has arrived for a minute, and a fresh
-     * Home Assistant shows `unknown` until the first payload lands.  The first
-     * entity that exists decides - a *missing* entity (older firmware) is not
-     * an offline device.
+     * **Any single live reading wins** (same rule as the control and power-flow
+     * cards): `quick/state` arrives every second, `device/state` and
+     * `system/state` every five minutes, so one recent value from any of them
+     * proves the unit is talking.  Only when none of them has a reading and none
+     * reported within the tolerance is it called offline; a unit with none of
+     * these entities at all is never accused.
      */
     _deviceOffline() {
       if (!this._hass) return false;
-      for (const suffix of ["soc", "system_pv_power", "pv_power", "battery_status"]) {
+      const now = Date.now();
+      let seen = 0;
+      for (const suffix of OFFLINE_PROBES) {
         const entityId = this._resolveEntity(suffix, "sensor");
         if (!entityId) continue;
         const state = (this._hass.states || {})[entityId];
         if (!state) continue;
-        return state.state === "unavailable" || state.state === "unknown";
+        seen += 1;
+        const value = String(state.state);
+        if (value !== "" && value !== "unknown" && value !== "unavailable") {
+          return false;
+        }
+        const stamp = Date.parse(state.last_reported || state.last_updated || "");
+        if (Number.isFinite(stamp) && now - stamp <= OFFLINE_AFTER_MS) return false;
       }
-      return false;
+      return seen > 0;
     }
 
     /* ---------------------------- the data ---------------------------- */
@@ -2144,7 +2202,7 @@ function _hmBatteryRegister() {
             ${this._showTitle()
               ? html`<div class="htitle">${esc(this._title())}</div>`
               : html`<div class="htitle"></div>`}
-            <div class="hstat">${this._untrusted(this._signal())}</div>
+            <div class="hstat">${this._untrusted(this._roleBadge())}${this._untrusted(this._signal())}</div>
           </div>
           <div class="wrap" style=${this._wrapStyle()}>
             ${this._untrusted(this._svg({
@@ -2217,6 +2275,38 @@ function _hmBatteryRegister() {
         + `<circle cx="11" cy="11" r="8.6" fill="none" stroke="#2f9e63" stroke-width="2"/>`
         + `<path d="M7 11.3 9.9 14.2 15.1 8.3" fill="none" stroke="#2f9e63"`
         + ` stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    }
+
+    /**
+     * The role this unit plays in the system, from the latest state event
+     * (§46 `role`): `master`, `single` or `slave`.
+     *
+     * It is read from the integration's own `device_role` sensor rather than
+     * from the retained payload directly, so it follows the same path as every
+     * other reading: the device pushes the event, the coordinator parses it and
+     * the entity carries the newest value.  An empty string means "not reported
+     * yet" and the badge is simply not drawn.
+     */
+    _role() {
+      const state = this._stateOf("device_role", "sensor");
+      return state ? String(state.state) : "";
+    }
+
+    /** The role pill, as markup (injected through `_untrusted`). */
+    _roleBadge() {
+      const spec = {
+        master: { en: "Master", zh: "主机", cls: "master" },
+        single: { en: "Single", zh: "单机", cls: "single" },
+        slave: { en: "Slave", zh: "从机", cls: "slave" },
+      }[this._role()];
+      if (!spec) return "";
+
+      const label = esc(this._t(spec.en, spec.zh));
+      const title = esc(this._t(
+        `Device role: ${spec.en} - as reported by the latest state event.`,
+        `设备角色：${spec.zh}（来自最新状态事件）。`,
+      ));
+      return `<span class="hrole ${spec.cls}" title="${title}">${label}</span>`;
     }
 
     /**

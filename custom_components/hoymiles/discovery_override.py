@@ -85,6 +85,8 @@ from . import mqtt_util
 from .const import (
     DISCOVERY_PREFIX,
     DOMAIN,
+    EMS_MODES,
+    EMS_MODES_LEGACY_SLAVE,
     FIRMWARE_DISCOVERY_TOPICS,
     FIRMWARE_ROLE_GATED,
     LEGACY_DISCOVERY_OBJECTS,
@@ -93,13 +95,14 @@ from .const import (
     ROLE_MASTER_ONLY,
     ROLE_MASTER_SINGLE,
     ROLE_MULTIPHASE_MASTER,
+    T_ATTRIBUTES,
     T_AVAILABILITY,
     T_EMS_MODE_STATE,
+    T_GROUP_META,
     T_MASTER_AVAILABILITY,
     T_PHASE_AVAILABILITY,
     T_ROLE_AVAILABILITY,
     T_SWITCH_SET,
-    ems_modes_for_role,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -186,27 +189,6 @@ def _patch_ems_mode(dev_id: str, payload: dict[str, Any]) -> bool:
         return False
 
     payload["state_topic"] = T_EMS_MODE_STATE.format(dev_id=dev_id)
-    return True
-
-
-def _filter_ems_options(payload: dict[str, Any], allowed: tuple[str, ...],
-                        full: list[str]) -> bool:
-    """Narrow the EMS picker to the modes this role may select.
-
-    ``full`` is the option list the firmware published before any filtering, so
-    leaving ``slave`` restores every mode instead of only re-adding the ones the
-    previous pass kept.
-    """
-    options = payload.get("options")
-    if not isinstance(options, list) or not options:
-        return False
-
-    source = full or [str(option) for option in options]
-    wanted = [option for option in source if option in allowed]
-    if not wanted or wanted == options:
-        return False
-
-    payload["options"] = wanted
     return True
 
 
@@ -442,18 +424,26 @@ class FirmwareDiscoveryPatcher:
         # ``SUPERSEDED_DISCOVERY_OBJECTS``.
         self._capabilities: set[str] = set()
         self._capability_listeners: list[CapabilityListener] = []
+        # Bumped every time the device re-announces its role, so a card can tell
+        # "still the same list" from "the list was rebuilt just now".
+        self._capability_epoch = 0
+        # ``True`` once the unit has told us what it can control at all.  Until
+        # then an empty set means "not known yet", never "nothing supported".
+        self._capability_ready = False
+        # The ``supported_topics`` map of the last ``attributes`` payload, used to
+        # recognise a role change.  ``None`` before the first one.
+        self._attributes: dict[str, Any] | None = None
+        # One resubscribe at a time, so a burst of ``attributes`` messages does
+        # not restart the discovery watch over and over.
+        self._refreshing = False
         # The role the device reports (§32 ``role``), set by the coordinator.
         # ``None`` leaves every role dependent choice wide open, which is the safe
         # direction right after a restart.
         self._role: str | None = None
-        # The last payload this class published for each managed topic, so a role
-        # change can re-run the role filters without waiting for the firmware to
-        # republish its config.
+        # The last payload this class published for each managed topic, so a stale
+        # role narrowed EMS option list can be repaired without waiting for the
+        # firmware to republish its config.
         self._payloads: dict[str, dict[str, Any]] = {}
-        # The EMS option list **before** any role filtering.  Filtering is
-        # lossy, so it has to be applied to the original list every time - a
-        # slave that is promoted again must get all five modes back.
-        self._ems_options_full: list[str] = []
 
     # ------------------------------------------------------------------
     # capabilities
@@ -462,6 +452,16 @@ class FirmwareDiscoveryPatcher:
     def capabilities(self) -> frozenset[str]:
         """Discovery objects this device announced (``fan_mode``, ...)."""
         return frozenset(self._capabilities)
+
+    @property
+    def capability_epoch(self) -> int:
+        """How often the capability list was rebuilt from scratch."""
+        return self._capability_epoch
+
+    @property
+    def capability_ready(self) -> bool:
+        """Has the unit described itself yet (``attributes`` received)?"""
+        return self._capability_ready
 
     @callback
     def async_add_capability_listener(self, listener: CapabilityListener) -> Callable[[], None]:
@@ -489,15 +489,101 @@ class FirmwareDiscoveryPatcher:
         handled before the capability bookkeeping.
         """
         parts = path.split("/")
-        if len(parts) < 3:
+        if len(parts) < 2:
             return
         name = parts[-1]
-        if name in self._capabilities:
+        if name == self.dev_id:
+            # A four level topic (``switch/<dev_id>/config``) carries no object
+            # id - the component itself is the feature, and ``switch`` is what
+            # the card checks to decide whether the on/off tile exists.
+            name = parts[0]
+        self._note_capability(name)
+
+    @callback
+    def _note_capability(self, name: str) -> None:
+        """Add one capability and hand the new snapshot to the listeners."""
+        if not name or name in self._capabilities:
             return
         self._capabilities.add(name)
         snapshot = frozenset(self._capabilities)
         for listener in list(self._capability_listeners):
             listener(snapshot)
+
+    @callback
+    def _forget_capabilities(self) -> None:
+        """Drop everything learned so far and tell the listeners.
+
+        The device re-announces its whole feature set right after a role change,
+        and the configs that are still on the broker describe the role it had
+        *before* that change.  Without this reset a unit that stopped being a
+        master kept its power ceiling card - and the topics behind it no longer
+        accept anything.
+        """
+        self._capability_epoch += 1
+        if not self._capabilities:
+            return
+        self._capabilities.clear()
+        empty = frozenset()
+        for listener in list(self._capability_listeners):
+            listener(empty)
+
+    @callback
+    def _on_attributes_message(self, msg: Any) -> None:
+        """The unit described itself: a changed list means the role changed.
+
+        Deliberately *not* a reset on every message.  The payload is retained and
+        republished periodically, and a unit that keeps the same capabilities
+        would otherwise blink its whole Control page on every repeat.  A genuine
+        role change alters ``supported_topics``, and that is what is compared.
+        """
+        text = mqtt_util.payload_to_text(msg.payload)
+        if text is None:
+            return
+        try:
+            payload = json.loads(text)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        topics = payload.get("supported_topics")
+        if not isinstance(topics, dict) or not topics:
+            return
+
+        previous = self._attributes
+        self._attributes = topics
+        self._capability_ready = True
+        if previous is not None and set(previous) != set(topics):
+            # The ``supported_topics`` map is by itself proof of what exists: it
+            # is the firmware's own answer, and it is already ordered correctly
+            # for a role, unlike the retained configs the broker replays.
+            self._forget_capabilities()
+            for name in topics:
+                self._note_capability(str(name))
+            _LOGGER.debug(
+                "Capabilities of %s reset from attributes: %s",
+                self.dev_id,
+                sorted(self._capabilities),
+            )
+            # The retained configs on the broker are the *previous* role's, so the
+            # list cannot be rebuilt from them without asking for them again.
+            # Unsubscribe + subscribe makes the broker replay every retained
+            # payload, which is also the moment the patched EMS options and the
+            # role narrowed sections get rebuilt.
+            self.hass.async_create_task(self._async_refresh_discovery())
+
+    @callback
+    def _on_group_meta_message(self, msg: Any) -> None:
+        """A ``meta`` group arrived: that group exists on this unit.
+
+        These groups have no discovery config of their own - `number.py` creates
+        the entities from the description - so they would otherwise be missing
+        from the capability list and every card that depends on them would hide.
+        """
+        if not msg.payload:
+            return
+        parts = msg.topic.split("/")
+        if len(parts) >= 4:
+            self._note_capability(parts[-2])
 
     async def async_setup(self) -> None:
         """Subscribe to the discovery topics of this device.
@@ -517,6 +603,33 @@ class FirmwareDiscoveryPatcher:
             )
             self._unsubs.append(unsub)
             _LOGGER.debug("Watching firmware discovery topics on %s", topic)
+
+        # The unit's own statement of what it can control, and the ``meta``
+        # groups that have no discovery config of their own.  Both are retained,
+        # so this also works when Home Assistant starts long after the device.
+        extra = (
+            (T_ATTRIBUTES.format(dev_id=self.dev_id), self._on_attributes_message),
+            (T_GROUP_META.format(dev_id=self.dev_id, group="+"), self._on_group_meta_message),
+        )
+        for topic, handler in extra:
+            unsub = await mqtt_util.mqtt.async_subscribe(self.hass, topic, handler, 1)
+            self._unsubs.append(unsub)
+            _LOGGER.debug("Watching capability topics on %s", topic)
+
+    async def _async_refresh_discovery(self) -> None:
+        """Replay every retained payload after the device changed its role."""
+        if self._refreshing:
+            return
+        self._refreshing = True
+        try:
+            # Slightly later: the firmware sends ``attributes`` first and its
+            # configs right after, so resubscribing too early would race its own
+            # republish and leave half the list in place.
+            await asyncio.sleep(2)
+            self.async_shutdown()
+            await self.async_setup()
+        finally:
+            self._refreshing = False
 
     @callback
     def async_shutdown(self) -> None:
@@ -578,8 +691,8 @@ class FirmwareDiscoveryPatcher:
         # stand-alone unit.  Adding the role topic as a second availability
         # entry is what turns them off on a slave.
         changed = _patch_role_availability(self.dev_id, path, payload) or changed
-        # The EMS picker stays available on a slave; its *options* are narrowed
-        # to the modes that role may actually select.
+        # The EMS picker is not role gated in either direction (§7/§8 are 角色:
+        # 不限): this only repairs an option list a previous build narrowed.
         changed = self._apply_role_filters(path, payload) or changed
 
         # Remember what this build would publish, so a later role change can
@@ -598,12 +711,13 @@ class FirmwareDiscoveryPatcher:
     # ------------------------------------------------------------------
     @callback
     def set_role(self, role: str | None) -> None:
-        """Re-apply the role filters to every payload we already know.
+        """Re-apply the payload repairs to every payload we already know.
 
         Called by the coordinator when ``event/state`` reports a new ``role``.
-        Without it the EMS option list would keep whatever it was when the config
-        payload first arrived - a unit promoted from ``slave`` to ``master``
-        would stay locked to two modes until the firmware republished.
+        The only role dependent rewrite left is the repair of a shortened EMS
+        option list, and it has to run here as well as on arrival: the retained
+        payload may have been stored by an older build before this process
+        started, and the firmware will not repeat it until it reconnects.
         """
         if self._role == role:
             return
@@ -621,19 +735,35 @@ class FirmwareDiscoveryPatcher:
             self.hass.async_create_task(self._async_republish(topic, rendered))
 
     def _apply_role_filters(self, path: str, payload: dict[str, Any]) -> bool:
-        """Apply the role rules that are not expressed as availability."""
+        """Repair a role-narrowed EMS option list an earlier build wrote.
+
+        V0.6.7 §7 publishes ``options`` as a fixed five (角色: 不限), and the
+        **role only decides which of them the UI offers** - see
+        ``EMS_MODES_BY_ROLE`` (in ``const.py``) and `_emsOptions()` in
+        ``hoymiles-control.js``.  The retained payload therefore has to keep all
+        five, or a unit that changes role never gets its modes back: the firmware
+        only publishes this discovery object on connect.
+
+        A previous build of this integration rewrote the payload to ``general`` /
+        ``fine_ctrl`` for a slave **and republished it retained**, which is why
+        the shortened list survived even after the firmware announced all five.
+        Recognising that exact legacy tuple (``EMS_MODES_LEGACY_SLAVE``) and
+        restoring the full list is the way out; every other list is left
+        untouched, which keeps a HiFlow system's three-option payload
+        (`general` / `tou_plan` / `meter_ctrl`) exactly as the device sent it.
+        """
         if path != f"select/{self.dev_id}/ems_mode":
             return False
 
         options = payload.get("options")
-        if isinstance(options, list):
-            # Keep the widest list ever seen: filtering is lossy, and a promoted
-            # unit has to get the modes back.
-            if len(options) > len(self._ems_options_full):
-                self._ems_options_full = [str(option) for option in options]
+        if not isinstance(options, list) or not options:
+            return False
 
-        allowed = ems_modes_for_role(self._role)
-        return _filter_ems_options(payload, allowed, self._ems_options_full)
+        if tuple(str(option) for option in options) != EMS_MODES_LEGACY_SLAVE:
+            return False
+
+        payload["options"] = list(EMS_MODES)
+        return True
 
     @callback
     def _maybe_backfill_model(self, payload: dict[str, Any]) -> None:

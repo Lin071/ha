@@ -448,6 +448,52 @@ function _hmControlRegister() {
   ];
   const PHASE_BAND = { lo: 100, hi: 2500 };
 
+  /* Which capability has to be present for one entity key to be drawn.
+   *
+   * The keys on the left are this card's own (mostly the integration's entity
+   * keys); the values on the right are what the device announced - either a
+   * discovery object name or a ``meta`` group name (see the backend's
+   * `discovery_override.py`).  A key that is missing here is not gated at all.
+   *
+   * This is deliberately a table rather than "does the entity exist": the
+   * entities outlive a role change (nothing deletes them), so existence kept
+   * drawing a card for a capability the device had already dropped - the fan
+   * card staying on an MS-A2 that had just been turned into a slave, for
+   * instance.
+   */
+  const CAP_OF_KEY = {
+    /* §35 - §38, described only by `fan/meta` */
+    fan_mode: "fan",
+    pcs_fan_speed: "fan",
+    /* §39 - §41, described only by `heat/meta` */
+    heat_param: "heat",
+    heat_mode: "heat",
+    /* §42, described only by `fine_ctrl/meta` */
+    eps_relay: "fine_ctrl",
+    charge_forbid: "fine_ctrl",
+    discharge_forbid: "fine_ctrl",
+    pv_power_limit: "fine_ctrl",
+    /* §33 - §36, two scalar discovery objects */
+    charge_soc_limit: "soc_h_limit",
+    discharge_soc_limit: "soc_l_limit",
+    /* §21 - §30 */
+    output_power: "output_power",
+    input_power: "input_power",
+    feed_power: "feed_power",
+    feed_power_enable: "feed_power",
+    /* §23/§24 per-phase output, §27/§28 per-phase input, §31/§32 house input */
+    phase_a_output_power: "phase_output_power",
+    phase_b_output_power: "phase_output_power",
+    phase_c_output_power: "phase_output_power",
+    phase_a_input_limit: "phase_input_power",
+    phase_b_input_limit: "phase_input_power",
+    phase_c_input_limit: "phase_input_power",
+    house_a_input_limit: "phase_house_in_power",
+    house_b_input_limit: "phase_house_in_power",
+    house_c_input_limit: "phase_house_in_power",
+    house_input_enable: "phase_house_in_power",
+  };
+
   /* The two cut-offs are NOT the same band, and they are not the entity's band
    * either.
    *
@@ -627,6 +673,10 @@ function _hmControlRegister() {
   const REBOOT_TIMEOUT_MS = 60000;  // the whole wait, start to finish
   const REBOOT_GRACE_MS = 6000;     // pushes still in flight are not "it is back"
   const REBOOT_POLL_MS = 3000;      // how often the backend is asked
+  /* The capability list is rebuilt only when the device changes its role, so
+     asking the backend once every few seconds is plenty - and it has to be
+     re-read on a timer because nothing pushes it to the card. */
+  const CAPS_POLL_MS = 5000;
 
   /* What "the device is offline" is decided from.
 
@@ -1300,6 +1350,14 @@ function _hmControlRegister() {
       this._vmInfo = null;
       this._vmLoading = false;
       this._vmAt = 0;
+      /* What the device says it can control, as `{epoch, keys: Set}` - or null
+         while the backend has not reported a capability list yet, in which case
+         every card falls back to the old "does the entity exist" behaviour.
+         Re-read on a timer; a change bumps the epoch and re-renders. */
+      this._caps = null;
+      this._capsAt = 0;
+      this._capsBusy = false;
+      this._capsSig = "";
       /* Last EMS mode this card rendered. Drives the "left / re-entered MQTT
          control" reset - see `_watchEmsMode`. */
       this._lastEmsMode = undefined;
@@ -2362,6 +2420,9 @@ function _hmControlRegister() {
       }
       this._reconcileSwitch();
       this._reconcileEmsMode();
+      /* Which optional cards this unit may show. Throttled inside, so this is
+         not one WebSocket round trip per state push. */
+      this._syncCaps();
       this.requestUpdate();
     }
 
@@ -4770,11 +4831,25 @@ function _hmControlRegister() {
 
     /** Power on/off and the reboot command: both take the unit up or down. */
     _powerCard() {
+      /* Two independent capabilities behind one card: a unit can accept a reboot
+         and no on/off command (the HiFlow models do exactly that). Either one
+         alone still deserves the card; neither means no card at all, which is
+         what a card full of dead buttons looked like. */
+      const rows = [];
+      /* Two names for the same thing: the discovery object is the four level
+         ``switch/<dev_id>`` (capability ``switch``), while the device's own
+         ``supported_topics`` map calls it ``switch_ctrl``. A list seeded from
+         `attributes` carries the second, a replayed config the first. */
+      if (this._capOk("switch") || this._capOk("switch_ctrl")) {
+        rows.push(this._switchRow());
+      }
+      if (this._capOk("reboot")) rows.push(this._rebootRow());
+      if (!rows.length) return "";
       return this._card({
         icon: this._icon("bolt"),
         title: this._t("Power", "电源"),
         cls: "power",
-        rows: [this._switchRow(), this._rebootRow()],
+        rows,
       });
     }
 
@@ -5837,6 +5912,69 @@ function _hmControlRegister() {
 
     /* -------------------------- V0.6.2 rows -------------------------- */
 
+    /**
+     * True when this unit announced that capability.
+     *
+     * `this._caps === null` means "not known yet" and answers `true` on purpose:
+     * a card that has never heard from the backend has to keep working exactly
+     * as it did before, and a control the user cannot reach is worse than one
+     * that is offered but rejected.
+     */
+    _capOk(cap) {
+      if (!cap) return true;
+      if (!this._caps) return true;
+      return this._caps.keys.has(cap);
+    }
+
+    /**
+     * Ask the backend what this device can control.
+     *
+     * The list is built in `discovery_override.py` from every discovery object
+     * and every `meta` group the unit announces, and it is **cleared** when the
+     * unit republishes `attributes` with a different role - the configs that
+     * arrived before that describe the old role. Nothing pushes the result to
+     * the card, so it is polled; slowly, because it changes once per role.
+     */
+    async _syncCaps() {
+      if (!this._hass || typeof this._hass.callWS !== "function") return;
+      if (this._capsBusy) return;
+      const now = Date.now();
+      if (this._capsAt && now - this._capsAt < CAPS_POLL_MS) return;
+      this._capsAt = now;
+      this._capsBusy = true;
+      try {
+        const out = await this._hass.callWS({
+          type: "hoymiles/device/info",
+          dev_id: this._dev(),
+        });
+        if (!this.isConnected) return;
+        const keys = Array.isArray(out && out.caps) ? out.caps : null;
+        /* `caps_ready` is the device having described itself at all. Before
+           that, an empty list means "nothing known", never "nothing there" -
+           and an empty list *after* that is a device whose retained configs are
+           gone (a unit that has been offline for days), where showing nothing
+           would hide controls that still work. */
+        const ready = !!out && out.known === true && out.caps_ready === true
+          && keys !== null && keys.length > 0;
+        const epoch = Number(out && out.caps_epoch) || 0;
+        this._caps = ready && keys ? { epoch, keys: new Set(keys) } : null;
+        const sig = this._caps
+          ? epoch + ":" + Array.from(this._caps.keys).sort().join(",")
+          : "";
+        if (sig !== this._capsSig) {
+          this._capsSig = sig;
+          /* Every `_has()` call reads this list, so a rebuilt list has to
+             re-render: the state push that asked for it rendered against the
+             previous one. */
+          this.requestUpdate();
+        }
+      } catch (err) {
+        /* An older backend has no `caps`: keep falling back to existence. */
+      } finally {
+        this._capsBusy = false;
+      }
+    }
+
     /** True when this device publishes the entity behind a protocol key.
      *
      * **Strict on purpose.**  `_resolve` ends with a "there is only one entity
@@ -5845,8 +5983,13 @@ function _hmControlRegister() {
      * `select` is the EMS mode answered "yes" to `fan_mode` and grew a fan card
      * it cannot drive (an MS-A2).  A capability is only claimed when an entity
      * really carries this key.
+     *
+     * On top of that, a key with an entry in `CAP_OF_KEY` needs the device to
+     * have announced that capability - see the table's own note.
      */
     _has(key, domain = "number") {
+      const cap = CAP_OF_KEY[key];
+      if (cap && !this._capOk(cap)) return false;
       return this._resolve(key, domain, true) != null;
     }
 
