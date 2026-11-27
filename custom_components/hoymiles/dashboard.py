@@ -95,7 +95,12 @@ SHOW_SANKEY = True
 #     input of its own, so the PV curves, the PV-by-port chart and the PV-today
 #     tile are not generated for it, and the cards that draw the hardware are
 #     told `show_pv: false`.
-TEMPLATE_VERSION = 21
+# 22: the device view's SOC chart is the **packs only** again.  Version 17-19
+#     added this unit's own `soc` as a slate line so a lagging pack was visible;
+#     in practice it read as one more pack and made "which curve is a module?"
+#     ambiguous, so the pane drops it and is named after what it shows
+#     (各电池包电量).  The device total is still on the System page.
+TEMPLATE_VERSION = 22
 
 # Return values of ``async_create_device_dashboard``.
 RESULT_CREATED = "created"
@@ -267,12 +272,9 @@ COLOR_SOC = COLOR_BATTERY   # battery SOC uses the battery colour
 
 # Three SOC levels can be on screen at once - the system (every unit in
 # parallel), one device (its own packs summed) and each pack's own BMS reading.
-# They are the same quantity at three scopes, so only the *scope* colour differs:
-# the system keeps the battery green, a single device is drawn in slate (the same
-# neutral the integration uses for "a part, not a flow"), and the packs keep
-# their own palette below.  Grey for the device line also means it never competes
-# with pack 1, which is green as well.
-COLOR_DEVICE_SOC = "#94a3b8"
+# The device view shows only the packs now (version 22), so the two scopes that
+# are drawn get one colour each: the system keeps the battery green, the packs
+# keep their own palette below.
 
 # The device view splits what the system view folds together, so it needs two
 # more slots: the on-grid port in slate grey, the off-grid (EPS) port in the same
@@ -715,29 +717,15 @@ def build_dashboard_config(
             ),
             _section(
                 _history(
-                    "Device and pack SOC",
-                    "设备 / 各电池包电量",
+                    "Pack SOC",
+                    "各电池包电量",
                     [
-                        # The device total goes first and in slate: it is the
-                        # summary of the curves under it, not one of them.  A pack
-                        # that is far below it is the thing worth noticing, and
-                        # that is only visible when both are on one axis.
-                        #
-                        # `always` keeps it out of the pack count below: the pane
-                        # declares `count_entity: pack_count`, and a series that
-                        # merely describes the device must not be counted as one
-                        # of the packs - that mistake hid 电池 1 on a one-pack
-                        # unit.
-                        {
-                            **_series(
-                                _entity_id(dev_id, "soc"),
-                                "This device",
-                                "设备电量",
-                                COLOR_DEVICE_SOC,
-                                "Dieses Gerät",
-                            ),
-                            "always": True,
-                        },
+                        # Only the packs themselves: the device total is the
+                        # average of these curves, and a reader who wants it
+                        # finds it on the System page.  Leaving it in this pane
+                        # drew one line that was NOT a pack next to the ones that
+                        # are, which is why the pane is now named after what it
+                        # really shows.
                         *[
                             _series(
                                 _entity_id(dev_id, f"pack_{idx}_soc"),
@@ -749,7 +737,7 @@ def build_dashboard_config(
                             for idx, color in enumerate(COLOR_PACKS, start=1)
                         ],
                     ],
-                    "Geräte- und Modulstand",
+                    "Modulstand",
                     unit="%",
                     height=300,
                     symmetric=False,
