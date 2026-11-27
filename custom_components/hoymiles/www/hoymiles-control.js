@@ -676,7 +676,7 @@ function _hmControlRegister() {
   /* The capability list is rebuilt only when the device changes its role, so
      asking the backend once every few seconds is plenty - and it has to be
      re-read on a timer because nothing pushes it to the card. */
-  const CAPS_POLL_MS = 5000;
+  const CAPS_POLL_MS = 2500;
 
   /* What "the device is offline" is decided from.
 
@@ -4871,6 +4871,10 @@ function _hmControlRegister() {
      * the heater has a card of its own.
      */
     _modeCard(mode) {
+      /* §7/§8: the picker itself is a control (``select/<dev>/ems_mode``). A
+         unit that stopped announcing it - after a protocol or role change - has
+         no card here either, exactly like every other card. */
+      if (!this._capOk("ems_mode")) return "";
       const rows = [this._emsRow()];
 
       /* The picker only offers the modes §7 allows for this role, so the three
@@ -4890,7 +4894,7 @@ function _hmControlRegister() {
           "该模式属于系统级控制，请在主机上设置：本机为从机，没有对应的控制项。",
         )}</div>`);
       } else if (mode === "mqtt_ctrl") {
-        if (this._config.show_power_ctrl !== false) {
+        if (this._config.show_power_ctrl !== false && this._capOk("power_ctrl")) {
           rows.push(html`<div class="sep"></div>`);
           rows.push(this._powerCtrlRow());
         }
@@ -5949,15 +5953,16 @@ function _hmControlRegister() {
         });
         if (!this.isConnected) return;
         const keys = Array.isArray(out && out.caps) ? out.caps : null;
-        /* `caps_ready` is the device having described itself at all. Before
-           that, an empty list means "nothing known", never "nothing there" -
-           and an empty list *after* that is a device whose retained configs are
-           gone (a unit that has been offline for days), where showing nothing
-           would hide controls that still work. */
+        /* `caps_ready` is the device having described itself. From then on the
+           list is authoritative **including when it is empty**: the backend
+           wipes it the moment the unit announces a new profile, and only refills
+           it from the topics the unit publishes afterwards. So "empty" means
+           "nothing has been re-announced yet" - a state this page has to show,
+           not one it may paper over with the previous profile's cards. */
         const ready = !!out && out.known === true && out.caps_ready === true
-          && keys !== null && keys.length > 0;
+          && keys !== null;
         const epoch = Number(out && out.caps_epoch) || 0;
-        this._caps = ready && keys ? { epoch, keys: new Set(keys) } : null;
+        this._caps = ready ? { epoch, keys: new Set(keys) } : null;
         const sig = this._caps
           ? epoch + ":" + Array.from(this._caps.keys).sort().join(",")
           : "";

@@ -424,18 +424,28 @@ class FirmwareDiscoveryPatcher:
         # ``SUPERSEDED_DISCOVERY_OBJECTS``.
         self._capabilities: set[str] = set()
         self._capability_listeners: list[CapabilityListener] = []
-        # Bumped every time the device re-announces its role, so a card can tell
-        # "still the same list" from "the list was rebuilt just now".
+        # Bumped whenever the list changes, so a card can tell "still the same"
+        # from "this was rebuilt just now".
         self._capability_epoch = 0
         # ``True`` once the unit has told us what it can control at all.  Until
-        # then an empty set means "not known yet", never "nothing supported".
+        # then the list means "not known yet", never "nothing supported".
         self._capability_ready = False
         # The ``supported_topics`` map of the last ``attributes`` payload, used to
-        # recognise a role change.  ``None`` before the first one.
-        self._attributes: dict[str, Any] | None = None
-        # One resubscribe at a time, so a burst of ``attributes`` messages does
-        # not restart the discovery watch over and over.
-        self._refreshing = False
+        # recognise a profile change.  ``None`` before the first one.
+        self._attributes: frozenset[str] | None = None
+        # Once the unit has described itself, **only live publications count**.
+        #
+        # This is the whole point of the ``attributes`` message: it says "this is
+        # my current profile, forget what you knew".  The broker, however, still
+        # holds every discovery config and ``meta`` group the unit published
+        # under an earlier profile - a unit that switched protocol kept ten
+        # configs after announcing five topics - and a retained payload carries
+        # no timestamp to tell "still true" from "true two hours ago".  So after
+        # the wipe a retained message proves nothing; a capability is only
+        # claimed again when the unit *publishes it now* (MQTT ``retain`` flag
+        # false), which is exactly what the firmware does when the new profile
+        # really has that control.
+        self._live_only = False
         # The role the device reports (§32 ``role``), set by the coordinator.
         # ``None`` leaves every role dependent choice wide open, which is the safe
         # direction right after a restart.
@@ -482,12 +492,16 @@ class FirmwareDiscoveryPatcher:
         return _remove
 
     @callback
-    def _record_capability(self, path: str) -> None:
+    def _record_capability(self, path: str, retained: bool) -> None:
         """Remember one announced discovery object and notify the listeners.
 
         Deleted (superseded / legacy) objects never reach here, because they are
         handled before the capability bookkeeping.
         """
+        if self._live_only and retained:
+            # The unit has described itself and this payload is broker history
+            # from an earlier profile - see ``_live_only``.
+            return
         parts = path.split("/")
         if len(parts) < 2:
             return
@@ -505,36 +519,52 @@ class FirmwareDiscoveryPatcher:
         if not name or name in self._capabilities:
             return
         self._capabilities.add(name)
+        self._capability_epoch += 1
         snapshot = frozenset(self._capabilities)
         for listener in list(self._capability_listeners):
             listener(snapshot)
 
     @callback
     def _forget_capabilities(self) -> None:
-        """Drop everything learned so far and tell the listeners.
+        """Wipe the whole list: the unit is about to describe a new profile.
 
-        The device re-announces its whole feature set right after a role change,
-        and the configs that are still on the broker describe the role it had
-        *before* that change.  Without this reset a unit that stopped being a
-        master kept its power ceiling card - and the topics behind it no longer
-        accept anything.
+        Everything is dropped and **only live publications** may rebuild it.  The
+        two copies of the list matter here:
+
+          * the card follows the list, so it loses every card at once and only
+            gets back the ones the unit announces again;
+          * the entity platforms also follow it, so an entity whose ``meta`` the
+            unit never republishes is simply not created for this profile.
         """
+        self._live_only = True
         self._capability_epoch += 1
-        if not self._capabilities:
-            return
+        changed = bool(self._capabilities)
         self._capabilities.clear()
+        if not changed:
+            return
         empty = frozenset()
         for listener in list(self._capability_listeners):
             listener(empty)
 
     @callback
     def _on_attributes_message(self, msg: Any) -> None:
-        """The unit described itself: a changed list means the role changed.
+        """The unit described itself: wipe, then wait for it to speak again.
 
-        Deliberately *not* a reset on every message.  The payload is retained and
-        republished periodically, and a unit that keeps the same capabilities
-        would otherwise blink its whole Control page on every repeat.  A genuine
-        role change alters ``supported_topics``, and that is what is compared.
+        Two things happen here and nothing else:
+
+          * a **profile change** - the first message ever seen, or a
+            ``supported_topics`` key set that differs from the previous one -
+            wipes the capability list.  A unit that switches protocol or role
+            republishes this topic with a different map, and everything learned
+            before it describes the profile it just left;
+          * a repeat of the same map changes nothing, because this topic is
+            retained and republished, and wiping on every repeat would make the
+            Control page blink.
+
+        After the wipe the list is rebuilt only from what the unit publishes
+        from then on (e.g. it republishes ``reboot/config`` when the new profile
+        still accepts a reboot), so what the page shows is the new profile and
+        not a merge of both.
         """
         text = mqtt_util.payload_to_text(msg.payload)
         if text is None:
@@ -549,27 +579,20 @@ class FirmwareDiscoveryPatcher:
         if not isinstance(topics, dict) or not topics:
             return
 
+        keys = frozenset(str(key) for key in topics)
         previous = self._attributes
-        self._attributes = topics
+        self._attributes = keys
         self._capability_ready = True
-        if previous is not None and set(previous) != set(topics):
-            # The ``supported_topics`` map is by itself proof of what exists: it
-            # is the firmware's own answer, and it is already ordered correctly
-            # for a role, unlike the retained configs the broker replays.
-            self._forget_capabilities()
-            for name in topics:
-                self._note_capability(str(name))
-            _LOGGER.debug(
-                "Capabilities of %s reset from attributes: %s",
-                self.dev_id,
-                sorted(self._capabilities),
-            )
-            # The retained configs on the broker are the *previous* role's, so the
-            # list cannot be rebuilt from them without asking for them again.
-            # Unsubscribe + subscribe makes the broker replay every retained
-            # payload, which is also the moment the patched EMS options and the
-            # role narrowed sections get rebuilt.
-            self.hass.async_create_task(self._async_refresh_discovery())
+        if previous == keys:
+            return
+
+        _LOGGER.info(
+            "Capabilities of %s wiped: the unit described a new profile (%d topics: %s)",
+            self.dev_id,
+            len(keys),
+            ", ".join(sorted(keys)),
+        )
+        self._forget_capabilities()
 
     @callback
     def _on_group_meta_message(self, msg: Any) -> None:
@@ -578,8 +601,14 @@ class FirmwareDiscoveryPatcher:
         These groups have no discovery config of their own - `number.py` creates
         the entities from the description - so they would otherwise be missing
         from the capability list and every card that depends on them would hide.
+
+        Like the configs, only a fresh publication counts once the unit has
+        described itself: the retained copy on the broker may belong to the
+        profile it just left.
         """
         if not msg.payload:
+            return
+        if self._live_only and getattr(msg, "retain", False):
             return
         parts = msg.topic.split("/")
         if len(parts) >= 4:
@@ -616,21 +645,6 @@ class FirmwareDiscoveryPatcher:
             self._unsubs.append(unsub)
             _LOGGER.debug("Watching capability topics on %s", topic)
 
-    async def _async_refresh_discovery(self) -> None:
-        """Replay every retained payload after the device changed its role."""
-        if self._refreshing:
-            return
-        self._refreshing = True
-        try:
-            # Slightly later: the firmware sends ``attributes`` first and its
-            # configs right after, so resubscribing too early would race its own
-            # republish and leave half the list in place.
-            await asyncio.sleep(2)
-            self.async_shutdown()
-            await self.async_setup()
-        finally:
-            self._refreshing = False
-
     @callback
     def async_shutdown(self) -> None:
         """Stop watching discovery topics."""
@@ -642,6 +656,7 @@ class FirmwareDiscoveryPatcher:
     def _on_discovery_message(self, msg: Any) -> None:
         """Rewrite or delete a firmware discovery payload when it is not right."""
         path = _object_path(msg.topic)
+        retained = bool(getattr(msg, "retain", False))
         if path is None:
             return
 
@@ -656,14 +671,14 @@ class FirmwareDiscoveryPatcher:
             # Still recorded: a superseded object (``soc_limit``, ``fan_speed``)
             # proves the device *has* that feature, it just cannot express it
             # through a scalar.  The integration entities are gated on it.
-            self._record_capability(path)
+            self._record_capability(path, retained)
             self.hass.async_create_task(self._async_remove(msg.topic))
             return
 
         # Every config that describes something this device really has is
         # recorded before the payload is parsed - a config we cannot parse is
         # still proof that the feature exists.
-        self._record_capability(path)
+        self._record_capability(path, retained)
 
         patch = self._patches.get(path)
         if patch is None:
