@@ -452,16 +452,16 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @property
     def ems_modes(self) -> tuple[str, ...]:
-        """The EMS modes this role may select (§7/§8 with the slave subset)."""
+        """The EMS modes this role may select (V0.6.7 §7/§8)."""
         return ems_modes_for_role(self._role)
 
     def require_ems_mode(self, mode: str) -> None:
-        """Raise when this role may not run ``mode``.
+        """Raise when this role is not offered ``mode``.
 
-        A **slave** may only run `general` (its own regulation) or `fine_ctrl`
-        (§13/§14 are 角色: 不限).  The other three write system level setpoints
-        that belong to the master, so they are refused here rather than silently
-        ignored by a device that will never act on them.
+        `mqtt_ctrl` (§9/§10), `tou_plan` (§15-§20) and `meter_ctrl` (§11/§12) are
+        主机和单机, so a **slave** cannot run them - their setpoint topics are not
+        even published there.  `fine_ctrl` (§13/§14) is a **single-unit** feature
+        by product definition, so a master is not offered it either.
         """
         if mode in self.ems_modes:
             return
@@ -482,10 +482,14 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         is the only way to keep a user from operating a topic the document does
         not define for that role.
         """
+        # V0.6.7 has no 仅主机 topic left (§29/§30 became 主机和单机), so nothing
+        # is gated on `master_availability`.  It is still published - always
+        # "online" - so an "offline" retained by an earlier build cannot keep a
+        # firmware entity switched off for ever.
         wanted = {
             self.role_availability_topic: self.allows(ROLE_MASTER_SINGLE),
             self.phase_availability_topic: self.allows(ROLE_MULTIPHASE_MASTER),
-            self.master_availability_topic: self.allows(ROLE_MASTER_ONLY),
+            self.master_availability_topic: True,
         }
         for topic, allowed in wanted.items():
             if not force and self._published_role_availability.get(topic) == allowed:
@@ -774,17 +778,11 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if mode not in EMS_MODES:
             return
 
-        # A slave may not run the system level modes.  Somebody publishing
-        # straight to the broker can still try, so such a command is not echoed
-        # onto the select's state topic - the picker must not show a mode the
-        # unit will not enter.
-        if mode not in self.ems_modes:
-            _LOGGER.warning(
-                "Ignoring EMS mode %r on %s: not available for role %r",
-                mode, self.dev_id, self._role,
-            )
-            return
-
+        # V0.6.7 §7/§8 are 角色: 不限, so the picker offers every mode to every
+        # unit and a command has to be echoed back whatever the role is.  The
+        # role still decides which *blocks* the cards draw (§9-§12, §15-§20 are
+        # 主机和单机); refusing the echo here would leave the picker showing a
+        # pending mode for two and a half minutes on a slave.
         self.hass.async_create_task(self._async_stop_repeat_if_needed(mode))
 
         self._ems_mode_command_time = time.monotonic()
@@ -855,12 +853,12 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if mode not in EMS_MODES:
             return
 
-        # Remember what the unit says it is running. The virtual meter counter is
-        # scoped to `meter_ctrl`, so any other reported mode clears it - and this
-        # is the *device's* word, not the last command we sent.
+        # Remember what the unit says it is running.  The virtual-meter counter
+        # is deliberately **not** cleared here: it counts pushes that really
+        # arrived, and a unit stuck in `general` (firmware ignoring the mode
+        # command) still receives them - wiping the counter on every report made
+        # the strip on the card disappear while the readings kept updating.
         self._ems_mode_reported = mode
-        if mode != EMS_MODE_METER and self.meter_rx.get("count"):
-            self.meter_rx = {"count": 0, "at": None, "source": None, "fields": {}}
 
         if mode == self._ems_mode_state:
             return
@@ -1619,8 +1617,11 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         object-taking ``set`` topic.  A partial object keeps the field that was
         not sent, so the enable switch never rewrites the limit, and turning the
         limit down never re-enables export.
+
+        §29/§30 are 角色: 主机和单机 in V0.6.7 (V0.6.6 had 仅主机), so a
+        stand-alone unit writes it too.
         """
-        self.require_role(ROLE_MASTER_ONLY, "馈网限值")
+        self.require_role(ROLE_MASTER_SINGLE, "馈网限值")
         payload: dict[str, Any] = {}
         if enable is not None:
             payload["enable"] = bool(enable)
@@ -1658,17 +1659,18 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         write through Home Assistant, ``"mqtt"`` for a controller publishing
         straight to the broker.
 
-        Writes are only counted while the **device reports** ``meter_ctrl``: in
-        any other mode a virtual meter reading has no meaning, so the card must
-        not claim "N pushes received" for a unit that is merely sitting there.
+        Writes are counted regardless of what mode the **device** says it is
+        in.  The gate used to require a reported ``meter_ctrl``, which silently
+        hid the counter on a unit whose firmware ignores the mode command (it
+        keeps reporting ``general``) - the meter readings still arrived and were
+        still stored, so the card showed the numbers but no evidence that they
+        had been pushed.  A push that arrives is a fact worth showing.
 
         A **slave** has no §11/§12 topic at all (§7-§12 are 主机和单机), so a
         stray push is not counted either - the entity, the HTTP endpoint and the
         repeat job are all gated, this is the last line of defence.
         """
         if not self.allows(ROLE_MASTER_SINGLE):
-            return
-        if self._ems_mode_reported != EMS_MODE_METER:
             return
         count = int(self.meter_rx.get("count") or 0) + 1
         self.meter_rx = {

@@ -287,11 +287,29 @@ function _hmControlRegister() {
     { id: "meter_ctrl", en: "Meter ctrl", zh: "虚拟电表" },
   ];
 
-  /* What a **slave** may select (§7/§8 with the system level modes belonging to
-     the master): its own regulation, and the device level precise control block
-     whose topics §13/§14 mark as 角色: 不限.  `mqtt_ctrl`, `tou_plan` and
-     `meter_ctrl` write system level setpoints, so a slave is never offered them. */
-  const EMS_MODES_SLAVE = ["general", "fine_ctrl"];
+  /* Which EMS modes each role gets.  The protocol lists a fixed five and adds a
+     supporting note per option; the **product rule** on top of that is:
+
+       general     every role
+       mqtt_ctrl   master, single      (§9/§10 是 主机和单机)
+       fine_ctrl   **single only**     (§13/§14 精准控制只在单机开放)
+       tou_plan    master, single      (§15-§20 是 主机和单机)
+       meter_ctrl  master, single      (§11/§12 是 主机和单机)
+
+     `fine_ctrl` is the exception to §13/§14's 角色: 不限: precise control is a
+     single-unit feature, so it is not offered on a master (the system level
+     modes own the setpoints there) nor on a slave.
+
+     The discovered option list is **not** narrowed - it keeps the protocol's
+     five, so a unit that changes role regains its modes without the firmware
+     republishing.  An unreported role ("" before the retained event lands)
+     keeps everything, so a page load never blanks the picker. */
+  const EMS_MODES_BY_ROLE = {
+    master: ["general", "mqtt_ctrl", "tou_plan", "meter_ctrl"],
+    single: EMS_MODES.map((mode) => mode.id),
+    slave: ["general"],
+  };
+
   const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
   /* Protocol V0.6.2 §35: how the two fans are driven. `disable` stops them, and
@@ -356,8 +374,9 @@ function _hmControlRegister() {
 
   /* §29/§30: the feed-in ceiling.  Unlike `input_power` the 0 end is meaningful
      - 0 forbids exporting to the grid.  V0.6.7 turned the topic into a group
-     (an `enable` switch + this limit behind one object) that only a **master**
-     publishes, so `_allowMasterOnly()` still decides whether the group is drawn. */
+     (an `enable` switch + this limit behind one object) that a master **and** a
+     stand-alone unit publish (角色: 主机和单机), so `_allowMaster()` decides
+     whether the group is drawn. */
   const FEED_POWER = { lo: 0, hi: 2500 };
 
   /* V0.6.7 §29/§30 and §31/§32: the two groups that gained an `enable` switch.
@@ -608,6 +627,33 @@ function _hmControlRegister() {
   const REBOOT_TIMEOUT_MS = 60000;  // the whole wait, start to finish
   const REBOOT_GRACE_MS = 6000;     // pushes still in flight are not "it is back"
   const REBOOT_POLL_MS = 3000;      // how often the backend is asked
+
+  /* What "the device is offline" is decided from.
+
+     **Any one** of these reporting is proof enough that the unit is talking:
+     `quick/state` (1 s) feeds soc / pv_power / battery_status / the system_*
+     numbers, `device/state` (5 min) feeds rssi / battery_temperature and
+     `system/state` (5 min) the rest.  The old rule asked the *first existing*
+     entity and believed it, so one `unknown` entity - a role gated sensor on a
+     slave, or a stale duplicate discovery payload an older firmware left on the
+     same SN - made a perfectly healthy unit look offline and locked the whole
+     page.  Silence has to be collective, not a single entity's opinion.
+
+     `OFFLINE_AFTER_MS` is the tolerance for the slowest cadence: a unit whose
+     entities are all `unavailable` but whose last report is younger than this is
+     still considered alive, because Home Assistant flips the availability topic
+     a moment before the readings stop. */
+  const LIVE_PROBES = [
+    ["soc", "sensor"],
+    ["pv_power", "sensor"],
+    ["battery_status", "sensor"],
+    ["battery_temperature", "sensor"],
+    ["rssi", "sensor"],
+    ["system_pv_power", "sensor"],
+    ["system_soc", "sensor"],
+    ["grid_on_power", "sensor"],
+  ];
+  const OFFLINE_AFTER_MS = 150000;  // 2.5 x the 5 minute topics' cadence margin
 
   /* The entities the firmware pushes every second.  The newest `last_updated`
      among them is the card's heartbeat while it waits for a reboot; `[key,
@@ -1468,6 +1514,9 @@ function _hmControlRegister() {
         .meter-rx .rx-count { font-weight: 600; color: var(--primary-text-color);
                               font-variant-numeric: tabular-nums; }
         .meter-rx.live .rx-count { color: var(--primary-color); }
+        /* Nothing pushed yet: the same line, dimmed, so the strip does not
+           shout while it waits. */
+        .meter-rx.wait .rx-count { color: var(--secondary-text-color); font-weight: 500; }
         .meter-rx .rx-latest { font-variant-numeric: tabular-nums; }
         .meter-rx .rx-state { margin-left: auto; white-space: nowrap; }
         /* The unit is a label, not a field: it keeps its own width so the row
@@ -2155,37 +2204,43 @@ function _hmControlRegister() {
            than a card whose height changes with the window. */
 
         /* ------------------------------------------------------------------ *
-         * EMS mode picker: five labels, and one of them is long
+         * EMS mode picker: N labels, one long
          *
-         * Five equal buttons in a 300 px card leave about 50 px each, which
-         * truncates every label to two characters - the user cannot tell which
-         * mode is which. So this ONE picker wraps into 3 + 2 instead.
+         * The number of buttons depends on the role (1 / 4 / 5), so the grid is
+         * keyed on the count the picker actually rendered (its data-n attribute).
+         * Hard-coding the five-button layout left an empty track on a master's
+         * four - a row that visibly ends early - because "one row of five, one
+         * track each" was written as a fixed five-column template.
          *
-         * A plain flex-wrap would leave the second line ragged (two buttons at
-         * a third of the width, half the row empty). A six-track grid fixes
-         * that without any width maths: the first three buttons take two tracks
-         * each (three per line) and the last two take three each, so the second
-         * line fills the row exactly. Source order is preserved, so the picker
-         * still reads in protocol order.
-         *
-         * Wrapping is NOT a window-width accident here: the card itself grows
-         * when the selected mode adds controls (the .wide class spans two
-         * tracks), and a card with room puts the five back on one line. That is
-         * a container query, so it follows the card and not the monitor.
+         * 4 buttons: one row of four when the card has room, 2 + 2 when it does
+         * not (four across a 300 px card truncates every Chinese label).
+         * 5 buttons: 3 + 2 when narrow (three equal tracks per line, no ragged
+         * second row), one row of five once the card is wide enough.  Wrapping is
+         * a container query, so it follows the CARD (which grows with the mode)
+         * and not the monitor.
          * ------------------------------------------------------------------ */
-        .seg.fluid.ems5 { display: grid; flex-wrap: nowrap;
-                          grid-template-columns: repeat(6, minmax(0, 1fr)); }
-        .seg.fluid.ems5 button { min-width: 0; padding: 5px 4px; font-size: 12.5px; }
-        .seg.fluid.ems5 button:nth-child(-n+3) { grid-column: span 2; }
-        .seg.fluid.ems5 button:nth-child(n+4) { grid-column: span 3; }
-        /* Width of the CARD's content box. Below this the five cannot be shown
-           in full; above it one line fits and the extra row would be waste.
-           :nth-child(n) is there for specificity only - it matches every
-           button, exactly like the span rules above, so this later rule wins
-           without an !important. */
+        .seg.fluid.ems { display: grid; flex-wrap: nowrap; }
+        .seg.fluid.ems button { min-width: 0; padding: 5px 4px; font-size: 12.5px; }
+
+        .seg.fluid.ems[data-n="4"] { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+        @container (max-width: 470px) {
+          .seg.fluid.ems[data-n="4"] {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+          }
+        }
+
+        .seg.fluid.ems[data-n="5"] { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+        .seg.fluid.ems[data-n="5"] button:nth-child(-n+3) { grid-column: span 2; }
+        .seg.fluid.ems[data-n="5"] button:nth-child(n+4) { grid-column: span 3; }
+        /* Width of the CARD's content box: above this the five fit on one line.
+           :nth-child(n) is there for specificity only - it matches every button,
+           exactly like the span rules above, so this later rule wins without an
+           !important. */
         @container (min-width: 520px) {
-          .seg.fluid.ems5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
-          .seg.fluid.ems5 button:nth-child(n) { grid-column: span 1; }
+          .seg.fluid.ems[data-n="5"] {
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+          }
+          .seg.fluid.ems[data-n="5"] button:nth-child(n) { grid-column: span 1; }
         }
 
         /* ================================================================== *
@@ -2453,7 +2508,21 @@ function _hmControlRegister() {
 
       const cacheKey = `${domain}:${key}`;
       const cached = this._cache.get(cacheKey);
-      if (cached && hass.states[cached]) return cached;
+      if (cached && hass.states[cached]) {
+        /* A cached answer that landed on **another** prefix must not stick.
+           Two units can share one numeric SN under different prefixes (a live
+           `LAS-…` beside a stale `MSA-…` discovery payload), and this card may
+           well render in the second or two before the live payload arrives -
+           at which point the serial wide fallback below picks the neighbour and
+           the cache would keep it for ever.  Re-resolve as soon as an entity
+           under this device's own slug exists. */
+        const own = `${domain}.${slug(this._dev())}`;
+        if (cached.startsWith(own)
+          || !Object.keys(hass.states).some((id) => id.startsWith(own))) {
+          return cached;
+        }
+        this._cache.delete(cacheKey);
+      }
 
       let found = null;
       const wantUid = new Set([
@@ -2484,9 +2553,22 @@ function _hmControlRegister() {
       // reports on `event/state`.
       if (!found) {
         const serial = serialOf(this._dev());
-        const candidates = Object.keys(hass.states).filter(
+        const all = Object.keys(hass.states).filter(
           (entityId) => entityId.startsWith(`${domain}.`) && entityId.includes(serial)
         );
+        /* Two units can carry the same numeric SN under different prefixes: the
+           live firmware publishes `LAS-280024180016`, while a broker still holds
+           the retained discovery of an older `MSA-280024180016` session.  HA's
+           MQTT device identifiers use the bare SN, so both sets of entities land
+           on ONE device and both ids contain the serial - matching on the serial
+           alone then picked the neighbour's entity.  That is how a **master**
+           card (5 EMS modes) ended up reading the stale **slave** select and
+           offering only `general` / `fine_ctrl`.
+           Entities that start with this device's own slug are authoritative; the
+           serial-wide list is only the fallback for a renamed device. */
+        const own = `${domain}.${slug(this._dev())}`;
+        const sameDevice = all.filter((entityId) => entityId.startsWith(own));
+        const candidates = sameDevice.length ? sameDevice : all;
         for (const alias of ENTITY_ALIASES[key] || [key]) {
           const want = norm(alias);
           const hit = candidates.find((entityId) => {
@@ -2580,31 +2662,40 @@ function _hmControlRegister() {
     /**
      * Is the device itself offline?
      *
-     * Same rule as the power-flow card: the integration marks the fast topics'
-     * entities `unavailable` once nothing has arrived for a minute, and a freshly
-     * started Home Assistant shows `unknown` until the first payload lands.
-     * The first entity that exists decides - a *missing* entity (older firmware)
-     * is not an offline device.
+     * **Any single live reading wins.**  A unit that pushes `quick/state` every
+     * second, or `device/state` / `system/state` every five minutes, is online -
+     * no matter what the other entities say.  Only when *none* of `LIVE_PROBES`
+     * carries a reading and none of them reported within `OFFLINE_AFTER_MS` is
+     * the unit called offline, and a unit with no such entity at all (older
+     * firmware, a hidden entity) is never accused.
      *
-     * This matters for more than cosmetics: nothing stops an MQTT publish to a
-     * powered-off unit, so without this check the card happily "sends" a fan
+     * The old rule asked the first existing entity and believed it, so a stale
+     * duplicate discovery on the same SN (an old `MSA-…` payload beside the live
+     * `LAS-…` one) left `sensor.<dev>_soc` at `unknown` and the control page sat
+     * behind "device offline" while rssi and every other reading kept updating.
+     *
+     * This still matters for more than cosmetics: nothing stops an MQTT publish
+     * to a powered-off unit, so without this check the card happily "sends" a
      * setting into the void and reports success.
      */
     _deviceOffline() {
       if (!this._hass) return false;
-      for (const [key, domain] of [
-        ["soc", "sensor"],
-        ["system_pv_power", "sensor"],
-        ["pv_power", "sensor"],
-        ["battery_status", "sensor"],
-      ]) {
+      const now = Date.now();
+      let seen = 0;
+      for (const [key, domain] of LIVE_PROBES) {
         const entityId = this._resolve(key, domain);
         if (!entityId) continue;
         const state = (this._hass.states || {})[entityId];
         if (!state) continue;
-        return state.state === "unavailable" || state.state === "unknown";
+        seen += 1;
+        const value = String(state.state);
+        if (value !== "" && value !== "unknown" && value !== "unavailable") {
+          return false;
+        }
+        const stamp = Date.parse(state.last_reported || state.last_updated || "");
+        if (Number.isFinite(stamp) && now - stamp <= OFFLINE_AFTER_MS) return false;
       }
-      return false;
+      return seen > 0;
     }
 
     /* ---------------------------- device model --------------------------- */
@@ -2694,21 +2785,9 @@ function _hmControlRegister() {
       return this._role() === "slave";
     }
 
-    /** May this unit use the 角色: 主机和单机 topics (§9-§12, §15-§22, §25, §26, §45)? */
+    /** May this unit use the 角色: 主机和单机 topics (§9-§12, §15-§22, §25, §26, §29, §30, §45)? */
     _allowMaster() {
       return !this._isSlave();
-    }
-
-    /**
-     * May it use a 角色: 仅主机 topic (§29/§30)?
-     *
-     * Stricter than `_allowMaster()`: a **single** unit is excluded too.  An
-     * unreported role stays allowed, like everywhere else on this card, so the
-     * row does not flicker while the state event is still on its way.
-     */
-    _allowMasterOnly() {
-      const role = this._role();
-      return role === "" || role === "master";
     }
 
     /**
@@ -3495,16 +3574,13 @@ function _hmControlRegister() {
       if (!Array.isArray(options) || !options.length) {
         options = EMS_MODES.map((m) => m.id);
       }
-      /* A **slave** only runs its own regulation (`general`) or the device level
-         precise control block (`fine_ctrl`, §13/§14 are 角色: 不限).  The three
-         system level modes write setpoints that belong to the master, so they
-         are not offered here even if the discovered config still lists them
-         (the integration narrows that list too, but a cached payload from before
-         the role was known must not leak through). */
-      if (this._isSlave()) {
-        return options.filter((id) => EMS_MODES_SLAVE.includes(id));
-      }
-      return options;
+      /* V0.6.7 §7: the role decides which of the discovered options are offered.
+         The retained payload keeps the protocol's full five (so a promoted unit
+         gets its modes back without the firmware republishing), and the picker
+         narrows on top of it. */
+      const allowed = EMS_MODES_BY_ROLE[this._role()];
+      if (!allowed) return options;
+      return options.filter((id) => allowed.includes(id));
     }
 
     _sendPowerCtrl() {
@@ -4720,15 +4796,25 @@ function _hmControlRegister() {
      * the heater has a card of its own.
      */
     _modeCard(mode) {
-      /* A **slave** keeps this card - it can run its own regulation or the
-         device level precise control - but only those two modes are offered
-         (§7/§8 with the system level modes belonging to the master).
-         `_emsOptions()` is what narrows the picker, so this method never has to
-         branch on the role: the fewer buttons are the whole difference, and the
-         card width follows them (see `wide` below). */
       const rows = [this._emsRow()];
 
-      if (mode === "mqtt_ctrl") {
+      /* The picker only offers the modes §7 allows for this role, so the three
+         system level ones cannot normally be selected on a slave.  A unit can
+         still *report* one (the firmware accepts `mqtt_ctrl` and reverts about
+         15 s later when no setpoint renews the lease), and then drawing dead
+         sliders over topics that do not exist would read like a broken card -
+         the mode explains itself instead. */
+      const masterOnly = !this._allowMaster()
+        && (mode === "mqtt_ctrl" || mode === "tou_plan" || mode === "meter_ctrl");
+
+      if (masterOnly) {
+        rows.push(html`<div class="sep"></div>`);
+        rows.push(html`<div class="note">${this._t(
+          "This is a system level mode, set on the master: this unit is running "
+          + "as a slave, so it has no controls of its own for it.",
+          "该模式属于系统级控制，请在主机上设置：本机为从机，没有对应的控制项。",
+        )}</div>`);
+      } else if (mode === "mqtt_ctrl") {
         if (this._config.show_power_ctrl !== false) {
           rows.push(html`<div class="sep"></div>`);
           rows.push(this._powerCtrlRow());
@@ -4924,10 +5010,11 @@ function _hmControlRegister() {
         });
       }
 
-      if (this._has("feed_power") && this._allowMasterOnly()) {
+      if (this._has("feed_power") && this._allowMaster()) {
         /* V0.6.7 §29: same shape as the house group - the enable switch decides
            whether the limit exists at all, so an off switch leaves one compact
-           row instead of a dead slider. */
+           row instead of a dead slider.  §29/§30 are 主机和单机, so a
+           stand-alone unit gets the group too (V0.6.6 had it as 仅主机). */
         groups.push({
           id: "feed", en: "Feed-in", zh: "馈网", rows: [this._feedRow()],
         });
@@ -5202,7 +5289,7 @@ function _hmControlRegister() {
     /** iOS segmented control. `options` = [{id, label, enabled, title, pending}] */
     _segment(options, current, onPick, extraClass = "") {
       return html`
-        <div class="seg ${extraClass}">
+        <div class="seg ${extraClass}" data-n=${options.length}>
           ${options.map((opt) => html`
             <button class=${[
               opt.id === current ? "on" : "",
@@ -5434,7 +5521,10 @@ function _hmControlRegister() {
         bare: true,
         topic: this._topic("select/<dev_id>/ems_mode/command"),
         ctrl: this._segment(options, current, (id) => this._setEmsMode(id),
-          supported.length <= 2 ? "fluid" : "fluid ems5"),
+          /* Three or fewer fit one flex row at every width.  Four or more use
+             the count-keyed grid, so the buttons always fill the row instead
+             of leaving a track empty when a role drops one (see .seg.fluid.ems). */
+          supported.length <= 3 ? "fluid" : "fluid ems"),
       });
     }
 
@@ -6465,7 +6555,20 @@ function _hmControlRegister() {
       const rx = (info && info.rx) || null;
       const raw = rx ? Number(rx.count) : 0;
       const count = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
-      if (!count) return html``;
+      /* Always visible in this mode, even at zero: an empty strip is the
+         difference between "nothing has been pushed yet" and "the card is
+         broken".  It used to be hidden until the first write, which read as a
+         missing feature on a unit whose pushes were arriving but whose firmware
+         kept reporting `general`. */
+      if (!count) {
+        return html`
+          <div class="meter-rx wait">
+            <span class="rx-count">${this._t("External pushes", "外部推送")} 0</span>
+            <span class="rx-state">${this._t(
+              "waiting for the external meter", "等待外部电表推送",
+            )}</span>
+          </div>`;
+      }
       const fields = rx.fields || {};
       const bits = [];
       if (fields.power != null) bits.push(`${fields.power} W`);
