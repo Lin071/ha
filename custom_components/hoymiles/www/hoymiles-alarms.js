@@ -297,6 +297,20 @@ function _hmAlarmsRegister() {
      * the unique_id lookup silently returned nothing and the card reported
      * "unavailable" on a perfectly healthy device. The SN in the entity id is
      * the stable identifier that is still visible.
+     *
+     * Picking **which** sensor is the harder half, because one SN can end up
+     * with more than one alarm entity: a duplicate config entry that was added
+     * with a different prefix (`MAW-280425390014` beside `MSA-280425390014`),
+     * or the firmware's own MQTT discovery creating a parallel device. The old
+     * rule - shortest id wins - could not tell them apart when the two ids have
+     * the same length, so it took whichever came first in `hass.states` and had
+     * a 50 % chance of reading the dead one. An `unavailable` sensor has no
+     * attributes, so the list came back empty and the card hid itself - while
+     * the illustration next to it (which resolves its entity a different way)
+     * happily showed "4 active alarms". Two cards, two answers, same device.
+     *
+     * The order below is therefore: the id this page's own `dev_id` implies
+     * first, then a live entity, and only then the shortest id.
      */
     _entityId() {
       if (this._config.entities && this._config.entities.alarms) {
@@ -306,19 +320,44 @@ function _hmAlarmsRegister() {
 
       const hass = this._hass;
       if (!hass || !hass.states) return null;
-      if (this._cache && hass.states[this._cache]) return this._cache;
+      /* A cached id is only reused while it actually answers: the duplicate
+         entity this rule exists for can be the one that was cached, and the
+         cache must not make the wrong choice sticky. */
+      if (this._cache && hass.states[this._cache]) {
+        const cached = hass.states[this._cache];
+        if (cached.state !== "unavailable" && cached.state !== "unknown") {
+          return this._cache;
+        }
+        this._cache = null;
+      }
 
       const devId = this._config.dev_id;
       if (!devId) return null;
 
       const serial = serialOf(devId);
       const suffix = "_active_alarms";
+      /* What this page is about: the entity the device name implies. Renaming a
+         device keeps the SN inside the id, so this is only a hint - the loop
+         below still accepts any id that carries the SN. */
+      const expected = "sensor." + slug(devId) + suffix;
+
       let found = null;
+      let foundScore = -1;
       for (const entityId of Object.keys(hass.states)) {
         if (!entityId.startsWith("sensor.")) continue;
         if (!entityId.endsWith(suffix)) continue;
         if (!entityId.includes(serial)) continue;
-        if (!found || entityId.length < found.length) found = entityId;
+        const state = hass.states[entityId];
+        const live = !!state && state.state !== "unavailable" && state.state !== "unknown";
+        /* Higher is better. 3 = the id this page implies *and* it answers, so a
+           duplicate entry can never win it. Ties fall back to the shortest id,
+           which is the previous behaviour. */
+        const score = (entityId === expected ? 2 : 0) + (live ? 1 : 0);
+        if (score > foundScore
+          || (score === foundScore && found && entityId.length < found.length)) {
+          found = entityId;
+          foundScore = score;
+        }
       }
 
       if (found) this._cache = found;

@@ -448,52 +448,6 @@ function _hmControlRegister() {
   ];
   const PHASE_BAND = { lo: 100, hi: 2500 };
 
-  /* Which capability has to be present for one entity key to be drawn.
-   *
-   * The keys on the left are this card's own (mostly the integration's entity
-   * keys); the values on the right are what the device announced - either a
-   * discovery object name or a ``meta`` group name (see the backend's
-   * `discovery_override.py`).  A key that is missing here is not gated at all.
-   *
-   * This is deliberately a table rather than "does the entity exist": the
-   * entities outlive a role change (nothing deletes them), so existence kept
-   * drawing a card for a capability the device had already dropped - the fan
-   * card staying on an MS-A2 that had just been turned into a slave, for
-   * instance.
-   */
-  const CAP_OF_KEY = {
-    /* §35 - §38, described only by `fan/meta` */
-    fan_mode: "fan",
-    pcs_fan_speed: "fan",
-    /* §39 - §41, described only by `heat/meta` */
-    heat_param: "heat",
-    heat_mode: "heat",
-    /* §42, described only by `fine_ctrl/meta` */
-    eps_relay: "fine_ctrl",
-    charge_forbid: "fine_ctrl",
-    discharge_forbid: "fine_ctrl",
-    pv_power_limit: "fine_ctrl",
-    /* §33 - §36, two scalar discovery objects */
-    charge_soc_limit: "soc_h_limit",
-    discharge_soc_limit: "soc_l_limit",
-    /* §21 - §30 */
-    output_power: "output_power",
-    input_power: "input_power",
-    feed_power: "feed_power",
-    feed_power_enable: "feed_power",
-    /* §23/§24 per-phase output, §27/§28 per-phase input, §31/§32 house input */
-    phase_a_output_power: "phase_output_power",
-    phase_b_output_power: "phase_output_power",
-    phase_c_output_power: "phase_output_power",
-    phase_a_input_limit: "phase_input_power",
-    phase_b_input_limit: "phase_input_power",
-    phase_c_input_limit: "phase_input_power",
-    house_a_input_limit: "phase_house_in_power",
-    house_b_input_limit: "phase_house_in_power",
-    house_c_input_limit: "phase_house_in_power",
-    house_input_enable: "phase_house_in_power",
-  };
-
   /* The two cut-offs are NOT the same band, and they are not the entity's band
    * either.
    *
@@ -673,9 +627,11 @@ function _hmControlRegister() {
   const REBOOT_TIMEOUT_MS = 60000;  // the whole wait, start to finish
   const REBOOT_GRACE_MS = 6000;     // pushes still in flight are not "it is back"
   const REBOOT_POLL_MS = 3000;      // how often the backend is asked
-  /* The capability list is rebuilt only when the device changes its role, so
-     asking the backend once every few seconds is plenty - and it has to be
-     re-read on a timer because nothing pushes it to the card. */
+
+  /* How often the backend is asked which cards this unit may show.  The answer
+     only changes when the unit re-describes itself, which happens on every
+     connect and on every reboot, so a couple of seconds is plenty - and short
+     enough that the page is already correct by the time the user looks at it. */
   const CAPS_POLL_MS = 2500;
 
   /* What "the device is offline" is decided from.
@@ -1350,10 +1306,12 @@ function _hmControlRegister() {
       this._vmInfo = null;
       this._vmLoading = false;
       this._vmAt = 0;
-      /* What the device says it can control, as `{epoch, keys: Set}` - or null
-         while the backend has not reported a capability list yet, in which case
-         every card falls back to the old "does the entity exist" behaviour.
-         Re-read on a timer; a change bumps the epoch and re-renders. */
+      /* What the device says it can control **now**, as `{epoch, keys}` - or
+         `null` while the backend has no answer (an older backend, or a unit that
+         has never published its attributes topic).  `null` means "draw
+         everything", which is exactly the behaviour before this feature.
+         Re-read on a timer; the backend wipes the list every time the unit
+         re-describes itself. */
       this._caps = null;
       this._capsAt = 0;
       this._capsBusy = false;
@@ -4729,9 +4687,11 @@ function _hmControlRegister() {
           ${this._capsBlank() ? html`<div class="offline-note">
             <span class="oi">${this._icon("faders", 16)}</span>
             <span>${this._t(
-              "The device announced a new profile, so the old controls were "
-              + "cleared. Waiting for it to publish the controls it supports now.",
-              "设备已重新上报能力，旧的控制项已清空，正在等待它发布当前支持的控制项。",
+              "The device announced a new profile, so the previous controls "
+              + "were cleared. Waiting for it to publish the controls it "
+              + "supports now.",
+              "设备已重新上报基本属性，旧的控制项已清空，"
+              + "正在等待它发布当前支持的控制项。",
             )}</span>
           </div>` : ""}
           <div class="board">
@@ -4839,19 +4799,12 @@ function _hmControlRegister() {
 
     /** Power on/off and the reboot command: both take the unit up or down. */
     _powerCard() {
-      /* Two independent capabilities behind one card: a unit can accept a reboot
-         and no on/off command (the HiFlow models do exactly that). Either one
-         alone still deserves the card; neither means no card at all, which is
-         what a card full of dead buttons looked like. */
+      /* Two independent topics, so two independent rows: §3-§6 are both
+         "仅MQTTS", and a unit in plain MQTT answers neither. When the unit
+         republished nothing, no card - that is the whole point of the wipe. */
       const rows = [];
-      /* Two names for the same thing: the discovery object is the four level
-         ``switch/<dev_id>`` (capability ``switch``), while the device's own
-         ``supported_topics`` map calls it ``switch_ctrl``. A list seeded from
-         `attributes` carries the second, a replayed config the first. */
-      if (this._capOk("switch") || this._capOk("switch_ctrl")) {
-        rows.push(this._switchRow());
-      }
-      if (this._capOk("reboot")) rows.push(this._rebootRow());
+      if (this._capsOk("switch")) rows.push(this._switchRow());
+      if (this._capsOk("reboot")) rows.push(this._rebootRow());
       if (!rows.length) return "";
       return this._card({
         icon: this._icon("bolt"),
@@ -4879,10 +4832,9 @@ function _hmControlRegister() {
      * the heater has a card of its own.
      */
     _modeCard(mode) {
-      /* §7/§8: the picker itself is a control (``select/<dev>/ems_mode``). A
-         unit that stopped announcing it - after a protocol or role change - has
-         no card here either, exactly like every other card. */
-      if (!this._capOk("ems_mode")) return "";
+      /* §7-§8: ``select/<dev>/ems_mode`` is 仅MQTTS, so a unit running plain
+         MQTT has no mode picker at all. */
+      if (!this._capsOk("ems_mode")) return "";
       const rows = [this._emsRow()];
 
       /* The picker only offers the modes §7 allows for this role, so the three
@@ -4902,7 +4854,7 @@ function _hmControlRegister() {
           "该模式属于系统级控制，请在主机上设置：本机为从机，没有对应的控制项。",
         )}</div>`);
       } else if (mode === "mqtt_ctrl") {
-        if (this._config.show_power_ctrl !== false && this._capOk("power_ctrl")) {
+        if (this._config.show_power_ctrl !== false) {
           rows.push(html`<div class="sep"></div>`);
           rows.push(this._powerCtrlRow());
         }
@@ -4990,6 +4942,81 @@ function _hmControlRegister() {
       });
     }
 
+    /**
+     * May this card be drawn?
+     *
+     * `names` are capability names as the device reports them (the discovery
+     * object name, or the ``meta`` group name).  **Any** one of them is enough:
+     * the cut-off card, for instance, is useful with either limit alone.
+     *
+     * `this._caps === null` means "the backend has not said" - an older backend,
+     * or a unit that has never published its ``attributes`` topic - and answers
+     * `yes` on purpose, so a page never goes blank because a message is missing.
+     *
+     * This is deliberately a **card** level test and nothing finer.  Gating
+     * single rows inside a card was tried and reverted: §32 groups several
+     * fields into one object, and hiding one row of a group reads as "the group
+     * is broken", not as "this unit has no such field".
+     */
+    _capsOk(...names) {
+      if (!this._caps) return true;
+      return names.some((name) => this._caps.keys.has(name));
+    }
+
+    /**
+     * Ask the backend which cards this unit may show.
+     *
+     * The backend builds the answer from what the unit published **fresh** after
+     * its last ``attributes`` message - the retained leftovers of an earlier
+     * protocol or role are deliberately excluded, which is the whole point: a
+     * unit switched from MQTTS to MQTT still has the old ``switch``,
+     * ``reboot`` and ``ems_mode`` configs on the broker although §3-§20 of the
+     * protocol say those topics no longer exist in that mode.
+     *
+     * Nothing pushes the answer, so it is polled - slowly, because it changes
+     * once per connect.
+     */
+    async _syncCaps() {
+      if (!this._hass || typeof this._hass.callWS !== "function") return;
+      if (this._capsBusy) return;
+      const now = Date.now();
+      if (this._capsAt && now - this._capsAt < CAPS_POLL_MS) return;
+      this._capsAt = now;
+      this._capsBusy = true;
+      try {
+        const out = await this._hass.callWS({
+          type: "hoymiles/device/info",
+          dev_id: this._dev(),
+        });
+        if (!this.isConnected) return;
+        const keys = Array.isArray(out && out.caps) ? out.caps : null;
+        /* `caps_ready` is the unit having described itself at least once. Before
+           that the list means "not known", never "nothing there" - and an empty
+           list *after* that is the real state the page has to show: the unit
+           announced a new profile and has not republished anything yet. */
+        const ready = !!out && out.known === true && out.caps_ready === true
+          && keys !== null;
+        const epoch = Number(out && out.caps_epoch) || 0;
+        this._caps = ready ? { epoch, keys: new Set(keys) } : null;
+        const sig = this._caps
+          ? epoch + ":" + Array.from(this._caps.keys).sort().join(",")
+          : "";
+        if (sig !== this._capsSig) {
+          this._capsSig = sig;
+          this.requestUpdate();
+        }
+      } catch (err) {
+        /* No answer: keep drawing everything. */
+      } finally {
+        this._capsBusy = false;
+      }
+    }
+
+    /** True when the unit announced a new profile and nothing came back yet. */
+    _capsBlank() {
+      return !!this._caps && this._caps.keys.size === 0;
+    }
+
     /** True when this device publishes any fan entity (protocol §35 - §38). */
     _hasFan() {
       return this._has("fan_mode", "select") || this._has("pcs_fan_speed");
@@ -5005,6 +5032,7 @@ function _hmControlRegister() {
      * leftover space is a good place to say why nothing is moving.
      */
     _fanCard() {
+      if (!this._capsOk("fan")) return "";
       if (!this._hasFan()) {
         // No fan on this model: no card at all, so the grid does not keep an
         // empty cell for a row that has nothing to show.
@@ -5135,6 +5163,14 @@ function _hmControlRegister() {
       /* §21-§32: a slave publishes and accepts none of these, so the card would
          be a stack of dead sliders. */
       if (!this._allowMaster()) return "";
+      /* Every limit group is MQTT&MQTTS, so the unit republishes at least one
+         of them in either protocol.  None of them means the unit does not have
+         a ceiling at all - and then there is no card.  The rows inside follow
+         the old existence logic, so a group never loses half its fields. */
+      if (!this._capsOk(
+        "output_power", "input_power", "phase_output_power",
+        "phase_input_power", "phase_house_in_power", "feed_power",
+      )) return "";
 
       const groups = this._powerLimitGroups();
       if (!groups.length) return "";
@@ -5217,6 +5253,7 @@ function _hmControlRegister() {
      * invited a pack change that silently never happened.
      */
     _heatCard() {
+      if (!this._capsOk("heat")) return "";
       if (!this._has("heat_param")) return "";
       const mode = this._heatModeShown();
       const off = mode === HEAT_MODE_OFF;
@@ -5265,6 +5302,7 @@ function _hmControlRegister() {
      * sense.
      */
     _socCard() {
+      if (!this._capsOk("soc_h_limit", "soc_l_limit")) return "";
       if (!this._has("charge_soc_limit") && !this._has("discharge_soc_limit")) {
         return "";
       }
@@ -5924,75 +5962,6 @@ function _hmControlRegister() {
 
     /* -------------------------- V0.6.2 rows -------------------------- */
 
-    /** True while the device has described itself but nothing is claimed yet. */
-    _capsBlank() {
-      return !!this._caps && this._caps.keys.size === 0;
-    }
-
-    /**
-     * True when this unit announced that capability.
-     *
-     * `this._caps === null` means "not known yet" and answers `true` on purpose:
-     * a card that has never heard from the backend has to keep working exactly
-     * as it did before, and a control the user cannot reach is worse than one
-     * that is offered but rejected.
-     */
-    _capOk(cap) {
-      if (!cap) return true;
-      if (!this._caps) return true;
-      return this._caps.keys.has(cap);
-    }
-
-    /**
-     * Ask the backend what this device can control.
-     *
-     * The list is built in `discovery_override.py` from every discovery object
-     * and every `meta` group the unit announces, and it is **cleared** when the
-     * unit republishes `attributes` with a different role - the configs that
-     * arrived before that describe the old role. Nothing pushes the result to
-     * the card, so it is polled; slowly, because it changes once per role.
-     */
-    async _syncCaps() {
-      if (!this._hass || typeof this._hass.callWS !== "function") return;
-      if (this._capsBusy) return;
-      const now = Date.now();
-      if (this._capsAt && now - this._capsAt < CAPS_POLL_MS) return;
-      this._capsAt = now;
-      this._capsBusy = true;
-      try {
-        const out = await this._hass.callWS({
-          type: "hoymiles/device/info",
-          dev_id: this._dev(),
-        });
-        if (!this.isConnected) return;
-        const keys = Array.isArray(out && out.caps) ? out.caps : null;
-        /* `caps_ready` is the device having described itself. From then on the
-           list is authoritative **including when it is empty**: the backend
-           wipes it the moment the unit announces a new profile, and only refills
-           it from the topics the unit publishes afterwards. So "empty" means
-           "nothing has been re-announced yet" - a state this page has to show,
-           not one it may paper over with the previous profile's cards. */
-        const ready = !!out && out.known === true && out.caps_ready === true
-          && keys !== null;
-        const epoch = Number(out && out.caps_epoch) || 0;
-        this._caps = ready ? { epoch, keys: new Set(keys) } : null;
-        const sig = this._caps
-          ? epoch + ":" + Array.from(this._caps.keys).sort().join(",")
-          : "";
-        if (sig !== this._capsSig) {
-          this._capsSig = sig;
-          /* Every `_has()` call reads this list, so a rebuilt list has to
-             re-render: the state push that asked for it rendered against the
-             previous one. */
-          this.requestUpdate();
-        }
-      } catch (err) {
-        /* An older backend has no `caps`: keep falling back to existence. */
-      } finally {
-        this._capsBusy = false;
-      }
-    }
-
     /** True when this device publishes the entity behind a protocol key.
      *
      * **Strict on purpose.**  `_resolve` ends with a "there is only one entity
@@ -6001,13 +5970,8 @@ function _hmControlRegister() {
      * `select` is the EMS mode answered "yes" to `fan_mode` and grew a fan card
      * it cannot drive (an MS-A2).  A capability is only claimed when an entity
      * really carries this key.
-     *
-     * On top of that, a key with an entry in `CAP_OF_KEY` needs the device to
-     * have announced that capability - see the table's own note.
      */
     _has(key, domain = "number") {
-      const cap = CAP_OF_KEY[key];
-      if (cap && !this._capOk(cap)) return false;
       return this._resolve(key, domain, true) != null;
     }
 
